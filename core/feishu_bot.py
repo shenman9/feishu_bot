@@ -129,6 +129,37 @@ class FeishuBot(ABC):
         if not response.success():
             _log("ERROR", f"发送失败: code={response.code}, msg={response.msg}")
 
+    def send_message_get_id(self, chat_id: str, msg_type: str, content: str) -> Optional[str]:
+        """发送消息并返回 message_id，失败时返回 None"""
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type(msg_type)
+                .content(content)
+                .build()) \
+            .build()
+        response = self.client.im.v1.message.create(request)
+        if not response.success():
+            _log("ERROR", f"发送失败: code={response.code}, msg={response.msg}")
+            return None
+        try:
+            return response.data.message_id
+        except AttributeError:
+            return None
+
+    def patch_message(self, message_id: str, content: str) -> None:
+        """更新已发送消息的文本内容"""
+        request = PatchMessageRequest.builder() \
+            .message_id(message_id) \
+            .request_body(PatchMessageRequestBody.builder()
+                .content(content)
+                .build()) \
+            .build()
+        response = self.client.im.v1.message.patch(request)
+        if not response.success():
+            _log("ERROR", f"消息更新失败: code={response.code}, msg={response.msg}")
+
     def reply(self, chat_id: str, text: str) -> None:
         """发送文本消息"""
         self.send_message(chat_id, "text", json.dumps({"text": text}))

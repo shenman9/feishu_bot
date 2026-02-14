@@ -27,6 +27,8 @@ _im_v1_mock.__all__ = [
     "CreateMessageRequest",
     "CreateMessageRequestBody",
     "GetMessageResourceRequest",
+    "PatchMessageRequest",
+    "PatchMessageRequestBody",
 ]
 
 _modules = {
@@ -90,6 +92,8 @@ def mock_bot():
     bot.reply = MagicMock()
     bot.reply_card = MagicMock()
     bot.send_message = MagicMock()
+    bot.send_message_get_id = MagicMock(return_value="mock_msg_id")
+    bot.patch_message = MagicMock()
     return bot
 
 

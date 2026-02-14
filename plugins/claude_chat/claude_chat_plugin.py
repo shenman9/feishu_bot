@@ -2,10 +2,12 @@
 Claude 对话插件
 
 通过 Anthropic Messages API 兼容的中转服务与 Claude 进行多轮对话。
+支持流式响应，实时更新飞书消息内容。
 """
 
 import json
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -20,12 +22,17 @@ DEFAULT_MAX_HISTORY = 20
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MODEL = "claude-opus-4-6"
 
+# 流式更新控制
+_PATCH_INTERVAL = 0.5   # 最小更新间隔（秒）
+_PATCH_MIN_CHARS = 50   # 最小新增字符数触发更新
+
 
 class ClaudeChatPlugin(Plugin):
     """Claude 对话插件
 
     支持多轮对话，维护每个用户独立的消息历史。
-    通过 Anthropic Messages API 兼容接口调用 Claude 模型。
+    通过 Anthropic Messages API 兼容接口调用 Claude 模型，
+    使用流式响应实时更新飞书消息。
     """
 
     def __init__(self):
@@ -85,15 +92,19 @@ class ClaudeChatPlugin(Plugin):
         if trimmed and trimmed[0]["role"] != "user":
             trimmed = trimmed[1:]
         return trimmed
+# PLACEHOLDER_STREAM
 
-    def _call_claude_api(self, history: list[dict]) -> str:
-        """调用 Claude API 获取回复
+    def _call_claude_api_stream(self, history: list[dict], message_id: Optional[str],
+                                chat_id: str) -> str:
+        """流式调用 Claude API，实时更新飞书消息
 
         Args:
             history: 对话历史消息列表
+            message_id: 占位消息的 ID，为 None 时降级为非流式
+            chat_id: 聊天 ID（降级时用于发送消息）
 
         Returns:
-            Claude 的回复文本
+            Claude 的完整回复文本
 
         Raises:
             RuntimeError: API 调用失败时抛出
@@ -110,9 +121,9 @@ class ClaudeChatPlugin(Plugin):
             "model": cfg["model"],
             "max_tokens": cfg["max_tokens"],
             "messages": history,
+            "stream": True,
         }
 
-        # 如果配置了系统提示词，加入 system 字段
         if cfg["system_prompt"]:
             payload["system"] = cfg["system_prompt"]
 
@@ -122,6 +133,7 @@ class ClaudeChatPlugin(Plugin):
                 headers=headers,
                 json=payload,
                 timeout=120,
+                stream=True,
             )
         except requests.RequestException as e:
             raise RuntimeError(f"网络请求失败: {e}") from e
@@ -131,23 +143,84 @@ class ClaudeChatPlugin(Plugin):
                 f"API 返回错误: status={resp.status_code}, body={resp.text[:500]}"
             )
 
+        # 解析 SSE 流，累积文本并定期更新消息
+        full_text = ""
+        last_patch_len = 0
+        last_patch_time = time.time()
+
         try:
-            data = resp.json()
-        except ValueError as e:
-            raise RuntimeError(f"API 响应解析失败: {e}") from e
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]  # 去掉 "data: " 前缀
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
 
-        # Anthropic Messages API 响应格式:
-        # {"content": [{"type": "text", "text": "..."}], ...}
-        content_blocks = data.get("content", [])
-        texts = [
-            block["text"]
-            for block in content_blocks
-            if block.get("type") == "text"
-        ]
-        if not texts:
-            raise RuntimeError(f"API 响应中无文本内容: {data}")
+                # 提取增量文本
+                delta_text = self._extract_delta_text(data)
+                if not delta_text:
+                    continue
 
-        return "\n".join(texts)
+                full_text += delta_text
+
+                # 按频率控制更新消息
+                if message_id:
+                    now = time.time()
+                    chars_since = len(full_text) - last_patch_len
+                    time_since = now - last_patch_time
+                    if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
+                        self._patch_text(message_id, full_text)
+                        last_patch_len = len(full_text)
+                        last_patch_time = now
+        finally:
+            resp.close()
+
+        if not full_text:
+            raise RuntimeError("API 流式响应中无文本内容")
+
+        # 最终更新一次完整内容
+        if message_id and len(full_text) > last_patch_len:
+            self._patch_text(message_id, full_text)
+
+        return full_text
+# PLACEHOLDER_HANDLE
+
+    @staticmethod
+    def _extract_delta_text(data: dict) -> str:
+        """从 SSE 事件数据中提取增量文本"""
+        # content_block_delta 事件
+        if data.get("type") == "content_block_delta":
+            delta = data.get("delta", {})
+            if delta.get("type") == "text_delta":
+                return delta.get("text", "")
+        return ""
+
+    @staticmethod
+    def _build_card(text: str) -> str:
+        """构造包含文本的飞书卡片 JSON"""
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude"},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "markdown", "content": text},
+            ],
+        }
+        return json.dumps(card)
+
+    def _patch_text(self, message_id: str, text: str) -> None:
+        """更新飞书卡片消息内容"""
+        content = self._build_card(text)
+        try:
+            self.bot.patch_message(message_id, content)
+        except Exception as e:
+            logger.warning("消息更新失败: %s", e)
 
     # ---- Plugin 接口实现 ----
 
@@ -186,22 +259,35 @@ class ClaudeChatPlugin(Plugin):
         # 2. 裁剪历史
         state["history"] = self._trim_history(state["history"])
 
-        # 3. 调用 API
+        # 3. 发送卡片占位消息，获取 message_id 用于后续更新
+        #    飞书 PatchMessage API 仅支持更新卡片消息，不支持纯文本
+        placeholder = self._build_card("正在思考...")
+        message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
+
+        # 4. 流式调用 API 并实时更新消息
         try:
-            reply_text = self._call_claude_api(state["history"])
+            reply_text = self._call_claude_api_stream(
+                state["history"], message_id, chat_id
+            )
         except RuntimeError as e:
             logger.error("Claude API 调用失败: %s", e)
             # 移除刚加入的用户消息，避免污染历史
             if state["history"] and state["history"][-1]["role"] == "user":
                 state["history"].pop()
-            self.bot.reply(chat_id, f"Claude 暂时无法回复，请稍后再试。\n错误: {e}")
+            # 更新占位消息为错误提示
+            error_msg = f"Claude 暂时无法回复，请稍后再试。\n错误: {e}"
+            if message_id:
+                self._patch_text(message_id, error_msg)
+            else:
+                self.bot.reply(chat_id, error_msg)
             return
 
-        # 4. 将 Claude 回复加入历史
+        # 5. 将 Claude 回复加入历史
         state["history"].append({"role": "assistant", "content": reply_text})
 
-        # 5. 发送回复
-        self.bot.reply(chat_id, reply_text)
+        # 6. 如果没有 message_id（降级模式），直接发送完整回复
+        if not message_id:
+            self.bot.reply(chat_id, reply_text)
 
     def is_user_active(self, user_id: str) -> bool:
         """用户是否在活跃会话中"""
