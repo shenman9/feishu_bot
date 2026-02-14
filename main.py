@@ -5,6 +5,7 @@
 from config import load_config
 from core.hub_bot import HubBot
 from plugins.rps_game import RPSPlugin
+from plugins.file_reader import FileReaderPlugin
 
 
 def main():
@@ -14,6 +15,7 @@ def main():
     # 注册插件（新增功能在此添加）
     bot.register_all([
         RPSPlugin(),
+        FileReaderPlugin(),
     ])
 
     bot.start()

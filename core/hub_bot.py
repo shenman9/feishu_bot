@@ -5,7 +5,7 @@ HubBot - 统一入口机器人
 
 from typing import Dict, List
 
-from core.feishu_bot import FeishuBot
+from core.feishu_bot import FeishuBot, _log
 from core.plugin import Plugin
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
@@ -27,7 +27,7 @@ class HubBot(FeishuBot):
     def register(self, plugin: Plugin) -> None:
         plugin.on_register(self)
         self.plugins[plugin.keyword] = plugin
-        print(f"[HubBot] 已注册插件: {plugin.name} (关键词='{plugin.keyword}')")
+        _log("INFO", f"已注册插件: {plugin.name} (关键词='{plugin.keyword}')")
 
     def register_all(self, plugins: List[Plugin]) -> None:
         for p in plugins:
@@ -109,3 +109,22 @@ class HubBot(FeishuBot):
             )
 
         return self.make_card_response(toast="请先选择一个功能（发送「菜单」查看）")
+
+    # ---- 文件消息路由 ----
+
+    def on_file_message(
+        self, sender_id: str, chat_id: str, message_id: str,
+        file_key: str, file_name: str
+    ) -> None:
+        """文件消息路由：转发给活跃插件，无活跃插件则提示"""
+        active_kw = self.active_plugin.get(sender_id)
+        if active_kw and active_kw in self.plugins:
+            plugin = self.plugins[active_kw]
+            plugin.handle_file_message(
+                sender_id, chat_id, message_id, file_key, file_name
+            )
+            if not plugin.is_user_active(sender_id):
+                self.active_plugin.pop(sender_id, None)
+            return
+
+        self.reply(chat_id, "请先发送「文件阅读」激活文件阅读功能，再上传文件。")

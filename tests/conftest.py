@@ -26,6 +26,7 @@ _im_v1_mock.__all__ = [
     "P2ImMessageReceiveV1",
     "CreateMessageRequest",
     "CreateMessageRequestBody",
+    "GetMessageResourceRequest",
 ]
 
 _modules = {
@@ -56,6 +57,7 @@ class StubPlugin(Plugin):
         self._keyword = keyword
         self._description = description
         self.received_messages: list[tuple] = []
+        self.received_file_messages: list[tuple] = []
 
     @property
     def name(self) -> str:
@@ -71,6 +73,14 @@ class StubPlugin(Plugin):
 
     def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
         self.received_messages.append((user_id, chat_id, text))
+
+    def handle_file_message(
+        self, user_id: str, chat_id: str, message_id: str,
+        file_key: str, file_name: str
+    ) -> None:
+        self.received_file_messages.append(
+            (user_id, chat_id, message_id, file_key, file_name)
+        )
 
 
 @pytest.fixture

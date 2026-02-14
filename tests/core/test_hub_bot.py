@@ -131,3 +131,33 @@ class TestCardActionRouting:
         mock_bot.make_card_response = MagicMock(return_value="toast_resp")
         result = mock_bot.on_card_action("u1", "c1", "m1", {})
         assert result == "toast_resp"
+
+
+class TestFileMessageRouting:
+    """文件消息路由测试"""
+
+    def test_file_message_routes_to_active_plugin(self, bot_with_plugin):
+        """文件消息转发给活跃插件"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("u1", "c1", "test")  # 激活插件
+        bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
+        assert plugin.received_file_messages == [
+            ("u1", "c1", "msg1", "fk1", "a.txt")
+        ]
+
+    def test_file_message_no_active_plugin_shows_hint(self, bot_with_plugin):
+        """无活跃插件时提示用户"""
+        bot, plugin = bot_with_plugin
+        bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
+        bot.reply.assert_called_once()
+        msg = bot.reply.call_args[0][1]
+        assert "文件阅读" in msg
+
+    def test_file_message_auto_deactivate(self, mock_bot):
+        """文件消息处理后插件 is_user_active=False 时自动移除"""
+        p = StubPlugin(keyword="fp")
+        mock_bot.register(p)
+        mock_bot.on_message("u1", "c1", "fp")
+        # StubPlugin.is_user_active 默认返回 False
+        mock_bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
+        assert "u1" not in mock_bot.active_plugin

@@ -60,6 +60,13 @@ class Plugin(ABC):
         )
         return P2CardActionTriggerResponse()
 
+    def handle_file_message(
+        self, user_id: str, chat_id: str, message_id: str,
+        file_key: str, file_name: str
+    ) -> None:
+        """处理路由过来的文件消息，默认忽略，需要处理文件的插件覆写此方法"""
+        pass
+
     # ---- 会话状态 ----
 
     def is_user_active(self, user_id: str) -> bool:

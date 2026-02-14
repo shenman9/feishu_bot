@@ -4,8 +4,15 @@
 """
 
 import json
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+# 消息去重缓存最大容量和过期时间
+_DEDUP_MAX_SIZE = 500
+_DEDUP_TTL = 300  # 5 分钟
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
@@ -15,6 +22,15 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     CallBackCard,
     CallBackToast,
 )
+
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _log(level: str, msg: str) -> None:
+    """带时间戳的日志输出（北京时间）"""
+    ts = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
 
 
 class FeishuBot(ABC):
@@ -29,6 +45,7 @@ class FeishuBot(ABC):
     def __init__(self, app_id: str, app_secret: str):
         self.app_id = app_id
         self.app_secret = app_secret
+        self._seen_messages: OrderedDict[str, float] = OrderedDict()
 
         self.client = lark.Client.builder() \
             .app_id(app_id) \
@@ -43,19 +60,51 @@ class FeishuBot(ABC):
 
     # ---- 消息收发层 ----
 
+    def _is_duplicate(self, message_id: str) -> bool:
+        """检查消息是否重复，同时清理过期条目"""
+        now = time.time()
+        if message_id in self._seen_messages:
+            return True
+        # 清理过期条目
+        while self._seen_messages:
+            oldest_id, ts = next(iter(self._seen_messages.items()))
+            if now - ts > _DEDUP_TTL:
+                self._seen_messages.pop(oldest_id)
+            else:
+                break
+        # 容量上限兜底
+        if len(self._seen_messages) >= _DEDUP_MAX_SIZE:
+            self._seen_messages.popitem(last=False)
+        self._seen_messages[message_id] = now
+        return False
+
     def _on_raw_message(self, data: P2ImMessageReceiveV1) -> None:
-        """解析原始消息，提取关键字段后交给子类处理"""
+        """解析原始消息，根据消息类型分发到对应处理方法"""
         message = data.event.message
+        sender_id = data.event.sender.sender_id.user_id
+        chat_id = message.chat_id
+        message_id = message.message_id
+        msg_type = message.message_type
+
+        # 消息去重，防止飞书重试导致重复处理
+        if self._is_duplicate(message_id):
+            _log("INFO", f"跳过重复消息: message_id={message_id}")
+            return
+
         try:
             content_dict = json.loads(message.content)
-            text = content_dict.get("text", "").strip()
         except (json.JSONDecodeError, AttributeError):
             return
 
-        sender_id = data.event.sender.sender_id.user_id
-        chat_id = message.chat_id
-        print(f"[INFO] 收到消息: user={sender_id}, text={text}")
-        self.on_message(sender_id, chat_id, text)
+        if msg_type == "file":
+            file_key = content_dict.get("file_key", "")
+            file_name = content_dict.get("file_name", "")
+            _log("INFO", f"收到文件: user={sender_id}, message_id={message_id}, file={file_name}")
+            self.on_file_message(sender_id, chat_id, message_id, file_key, file_name)
+        else:
+            text = content_dict.get("text", "").strip()
+            _log("INFO", f"收到消息: user={sender_id}, message_id={message_id}, text={text}")
+            self.on_message(sender_id, chat_id, text)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         """解析卡片按钮点击事件，交给子类处理"""
@@ -63,7 +112,7 @@ class FeishuBot(ABC):
         chat_id = data.event.context.open_chat_id
         message_id = data.event.context.open_message_id
         action_value = data.event.action.value or {}
-        print(f"[INFO] 卡片点击: user={user_id}, action={action_value}")
+        _log("INFO", f"卡片点击: user={user_id}, action={action_value}")
         return self.on_card_action(user_id, chat_id, message_id, action_value)
 
     def send_message(self, chat_id: str, msg_type: str, content: str) -> None:
@@ -78,7 +127,7 @@ class FeishuBot(ABC):
             .build()
         response = self.client.im.v1.message.create(request)
         if not response.success():
-            print(f"[ERROR] 发送失败: code={response.code}, msg={response.msg}")
+            _log("ERROR", f"发送失败: code={response.code}, msg={response.msg}")
 
     def reply(self, chat_id: str, text: str) -> None:
         """发送文本消息"""
@@ -106,6 +155,29 @@ class FeishuBot(ABC):
             resp.card.data = card
         return resp
 
+    def download_file(self, message_id: str, file_key: str) -> bytes:
+        """下载飞书消息中的文件，返回文件二进制内容
+
+        Args:
+            message_id: 消息 ID
+            file_key: 文件的 file_key
+
+        Returns:
+            文件的二进制内容
+
+        Raises:
+            RuntimeError: 下载失败时抛出
+        """
+        request = GetMessageResourceRequest.builder() \
+            .message_id(message_id) \
+            .file_key(file_key) \
+            .type("file") \
+            .build()
+        response = self.client.im.v1.message_resource.get(request)
+        if not response.success():
+            raise RuntimeError(f"文件下载失败: code={response.code}, msg={response.msg}")
+        return response.file.read()
+
     # ---- 业务逻辑层 (子类实现) ----
 
     @abstractmethod
@@ -119,6 +191,13 @@ class FeishuBot(ABC):
         """处理卡片按钮点击，子类可覆写"""
         return P2CardActionTriggerResponse()
 
+    def on_file_message(
+        self, sender_id: str, chat_id: str, message_id: str,
+        file_key: str, file_name: str
+    ) -> None:
+        """处理收到的文件消息，子类可覆写"""
+        pass
+
     # ---- 启动 ----
 
     def start(self) -> None:
@@ -128,5 +207,5 @@ class FeishuBot(ABC):
             event_handler=self._event_handler,
             log_level=lark.LogLevel.INFO,
         )
-        print("机器人启动中，正在连接飞书...")
+        _log("INFO", "机器人启动中，正在连接飞书...")
         ws_client.start()
