@@ -1,3 +1,12 @@
 # 飞书应用凭证
 app_id: "your_app_id_here"
 app_secret: "your_app_secret_here"
+
+# Claude 对话插件配置
+claude:
+  api_url: "https://api.lingyaai.cn/v1/messages"
+  api_key: "your_claude_api_key_here"
+  model: "claude-opus-4-6"
+  max_history: 20          # 每个用户保留的最大消息条数（一问一答算 2 条）
+  max_tokens: 4096         # 单次回复最大 token 数
+  system_prompt: ""        # 可选的系统提示词

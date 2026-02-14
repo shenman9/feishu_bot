@@ -6,6 +6,7 @@ from config import load_config
 from core.hub_bot import HubBot
 from plugins.rps_game import RPSPlugin
 from plugins.file_reader import FileReaderPlugin
+from plugins.claude_chat import ClaudeChatPlugin
 
 
 def main():
@@ -16,6 +17,7 @@ def main():
     bot.register_all([
         RPSPlugin(),
         FileReaderPlugin(),
+        ClaudeChatPlugin(),
     ])
 
     bot.start()
