@@ -10,14 +10,25 @@ feishu_bot/
 ├── config.py                # 配置加载
 ├── config.yaml              # 实际配置（不提交）
 ├── config.yaml.example      # 配置模板
+├── pyproject.toml           # pytest 配置
+├── requirements-dev.txt     # 测试依赖
 ├── core/                    # 核心框架
 │   ├── feishu_bot.py        # 机器人基类（WebSocket 连接、消息收发）
 │   ├── hub_bot.py           # 统一入口（插件注册、消息路由、功能菜单）
 │   └── plugin.py            # 插件抽象基类
-└── plugins/                 # 功能插件（每个插件一个独立目录）
-    ├── README.md            # 插件开发指南
-    └── rps_game/            # 石头剪刀布（示例插件）
-        └── rps_plugin.py
+├── plugins/                 # 功能插件（每个插件一个独立目录）
+│   ├── README.md            # 插件开发指南
+│   └── rps_game/            # 石头剪刀布（示例插件）
+│       └── rps_plugin.py
+└── tests/                   # 测试套件
+    ├── README.md            # 测试开发指南
+    ├── conftest.py          # 共享夹具（mock bot、StubPlugin 等）
+    ├── core/                # 核心框架测试
+    │   ├── test_config.py
+    │   ├── test_hub_bot.py
+    │   └── test_plugin.py
+    └── plugins/             # 插件测试
+        └── test_rps_plugin.py
 ```
 
 ## 快速开始
@@ -26,6 +37,7 @@ feishu_bot/
 
 ```bash
 pip install lark-oapi pyyaml
+pip install -r requirements-dev.txt  # 测试依赖
 ```
 
 ### 2. 配置
@@ -84,3 +96,29 @@ bot.register_all([
 - `FeishuBot`：封装飞书 WebSocket 连接和消息收发，子类实现 `on_message`
 - `HubBot`：继承 FeishuBot，负责插件注册和消息路由
 - `Plugin`：插件抽象基类，定义统一接口，插件之间代码完全独立
+
+## 测试
+
+测试框架基于 pytest，通过 mock 隔离 `lark_oapi` 依赖，无需飞书连接即可运行。
+
+```bash
+# 运行全部测试
+pytest
+
+# 运行指定模块
+pytest tests/core/
+pytest tests/plugins/test_rps_plugin.py
+
+# 按名称匹配
+pytest -k "menu"
+```
+
+`tests/conftest.py` 提供了三个共享 fixture：
+
+| Fixture | 说明 |
+|---------|------|
+| `mock_bot` | `reply()` / `reply_card()` 被 mock 的 HubBot 实例 |
+| `stub_plugin` | 最小化插件实现，记录收到的消息到 `received_messages` |
+| `bot_with_plugin` | `(mock_bot, stub_plugin)` 元组，插件已注册 |
+
+新增插件时，在 `tests/plugins/` 下创建对应的 `test_<plugin_name>.py` 即可。详细指南见 [tests/README.md](tests/README.md)。
