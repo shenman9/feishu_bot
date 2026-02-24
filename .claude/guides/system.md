@@ -26,6 +26,7 @@
 
 * **语言**: Python 3.10+
 * **并发模式**: `asyncio` (异步 I/O)。所有 I/O 操作（网络请求、数据库）必须是异步的 (`await`)。
+* **核心依赖**: `lark-oapi`（飞书 SDK）、`pyyaml`（配置解析）、`httpx`（HTTP 客户端）、`schedule`（定时任务）、`jinja2`（模板引擎）
 * **依赖管理**: `pip` + `requirements.txt`。
 * **测试框架**: `pytest`。
 

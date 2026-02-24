@@ -66,7 +66,19 @@ class MyPlugin(Plugin):
 | `self.bot.reply(chat_id, text)` | 发送文本消息 |
 | `self.bot.reply_card(chat_id, card_dict)` | 发送交互卡片 |
 | `self.bot.send_message(chat_id, msg_type, content)` | 发送任意类型消息 |
+| `self.bot.send_message_get_id(chat_id, msg_type, content)` | 发送消息并返回 message_id |
+| `self.bot.patch_message(message_id, content)` | 更新已发送的卡片内容（用于进度更新、流式响应等） |
 | `self.bot.make_card_response(card=None, toast=None)` | 构造卡片按钮点击的响应（更新卡片/弹 toast） |
+
+## 生命周期钩子
+
+```python
+def on_register(self, bot) -> None:
+    """插件被注册到 HubBot 时调用。可用于初始化定时任务、后台线程等。
+    务必先调用 super().on_register(bot) 以正确绑定 self.bot。"""
+    super().on_register(bot)
+    # 自定义初始化逻辑
+```
 
 ## 卡片按钮路由
 
@@ -90,4 +102,9 @@ class MyPlugin(Plugin):
 
 ## 示例
 
-参考 `rps_game/` 目录中的石头剪刀布插件实现。
+| 插件 | 目录 | 特性参考 |
+|------|------|---------|
+| 石头剪刀布 | `rps_game/` | 基础交互、用户状态管理 |
+| 文件阅读 | `file_reader/` | 文件上传处理 |
+| Claude 对话 | `claude_chat/` | 流式响应、`patch_message` 实时更新卡片 |
+| 论文日报 | `paper_daily/` | 后台线程、定时推送（`on_register` + `schedule`）、订阅管理、进度卡片 |

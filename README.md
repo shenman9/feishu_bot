@@ -18,17 +18,15 @@ feishu_bot/
 │   └── plugin.py            # 插件抽象基类
 ├── plugins/                 # 功能插件（每个插件一个独立目录）
 │   ├── README.md            # 插件开发指南
-│   └── rps_game/            # 石头剪刀布（示例插件）
-│       └── rps_plugin.py
+│   ├── rps_game/            # 石头剪刀布（示例插件）
+│   ├── file_reader/         # 文件阅读（上传 txt 文件读取内容）
+│   ├── claude_chat/         # Claude 对话（多轮智能对话，流式响应）
+│   └── paper_daily/         # 论文日报（ArXiv 论文 AI 筛选与每日推送）
 └── tests/                   # 测试套件
     ├── README.md            # 测试开发指南
     ├── conftest.py          # 共享夹具（mock bot、StubPlugin 等）
     ├── core/                # 核心框架测试
-    │   ├── test_config.py
-    │   ├── test_hub_bot.py
-    │   └── test_plugin.py
     └── plugins/             # 插件测试
-        └── test_rps_plugin.py
 ```
 
 ## 快速开始
@@ -36,7 +34,7 @@ feishu_bot/
 ### 1. 安装依赖
 
 ```bash
-pip install lark-oapi pyyaml
+pip install lark-oapi pyyaml httpx schedule jinja2
 pip install -r requirements-dev.txt  # 测试依赖
 ```
 
@@ -46,7 +44,7 @@ pip install -r requirements-dev.txt  # 测试依赖
 cp config.yaml.example config.yaml
 ```
 
-编辑 `config.yaml`，填入飞书应用的凭证：
+编辑 `config.yaml`，填入飞书应用的凭证及各插件配置（详见 `config.yaml.example` 中的注释）：
 
 ```yaml
 app_id: "your_app_id"
@@ -68,8 +66,17 @@ python main.py
 | 用户发送 | 机器人行为 |
 |---------|-----------|
 | `菜单` / `帮助` | 展示功能菜单卡片 |
-| 插件关键词（如 `石头剪刀布`） | 激活对应插件 |
+| 插件关键词 | 激活对应插件 |
 | `退出` / `返回` | 退出当前插件，回到主菜单 |
+
+### 已有插件
+
+| 关键词 | 插件 | 说明 |
+|--------|------|------|
+| `石头剪刀布` | RPSPlugin | 猜拳小游戏 |
+| `文件阅读` | FileReaderPlugin | 上传 txt 文件读取内容 |
+| `Claude` | ClaudeChatPlugin | 多轮智能对话，流式响应实时更新卡片 |
+| `论文日报` | PaperDailyPlugin | ArXiv 论文 AI 筛选与中文摘要，支持订阅每日定时推送 |
 
 ### 底部菜单栏触发
 
