@@ -10,3 +10,21 @@ claude:
   max_history: 20          # 每个用户保留的最大消息条数（一问一答算 2 条）
   max_tokens: 4096         # 单次回复最大 token 数
   system_prompt: ""        # 可选的系统提示词
+
+# 论文日报插件配置
+paper_daily:
+  topics:
+    - "Attention机制"
+    - "Memory机制"
+    - "KV cache压缩"
+    - "Retrieval(检索)"
+    - "长序列"
+  categories:
+    - "cs.CL"
+    - "cs.AI"
+    - "cs.LG"
+  max_papers: 50             # LLM 处理的最大论文数
+  llm_base_url: "https://api.lingyaai.cn"
+  llm_api_key: "your_llm_api_key_here"
+  llm_model: "claude-opus-4-6"
+  schedule_time: "10:00"     # 每日定时推送时间（北京时间）

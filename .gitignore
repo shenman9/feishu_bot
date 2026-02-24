@@ -4,3 +4,8 @@ config.yaml
 # .claude 目录：忽略本地配置，但跟踪开发指南
 .claude/*
 !.claude/guides/
+# 论文日报插件运行时产物
+plugins/paper_daily/cache/
+plugins/paper_daily/reports/
+plugins/paper_daily/logs/
+plugins/paper_daily/subscribers.json
