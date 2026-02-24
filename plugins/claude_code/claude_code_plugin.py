@@ -141,6 +141,7 @@ class ClaudeCodePlugin(Plugin):
         """安全终止用户的运行中进程"""
         proc = self._running_processes.pop(user_id, None)
         if proc and proc.poll() is None:
+            logger.info("[CC] 终止进程: user=%s, pid=%d", user_id, proc.pid)
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
@@ -199,6 +200,7 @@ class ClaudeCodePlugin(Plugin):
         state = self._get_state(user_id)
         cfg = self._load_plugin_config()
         timer: Optional[threading.Timer] = None
+        start_time = time.time()
 
         try:
             cmd = self._build_command(
@@ -206,6 +208,12 @@ class ClaudeCodePlugin(Plugin):
                 resume=state.get("session_started", False),
             )
             cwd = state.get("working_dir") or cfg["default_working_dir"] or None
+
+            logger.info(
+                "[CC] 启动子进程: user=%s, session=%s, resume=%s, cwd=%s",
+                user_id, state["session_id"][:8], state.get("session_started", False), cwd,
+            )
+            logger.debug("[CC] 完整命令: %s", cmd)
 
             env, preexec_fn = self._prepare_subprocess_env()
 
@@ -220,6 +228,7 @@ class ClaudeCodePlugin(Plugin):
                 preexec_fn=preexec_fn,
             )
             self._running_processes[user_id] = proc
+            logger.info("[CC] 子进程已启动: pid=%d, user=%s", proc.pid, user_id)
 
             # 启动超时定时器
             timer = self._start_timeout_timer(user_id, cfg["timeout"])
@@ -231,13 +240,17 @@ class ClaudeCodePlugin(Plugin):
             cost_info = ""
             has_assistant_text = False
 
+            line_count = 0
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
+                line_count += 1
 
                 text_chunk, meta = self._parse_stream_line(line, has_assistant_text)
                 if text_chunk:
+                    if not has_assistant_text:
+                        logger.info("[CC] 收到首条输出: user=%s, pid=%d", user_id, proc.pid)
                     has_assistant_text = True
                     full_text += text_chunk
 
@@ -245,6 +258,10 @@ class ClaudeCodePlugin(Plugin):
                     if len(full_text) > cfg["max_output_chars"]:
                         full_text = full_text[:cfg["max_output_chars"]]
                         full_text += "\n\n**[输出已截断，超出飞书卡片字符限制]**"
+                        logger.warning(
+                            "[CC] 输出截断: user=%s, 字符数已达 %d 上限",
+                            user_id, cfg["max_output_chars"],
+                        )
                         self._kill_process(user_id)
                         break
 
@@ -260,14 +277,26 @@ class ClaudeCodePlugin(Plugin):
 
                 if meta:
                     cost_info = meta
+                    logger.info("[CC] 收到结果统计: user=%s, %s", user_id, meta)
 
             # 等待进程结束
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                logger.warning("[CC] 进程等待超时，强制终止: user=%s, pid=%d", user_id, proc.pid)
                 self._kill_process(user_id)
 
             stderr_output = proc.stderr.read() if proc.stderr else ""
+            elapsed = time.time() - start_time
+
+            logger.info(
+                "[CC] 子进程结束: user=%s, pid=%d, returncode=%s, "
+                "耗时=%.1fs, 输出行数=%d, 输出字符数=%d",
+                user_id, proc.pid, proc.returncode,
+                elapsed, line_count, len(full_text),
+            )
+            if stderr_output:
+                logger.debug("[CC] stderr 输出: %s", stderr_output[:500])
 
             # 进程正常结束后标记会话已启动，后续调用使用 --resume
             if proc.returncode == 0:
@@ -287,14 +316,18 @@ class ClaudeCodePlugin(Plugin):
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI 未安装或路径错误，请检查配置。"
-            logger.error(error_msg)
+            logger.error("[CC] CLI 未找到: %s", self._load_plugin_config()["claude_path"])
             if message_id:
                 self._patch_card(message_id, error_msg, running=False)
             else:
                 self.bot.reply(chat_id, error_msg)
 
         except Exception as e:
-            logger.error("Claude Code 执行失败: %s", e, exc_info=True)
+            elapsed = time.time() - start_time
+            logger.error(
+                "[CC] 执行异常: user=%s, 耗时=%.1fs, error=%s",
+                user_id, elapsed, e, exc_info=True,
+            )
             error_msg = f"执行失败: {e}"
             if message_id:
                 self._patch_card(message_id, error_msg, running=False)
@@ -307,6 +340,7 @@ class ClaudeCodePlugin(Plugin):
             state["running"] = False
             self._running_processes.pop(user_id, None)
             self._running_threads.pop(user_id, None)
+            logger.info("[CC] 任务清理完成: user=%s", user_id)
 
     def _start_timeout_timer(self, user_id: str, timeout: int) -> threading.Timer:
         """启动超时定时器，超时后终止进程"""
@@ -435,6 +469,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 1. 关键词激活
         if text == self.keyword:
+            logger.info("[CC] 用户激活插件: user=%s", user_id)
             state["active"] = True
             state["last_chat_id"] = chat_id
             session_id = state["session_id"]
@@ -457,6 +492,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 2. 特殊指令：新会话
         if text == "新会话":
+            logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
             self._kill_process(user_id)
             state["session_id"] = str(uuid.uuid4())
             state["session_started"] = False
@@ -470,6 +506,7 @@ class ClaudeCodePlugin(Plugin):
         # 3. 特殊指令：取消
         if text == "取消":
             if state["running"]:
+                logger.info("[CC] 用户取消任务: user=%s", user_id)
                 self._kill_process(user_id)
                 state["running"] = False
                 self.bot.reply(chat_id, "已取消当前任务。")
@@ -494,6 +531,7 @@ class ClaudeCodePlugin(Plugin):
         if text.startswith("切换目录 "):
             new_dir = text[len("切换目录 "):].strip()
             if os.path.isdir(new_dir):
+                logger.info("[CC] 用户切换目录: user=%s, dir=%s", user_id, new_dir)
                 state["working_dir"] = new_dir
                 self.bot.reply(chat_id, f"工作目录已切换: {new_dir}")
             else:
@@ -502,6 +540,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 6. 并发控制：运行中拒绝新任务
         if state["running"]:
+            logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
                 chat_id,
                 "上一个任务仍在运行中，请等待完成或发送「取消」终止。",
@@ -511,6 +550,10 @@ class ClaudeCodePlugin(Plugin):
         # 7. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
         state["last_chat_id"] = chat_id
+        logger.info(
+            "[CC] 开始执行 prompt: user=%s, session=%s, prompt长度=%d",
+            user_id, state["session_id"][:8], len(text),
+        )
 
         # 发送占位卡片
         placeholder = self._build_card("正在启动 Claude Code...", running=True)
@@ -538,6 +581,7 @@ class ClaudeCodePlugin(Plugin):
         if action == "cancel":
             state = self._get_state(user_id)
             if state.get("running"):
+                logger.info("[CC] 卡片取消按钮点击: user=%s", user_id)
                 self._kill_process(user_id)
                 state["running"] = False
                 return self.bot.make_card_response(toast="已取消执行")
