@@ -28,3 +28,18 @@ paper_daily:
   llm_api_key: "your_llm_api_key_here"
   llm_model: "claude-opus-4-6"
   schedule_time: "10:00"     # 每日定时推送时间（北京时间）
+
+# Claude Code 桥接插件配置
+claude_code:
+  claude_path: "/usr/bin/claude"        # Claude Code CLI 路径
+  default_working_dir: ""               # 默认工作目录（空=机器人进程当前目录）
+  timeout: 600                          # 单次执行超时（秒）
+  max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
+  permission_mode: "bypassPermissions"  # 权限模式（需配合 run_as_user 使用）
+  max_turns: 50                         # Claude Code 最大轮次
+  run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
+  # Docker 部署说明：
+  # 1. 在容器中创建非 root 用户: useradd -m claudebot
+  # 2. 设置 run_as_user: "claudebot"
+  # 3. 在该用户主目录下完成 claude 鉴权: su - claudebot -c "claude auth login"
+  # 4. 工作目录建议设在用户主目录下: default_working_dir: "/home/claudebot/work"
