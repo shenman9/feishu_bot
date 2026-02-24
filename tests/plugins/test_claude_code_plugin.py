@@ -154,14 +154,17 @@ class TestUserCommands:
     """用户特殊指令测试"""
 
     def test_new_session(self, plugin):
-        """「新会话」重置 session_id"""
+        """「新会话」重置 session_id 和 session_started"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         old_session = plugin._get_state("u1")["session_id"]
+        # 模拟已完成过一次调用
+        plugin._get_state("u1")["session_started"] = True
 
         plugin.handle_message("u1", "c1", "新会话")
-        new_session = plugin._get_state("u1")["session_id"]
+        state = plugin._get_state("u1")
 
-        assert old_session != new_session
+        assert state["session_id"] != old_session
+        assert state["session_started"] is False
         msg = plugin.bot.reply.call_args[0][1]
         assert "已重置" in msg
 
@@ -390,7 +393,7 @@ class TestSubprocessExecution:
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_command_includes_session_id(self, mock_popen_cls, plugin):
-        """命令行参数包含 session-id"""
+        """首次调用命令行参数包含 --session-id"""
         mock_popen_cls.return_value = _mock_popen([
             _make_result_event() + "\n",
         ])
@@ -406,6 +409,60 @@ class TestSubprocessExecution:
         cmd = mock_popen_cls.call_args[0][0]
         assert "--session-id" in cmd
         assert session_id in cmd
+        assert "--resume" not in cmd
+
+    @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
+    def test_session_started_after_success(self, mock_popen_cls, plugin):
+        """成功执行后 session_started 标记为 True"""
+        mock_popen_cls.return_value = _mock_popen([
+            _make_assistant_event("Hello!") + "\n",
+            _make_result_event() + "\n",
+        ])
+
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        assert plugin._get_state("u1")["session_started"] is False
+
+        plugin.handle_message("u1", "c1", "test")
+
+        thread = plugin._running_threads.get("u1")
+        if thread:
+            thread.join(timeout=10)
+
+        assert plugin._get_state("u1")["session_started"] is True
+
+    @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
+    def test_second_call_uses_resume(self, mock_popen_cls, plugin):
+        """第二次调用使用 --resume 而非 --session-id"""
+        mock_popen_cls.return_value = _mock_popen([
+            _make_assistant_event("Hello!") + "\n",
+            _make_result_event() + "\n",
+        ])
+
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "first prompt")
+
+        thread = plugin._running_threads.get("u1")
+        if thread:
+            thread.join(timeout=10)
+
+        # 重置 mock 以捕获第二次调用
+        mock_popen_cls.reset_mock()
+        mock_popen_cls.return_value = _mock_popen([
+            _make_assistant_event("World!") + "\n",
+            _make_result_event() + "\n",
+        ])
+
+        session_id = plugin._get_state("u1")["session_id"]
+        plugin.handle_message("u1", "c1", "second prompt")
+
+        thread = plugin._running_threads.get("u1")
+        if thread:
+            thread.join(timeout=10)
+
+        cmd = mock_popen_cls.call_args[0][0]
+        assert "--resume" in cmd
+        assert session_id in cmd
+        assert "--session-id" not in cmd
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_empty_output(self, mock_popen_cls, plugin):
@@ -504,7 +561,7 @@ class TestBuildCommand:
     """CLI 命令构建测试"""
 
     def test_basic_command(self, plugin):
-        """基本命令参数正确"""
+        """基本命令参数正确（新会话使用 --session-id）"""
         cmd = plugin._build_command("hello", "test-session-id")
         assert cmd[0] == "/usr/bin/claude"
         assert "-p" in cmd
@@ -513,6 +570,14 @@ class TestBuildCommand:
         assert "stream-json" in cmd
         assert "--session-id" in cmd
         assert "test-session-id" in cmd
+        assert "--resume" not in cmd
+
+    def test_resume_command(self, plugin):
+        """恢复已有会话使用 --resume 而非 --session-id"""
+        cmd = plugin._build_command("hello", "test-session-id", resume=True)
+        assert "--resume" in cmd
+        assert "test-session-id" in cmd
+        assert "--session-id" not in cmd
 
     def test_permission_mode(self, plugin):
         """包含权限模式参数"""

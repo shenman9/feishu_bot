@@ -91,6 +91,7 @@ class ClaudeCodePlugin(Plugin):
             self.user_states[user_id] = {
                 "active": False,
                 "session_id": str(uuid.uuid4()),
+                "session_started": False,
                 "running": False,
                 "working_dir": cfg["default_working_dir"],
                 "last_chat_id": "",
@@ -108,16 +109,27 @@ class ClaudeCodePlugin(Plugin):
 
     # ---- 子进程管理 ----
 
-    def _build_command(self, prompt: str, session_id: str) -> list[str]:
-        """构造 Claude Code CLI 命令行参数"""
+    def _build_command(
+        self, prompt: str, session_id: str, *, resume: bool = False
+    ) -> list[str]:
+        """构造 Claude Code CLI 命令行参数
+
+        Args:
+            prompt: 用户提示词
+            session_id: 会话 ID
+            resume: 是否为恢复已有会话（第二次及后续调用）
+        """
         cfg = self._load_plugin_config()
         cmd = [
             cfg["claude_path"],
             "-p", prompt,
             "--output-format", "stream-json",
-            "--session-id", session_id,
-            "--verbose",
         ]
+        if resume:
+            cmd.extend(["--resume", session_id])
+        else:
+            cmd.extend(["--session-id", session_id])
+        cmd.append("--verbose")
         perm = cfg.get("permission_mode", "")
         if perm:
             cmd.extend(["--permission-mode", perm])
@@ -189,7 +201,10 @@ class ClaudeCodePlugin(Plugin):
         timer: Optional[threading.Timer] = None
 
         try:
-            cmd = self._build_command(prompt, state["session_id"])
+            cmd = self._build_command(
+                prompt, state["session_id"],
+                resume=state.get("session_started", False),
+            )
             cwd = state.get("working_dir") or cfg["default_working_dir"] or None
 
             env, preexec_fn = self._prepare_subprocess_env()
@@ -253,6 +268,10 @@ class ClaudeCodePlugin(Plugin):
                 self._kill_process(user_id)
 
             stderr_output = proc.stderr.read() if proc.stderr else ""
+
+            # 进程正常结束后标记会话已启动，后续调用使用 --resume
+            if proc.returncode == 0:
+                state["session_started"] = True
 
             # 最终内容组装
             if not full_text:
@@ -440,6 +459,7 @@ class ClaudeCodePlugin(Plugin):
         if text == "新会话":
             self._kill_process(user_id)
             state["session_id"] = str(uuid.uuid4())
+            state["session_started"] = False
             state["running"] = False
             self.bot.reply(
                 chat_id,
