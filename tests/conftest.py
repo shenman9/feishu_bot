@@ -34,6 +34,9 @@ _im_v1_mock.__all__ = [
 _modules = {
     "lark_oapi": _lark_mock,
     "lark_oapi.api.im.v1": _im_v1_mock,
+    "lark_oapi.api.application.v6.model.p2_application_bot_menu_v6": (
+        _lark_mock.api.application.v6.model.p2_application_bot_menu_v6
+    ),
     "lark_oapi.event.callback.model.p2_card_action_trigger": (
         _lark_mock.event.callback.model.p2_card_action_trigger
     ),

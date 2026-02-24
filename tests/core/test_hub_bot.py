@@ -161,3 +161,39 @@ class TestFileMessageRouting:
         # StubPlugin.is_user_active 默认返回 False
         mock_bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
         assert "u1" not in mock_bot.active_plugin
+
+
+class TestBotMenuRouting:
+    """机器人底部菜单栏事件路由测试"""
+
+    def test_bot_menu_activates_plugin(self, bot_with_plugin):
+        """菜单点击匹配插件 keyword 时激活插件"""
+        bot, plugin = bot_with_plugin
+        bot.on_bot_menu("user1", "ou_open1", "test")
+        assert bot.active_plugin.get("user1") == "test"
+        assert plugin.received_messages == [("user1", "ou_open1", "test")]
+
+    def test_bot_menu_switches_plugin(self, mock_bot):
+        """菜单点击切换插件时旧插件被 deactivate"""
+        p1 = StubPlugin(name="A", keyword="a")
+        p2 = StubPlugin(name="B", keyword="b")
+        p1.deactivate_user = MagicMock()
+        mock_bot.register_all([p1, p2])
+
+        mock_bot.on_bot_menu("user1", "ou_open1", "a")
+        mock_bot.on_bot_menu("user1", "ou_open1", "b")
+
+        p1.deactivate_user.assert_called_once_with("user1")
+        assert mock_bot.active_plugin["user1"] == "b"
+
+    def test_bot_menu_unknown_key_shows_menu(self, bot_with_plugin):
+        """菜单点击未匹配任何插件时展示菜单"""
+        bot, plugin = bot_with_plugin
+        bot.on_bot_menu("user1", "ou_open1", "不存在的功能")
+        bot.reply_card.assert_called_once()
+
+    def test_bot_menu_menu_keyword_shows_menu(self, bot_with_plugin):
+        """菜单点击菜单关键词时展示功能菜单"""
+        bot, plugin = bot_with_plugin
+        bot.on_bot_menu("user1", "ou_open1", "菜单")
+        bot.reply_card.assert_called_once()

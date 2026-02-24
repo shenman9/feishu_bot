@@ -16,6 +16,9 @@ _DEDUP_TTL = 300  # 5 分钟
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
+from lark_oapi.api.application.v6.model.p2_application_bot_menu_v6 import (
+    P2ApplicationBotMenuV6,
+)
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger,
     P2CardActionTriggerResponse,
@@ -56,6 +59,7 @@ class FeishuBot(ABC):
         self._event_handler = lark.EventDispatcherHandler.builder("", "") \
             .register_p2_im_message_receive_v1(self._on_raw_message) \
             .register_p2_card_action_trigger(self._on_raw_card_action) \
+            .register_p2_application_bot_menu_v6(self._on_raw_bot_menu) \
             .build()
 
     # ---- 消息收发层 ----
@@ -115,10 +119,27 @@ class FeishuBot(ABC):
         _log("INFO", f"卡片点击: user={user_id}, action={action_value}")
         return self.on_card_action(user_id, chat_id, message_id, action_value)
 
+    def _on_raw_bot_menu(self, data: P2ApplicationBotMenuV6) -> None:
+        """解析机器人菜单点击事件，交给子类处理"""
+        operator = data.event.operator
+        user_id = operator.operator_id.user_id
+        open_id = operator.operator_id.open_id
+        event_key = data.event.event_key
+        _log("INFO", f"菜单点击: user={user_id}, event_key={event_key}")
+        self.on_bot_menu(user_id, open_id, event_key)
+
+    @staticmethod
+    def _detect_id_type(receive_id: str) -> str:
+        """根据 ID 前缀自动判断 receive_id_type（ou_ → open_id，默认 chat_id）"""
+        if receive_id.startswith("ou_"):
+            return "open_id"
+        return "chat_id"
+
     def send_message(self, chat_id: str, msg_type: str, content: str) -> None:
         """发送任意类型消息"""
+        id_type = self._detect_id_type(chat_id)
         request = CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
+            .receive_id_type(id_type) \
             .request_body(CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
                 .msg_type(msg_type)
@@ -131,8 +152,9 @@ class FeishuBot(ABC):
 
     def send_message_get_id(self, chat_id: str, msg_type: str, content: str) -> Optional[str]:
         """发送消息并返回 message_id，失败时返回 None"""
+        id_type = self._detect_id_type(chat_id)
         request = CreateMessageRequest.builder() \
-            .receive_id_type("chat_id") \
+            .receive_id_type(id_type) \
             .request_body(CreateMessageRequestBody.builder()
                 .receive_id(chat_id)
                 .msg_type(msg_type)
@@ -227,6 +249,10 @@ class FeishuBot(ABC):
         file_key: str, file_name: str
     ) -> None:
         """处理收到的文件消息，子类可覆写"""
+        pass
+
+    def on_bot_menu(self, user_id: str, open_id: str, event_key: str) -> None:
+        """处理机器人菜单点击事件，子类可覆写"""
         pass
 
     # ---- 启动 ----

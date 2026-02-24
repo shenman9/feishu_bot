@@ -128,3 +128,23 @@ class HubBot(FeishuBot):
             return
 
         self.reply(chat_id, "请先发送「文件阅读」激活文件阅读功能，再上传文件。")
+
+    # ---- 机器人菜单事件路由 ----
+
+    def on_bot_menu(self, user_id: str, open_id: str, event_key: str) -> None:
+        """处理底部菜单栏点击：event_key 匹配插件 keyword 则激活，否则展示菜单"""
+        # 菜单关键词 → 展示功能菜单
+        if event_key in MENU_KEYWORDS:
+            self._send_menu(open_id)
+            return
+
+        if event_key in self.plugins:
+            # 退出当前活跃插件
+            prev_kw = self.active_plugin.get(user_id)
+            if prev_kw and prev_kw in self.plugins:
+                self.plugins[prev_kw].deactivate_user(user_id)
+            # 激活目标插件，open_id 作为消息目标（send_message 自动检测 ID 类型）
+            self.active_plugin[user_id] = event_key
+            self.plugins[event_key].handle_message(user_id, open_id, event_key)
+        else:
+            self._send_menu(open_id)
