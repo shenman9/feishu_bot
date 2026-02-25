@@ -9,3 +9,6 @@ plugins/paper_daily/cache/
 plugins/paper_daily/reports/
 plugins/paper_daily/logs/
 plugins/paper_daily/subscribers.json
+# 启动脚本运行时产物
+.bot.pid
+.bot.log

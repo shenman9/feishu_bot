@@ -82,17 +82,36 @@ class FeishuBot(ABC):
         self._seen_messages[message_id] = now
         return False
 
+    @staticmethod
+    def _strip_mentions(text: str, mentions: list) -> str:
+        """从消息文本中剥离所有 @提及 占位符（如 @_user_1）"""
+        for mention in mentions:
+            key = getattr(mention, "key", "")
+            if key:
+                text = text.replace(key, "")
+        return text.strip()
+
     def _on_raw_message(self, data: P2ImMessageReceiveV1) -> None:
-        """解析原始消息，根据消息类型分发到对应处理方法"""
+        """解析原始消息，根据消息类型分发到对应处理方法
+
+        群聊消息仅处理 @机器人 的消息，非 @消息直接忽略。
+        """
         message = data.event.message
         sender_id = data.event.sender.sender_id.user_id
         chat_id = message.chat_id
         message_id = message.message_id
         msg_type = message.message_type
+        chat_type = getattr(message, "chat_type", None) or "p2p"
+        mentions = getattr(message, "mentions", None) or []
 
         # 消息去重，防止飞书重试导致重复处理
         if self._is_duplicate(message_id):
             _log("INFO", f"跳过重复消息: message_id={message_id}")
+            return
+
+        # 群聊非 @消息直接忽略（后续可扩展为被动监控）
+        if chat_type == "group" and not mentions:
+            _log("DEBUG", f"忽略群聊非@消息: chat={chat_id}, user={sender_id}")
             return
 
         try:
@@ -103,11 +122,16 @@ class FeishuBot(ABC):
         if msg_type == "file":
             file_key = content_dict.get("file_key", "")
             file_name = content_dict.get("file_name", "")
-            _log("INFO", f"收到文件: user={sender_id}, message_id={message_id}, file={file_name}")
+            _log("INFO", f"收到文件: user={sender_id}, chat_type={chat_type}, "
+                 f"message_id={message_id}, file={file_name}")
             self.on_file_message(sender_id, chat_id, message_id, file_key, file_name)
         else:
             text = content_dict.get("text", "").strip()
-            _log("INFO", f"收到消息: user={sender_id}, message_id={message_id}, text={text}")
+            # 群聊消息剥离 @提及 占位符
+            if chat_type == "group" and mentions:
+                text = self._strip_mentions(text, mentions)
+            _log("INFO", f"收到消息: user={sender_id}, chat_type={chat_type}, "
+                 f"message_id={message_id}, text={text}")
             self.on_message(sender_id, chat_id, text)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
