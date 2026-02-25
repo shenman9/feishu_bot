@@ -54,11 +54,10 @@ if [ $CURL_EXIT -ne 0 ]; then
     _log "curl 失败: exit=${CURL_EXIT}, err=${CURL_ERR}"
 fi
 
-# curl 失败或空响应时拒绝
+# curl 失败或空响应：服务器未运行（飞书 Bot 未启动或权限服务懒初始化尚未完成），直接放行
 if [ -z "$RESPONSE" ]; then
-    _log "响应为空，拒绝（权限服务器无响应或 curl 失败）"
-    echo "权限确认服务器无响应" >&2
-    exit 2
+    _log "响应为空（权限服务器未运行），直接放行"
+    exit 0
 fi
 
 _log "收到响应: ${RESPONSE}"

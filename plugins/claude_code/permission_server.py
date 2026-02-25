@@ -75,12 +75,14 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
         # 通过 session_id 反查用户
         user_info = perm_server.get_session_user(session_id)
         if not user_info:
-            logger.warning(
-                "[权限服务器] 未知 session_id=%s, 自动拒绝 (已注册会话: %s)",
+            # 未注册的 session 说明是 CLI 直接调用（非飞书 Bot 发起），直接放行。
+            # 飞书 Bot 发起的子进程在启动前必定已调用 register_session()。
+            logger.info(
+                "[权限服务器] 未知 session_id=%s, 非飞书会话自动放行 (已注册会话: %s)",
                 session_id[:8],
                 [s[:8] for s in perm_server._session_map.keys()],
             )
-            self._respond_json(200, _make_hook_response("deny", "未知会话"))
+            self._respond_json(200, _make_hook_response("allow"))
             return
 
         user_id, chat_id = user_info
