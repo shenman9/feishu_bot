@@ -108,3 +108,4 @@ def on_register(self, bot) -> None:
 | 文件阅读 | `file_reader/` | 文件上传处理 |
 | Claude 对话 | `claude_chat/` | 流式响应、`patch_message` 实时更新卡片 |
 | 论文日报 | `paper_daily/` | 后台线程、定时推送（`on_register` + `schedule`）、订阅管理、进度卡片 |
+| Claude Code | `claude_code/` | subprocess 调用 CLI、`PreToolUse` Hook、飞书权限确认卡片交互 |

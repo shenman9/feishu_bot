@@ -4,11 +4,14 @@ Claude Code 桥接插件
 通过 subprocess 调用本地 Claude Code CLI，
 将飞书消息作为 prompt 发送，实时流式回显结果到飞书卡片。
 支持会话持续（--session-id）、取消运行、清空会话、切换工作目录等操作。
+支持交互式权限确认：通过 PermissionRequest Hook + HTTP 服务器，
+将 Claude Code 的权限请求转发给飞书用户确认。
 """
 
 import json
 import logging
 import os
+import pathlib
 import pwd
 import subprocess
 import threading
@@ -18,6 +21,7 @@ from typing import Optional
 
 from config import load_config
 from core.plugin import Plugin
+from plugins.claude_code.permission_server import PermissionServer
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,8 @@ _PATCH_MIN_CHARS = 50       # 最小新增字符数触发更新
 _DEFAULT_TIMEOUT = 600          # 默认超时 10 分钟
 _DEFAULT_MAX_OUTPUT = 28000     # 飞书卡片 markdown 最大字符数
 _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
+_DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
+_DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 
 PLUGIN_KEYWORD = "CC"
 
@@ -49,6 +55,9 @@ class ClaudeCodePlugin(Plugin):
         # user_id -> 运行中的线程
         self._running_threads: dict[str, threading.Thread] = {}
         self._config: Optional[dict] = None
+        # 权限确认服务器（懒初始化）
+        self._perm_server: Optional[PermissionServer] = None
+        self._perm_server_started = False
 
     # ---- 元信息 ----
 
@@ -79,6 +88,8 @@ class ClaudeCodePlugin(Plugin):
                 "permission_mode": cc_cfg.get("permission_mode", "bypassPermissions"),
                 "max_turns": cc_cfg.get("max_turns", _DEFAULT_MAX_TURNS),
                 "run_as_user": cc_cfg.get("run_as_user", ""),
+                "permission_server_port": cc_cfg.get("permission_server_port", _DEFAULT_PERM_PORT),
+                "permission_timeout": cc_cfg.get("permission_timeout", _DEFAULT_PERM_TIMEOUT),
             }
         return self._config
 
@@ -107,6 +118,225 @@ class ClaudeCodePlugin(Plugin):
         self._kill_process(user_id)
         self.user_states.pop(user_id, None)
 
+    # ---- 权限确认服务器 ----
+
+    def _needs_permission_server(self) -> bool:
+        """判断当前配置是否需要启动权限确认服务器
+
+        仅当 permission_mode 不是 bypassPermissions/dontAsk 时需要。
+        """
+        cfg = self._load_plugin_config()
+        mode = cfg.get("permission_mode", "bypassPermissions")
+        return mode not in ("bypassPermissions", "dontAsk")
+
+    def _ensure_permission_server(self) -> None:
+        """确保权限确认服务器已启动（懒初始化）"""
+        if self._perm_server_started or not self._needs_permission_server():
+            return
+
+        cfg = self._load_plugin_config()
+        port = cfg["permission_server_port"]
+        timeout = cfg["permission_timeout"]
+
+        self._perm_server = PermissionServer(
+            port=port,
+            timeout=timeout,
+            on_permission_request=self._on_permission_request,
+        )
+        try:
+            self._perm_server.start()
+            self._perm_server_started = True
+            # 写入端口文件，供 Hook 脚本读取
+            self._write_port_file(port)
+            # 自动注册 Hook 到 Claude 设置
+            self._setup_hook()
+        except Exception as e:
+            logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
+            self._perm_server = None
+
+    def _write_port_file(self, port: int) -> None:
+        """将端口号写入 ~/.claude/.feishu_perm_port，供 Hook 脚本读取"""
+        cfg = self._load_plugin_config()
+        run_as_user = cfg.get("run_as_user", "")
+
+        # 确定目标用户的 HOME 目录
+        if run_as_user and os.getuid() == 0:
+            try:
+                home_dir = pwd.getpwnam(run_as_user).pw_dir
+            except KeyError:
+                home_dir = os.path.expanduser("~")
+        else:
+            home_dir = os.path.expanduser("~")
+
+        port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
+        try:
+            port_file.parent.mkdir(parents=True, exist_ok=True)
+            port_file.write_text(str(port))
+            # 如果以 root 运行且有 run_as_user，修正文件归属
+            if run_as_user and os.getuid() == 0:
+                try:
+                    pw = pwd.getpwnam(run_as_user)
+                    os.chown(port_file, pw.pw_uid, pw.pw_gid)
+                except (KeyError, OSError) as e:
+                    logger.warning("[CC] 修正端口文件归属失败: %s", e)
+            logger.info("[CC] 端口文件已写入: %s", port_file)
+        except OSError as e:
+            logger.error("[CC] 写入端口文件失败: %s", e)
+
+    def _setup_hook(self) -> None:
+        """自动注册 PreToolUse Hook 到 Claude 用户设置
+
+        将 Hook 脚本路径写入目标用户的 ~/.claude/settings.json。
+        """
+        cfg = self._load_plugin_config()
+        run_as_user = cfg.get("run_as_user", "")
+
+        if run_as_user and os.getuid() == 0:
+            try:
+                home_dir = pwd.getpwnam(run_as_user).pw_dir
+            except KeyError:
+                logger.error("[CC] Hook 注册失败: 用户 %s 不存在", run_as_user)
+                return
+        else:
+            home_dir = os.path.expanduser("~")
+
+        settings_path = pathlib.Path(home_dir) / ".claude" / "settings.json"
+
+        # 读取现有设置
+        settings = {}
+        if settings_path.exists():
+            try:
+                settings = json.loads(settings_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                logger.warning("[CC] 读取 Claude 设置失败，将创建新文件")
+
+        # Hook 脚本绝对路径
+        hook_script = str(
+            pathlib.Path(__file__).parent / "permission_hook.sh"
+        )
+
+        # 检查是否已配置（PreToolUse）
+        hooks = settings.get("hooks", {})
+        pre_hooks = hooks.get("PreToolUse", [])
+
+        already_configured = False
+        for rule in pre_hooks:
+            for h in rule.get("hooks", []):
+                if h.get("command") == hook_script:
+                    already_configured = True
+                    break
+
+        if already_configured:
+            logger.info("[CC] PreToolUse Hook 已配置，跳过注册")
+            return
+
+        # 移除旧的 PermissionRequest hook（如有）
+        if "PermissionRequest" in hooks:
+            del hooks["PermissionRequest"]
+            logger.info("[CC] 已移除旧的 PermissionRequest Hook")
+
+        # 添加 PreToolUse Hook 配置
+        new_hook_rule = {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": hook_script,
+                }
+            ],
+        }
+        pre_hooks.append(new_hook_rule)
+        hooks["PreToolUse"] = pre_hooks
+        settings["hooks"] = hooks
+
+        try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+            # 修正文件归属
+            if run_as_user and os.getuid() == 0:
+                try:
+                    pw = pwd.getpwnam(run_as_user)
+                    os.chown(settings_path, pw.pw_uid, pw.pw_gid)
+                except (KeyError, OSError) as e:
+                    logger.warning("[CC] 修正设置文件归属失败: %s", e)
+            logger.info("[CC] PreToolUse Hook 已注册: %s", hook_script)
+        except OSError as e:
+            logger.error("[CC] 写入 Claude 设置失败: %s", e)
+
+    def _on_permission_request(
+        self,
+        user_id: str,
+        chat_id: str,
+        request_id: str,
+        tool_name: str,
+        tool_input: dict,
+    ) -> None:
+        """权限请求回调：发送飞书权限确认卡片"""
+        card = self._build_permission_card(request_id, tool_name, tool_input)
+        try:
+            self.bot.send_message(chat_id, "interactive", card)
+            logger.info(
+                "[CC] 已发送权限确认卡片: user=%s, tool=%s, request=%s",
+                user_id, tool_name, request_id[:8],
+            )
+        except Exception as e:
+            logger.error("[CC] 发送权限确认卡片失败: %s", e, exc_info=True)
+            raise
+
+    @staticmethod
+    def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) -> str:
+        """构造权限确认飞书卡片"""
+        # 格式化工具输入的展示内容
+        if tool_name == "Bash" and "command" in tool_input:
+            input_display = f"```\n{tool_input['command']}\n```"
+        elif tool_name == "Edit" or tool_name == "Write":
+            file_path = tool_input.get("file_path", tool_input.get("path", ""))
+            input_display = f"文件: `{file_path}`"
+        else:
+            # 通用展示：JSON 格式
+            input_display = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)[:1000]}\n```"
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude Code 权限确认"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**工具**: {tool_name}\n**操作**:\n{input_display}",
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "允许"},
+                            "type": "primary",
+                            "value": {
+                                "action": "perm_allow",
+                                "plugin": PLUGIN_KEYWORD,
+                                "request_id": request_id,
+                            },
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "拒绝"},
+                            "type": "danger",
+                            "value": {
+                                "action": "perm_deny",
+                                "plugin": PLUGIN_KEYWORD,
+                                "request_id": request_id,
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+        return json.dumps(card)
+
     # ---- 子进程管理 ----
 
     def _build_command(
@@ -130,8 +360,14 @@ class ClaudeCodePlugin(Plugin):
         else:
             cmd.extend(["--session-id", session_id])
         cmd.append("--verbose")
-        perm = cfg.get("permission_mode", "")
-        if perm:
+        # 使用 Feishu 权限确认时，必须以 bypassPermissions 运行：
+        # PreToolUse hook 的 exit 0 无法覆盖 --permission-mode default 的内置检查，
+        # 在非交互（-p）模式下 default 模式会直接拒绝 Write/Bash，hook 形同虚设。
+        # 正确架构：bypassPermissions 跳过内置检查，hook 作为唯一权限门控。
+        if self._needs_permission_server():
+            cmd.extend(["--permission-mode", "bypassPermissions"])
+        else:
+            perm = cfg.get("permission_mode", "bypassPermissions")
             cmd.extend(["--permission-mode", perm])
         max_turns = cfg.get("max_turns", _DEFAULT_MAX_TURNS)
         cmd.extend(["--max-turns", str(max_turns)])
@@ -201,6 +437,11 @@ class ClaudeCodePlugin(Plugin):
         cfg = self._load_plugin_config()
         timer: Optional[threading.Timer] = None
         start_time = time.time()
+        session_id = state["session_id"]
+
+        # 注册会话到权限服务器（如果已启动）
+        if self._perm_server and self._perm_server_started:
+            self._perm_server.register_session(session_id, user_id, chat_id)
 
         try:
             cmd = self._build_command(
@@ -340,6 +581,9 @@ class ClaudeCodePlugin(Plugin):
             state["running"] = False
             self._running_processes.pop(user_id, None)
             self._running_threads.pop(user_id, None)
+            # 移除权限服务器中的会话映射
+            if self._perm_server and self._perm_server_started:
+                self._perm_server.unregister_session(session_id)
             logger.info("[CC] 任务清理完成: user=%s", user_id)
 
     def _start_timeout_timer(self, user_id: str, timeout: int) -> threading.Timer:
@@ -555,6 +799,9 @@ class ClaudeCodePlugin(Plugin):
             user_id, state["session_id"][:8], len(text),
         )
 
+        # 确保权限确认服务器已启动（首次调用时初始化）
+        self._ensure_permission_server()
+
         # 发送占位卡片
         placeholder = self._build_card("正在启动 Claude Code...", running=True)
         message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
@@ -571,7 +818,7 @@ class ClaudeCodePlugin(Plugin):
     def handle_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict
     ) -> "P2CardActionTriggerResponse":
-        """处理卡片按钮点击（取消按钮）"""
+        """处理卡片按钮点击（取消按钮、权限确认按钮）"""
         from lark_oapi.event.callback.model.p2_card_action_trigger import (
             P2CardActionTriggerResponse,
         )
@@ -587,4 +834,41 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(toast="已取消执行")
             return self.bot.make_card_response(toast="当前没有运行中的任务")
 
+        if action in ("perm_allow", "perm_deny"):
+            request_id = action_value.get("request_id", "")
+            behavior = "allow" if action == "perm_allow" else "deny"
+            behavior_cn = "允许" if behavior == "allow" else "拒绝"
+
+            if not self._perm_server:
+                return self.bot.make_card_response(toast="权限服务器未启动")
+
+            ok = self._perm_server.resolve_request(request_id, behavior)
+            if ok:
+                logger.info(
+                    "[CC] 用户权限响应: user=%s, request=%s, decision=%s",
+                    user_id, request_id[:8], behavior,
+                )
+                # 更新卡片为已处理状态
+                handled_card = self._build_permission_handled_card(behavior_cn)
+                return self.bot.make_card_response(
+                    card=json.loads(handled_card),
+                    toast=f"已{behavior_cn}",
+                )
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
         return P2CardActionTriggerResponse()
+
+    @staticmethod
+    def _build_permission_handled_card(decision: str) -> str:
+        """构造权限确认已处理的卡片（灰色，无按钮）"""
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": f"Claude Code 权限确认 - 已{decision}"},
+                "template": "grey",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"已{decision}此操作。"},
+            ],
+        }
+        return json.dumps(card)

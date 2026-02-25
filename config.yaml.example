@@ -35,11 +35,24 @@ claude_code:
   default_working_dir: ""               # 默认工作目录（空=机器人进程当前目录）
   timeout: 600                          # 单次执行超时（秒）
   max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
-  permission_mode: "bypassPermissions"  # 权限模式（需配合 run_as_user 使用）
+  permission_mode: "default"            # 权限模式（决定是否启用飞书交互确认）:
+                                        # "default" = 启用飞书卡片交互确认（推荐），
+                                        #   代码会强制以 bypassPermissions 运行 Claude，
+                                        #   由 hook 脚本作为唯一权限门控。
+                                        # "bypassPermissions"/"dontAsk" = 跳过所有确认
   max_turns: 50                         # Claude Code 最大轮次
   run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
+  permission_server_port: 9876          # 权限确认 HTTP 服务器端口（仅 default 模式生效）
+  permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝（仅 default 模式生效）
   # Docker 部署说明：
   # 1. 在容器中创建非 root 用户: useradd -m claudebot
   # 2. 设置 run_as_user: "claudebot"
   # 3. 在该用户主目录下完成 claude 鉴权: su - claudebot -c "claude auth login"
   # 4. 工作目录建议设在用户主目录下: default_working_dir: "/home/claudebot/work"
+  #
+  # 权限确认模式说明：
+  # - permission_mode 设为 "default" 时，Claude Code 执行危险操作（如 Bash 命令）前
+  #   会通过飞书卡片询问用户确认，用户可选择「允许」或「拒绝」。
+  # - 插件会自动启动 HTTP 服务器（端口见 permission_server_port），并向 Claude
+  #   的 settings.json 注册 PermissionRequest Hook。
+  # - 如不需要交互式确认，可设为 "bypassPermissions" 跳过所有权限检查。

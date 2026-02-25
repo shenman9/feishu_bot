@@ -21,7 +21,11 @@ feishu_bot/
 │   ├── rps_game/            # 石头剪刀布（示例插件）
 │   ├── file_reader/         # 文件阅读（上传 txt 文件读取内容）
 │   ├── claude_chat/         # Claude 对话（多轮智能对话，流式响应）
-│   └── paper_daily/         # 论文日报（ArXiv 论文 AI 筛选与每日推送）
+│   ├── paper_daily/         # 论文日报（ArXiv 论文 AI 筛选与每日推送）
+│   └── claude_code/         # Claude Code 桥接（调用本地 CLI，支持飞书交互式权限确认）
+│       ├── claude_code_plugin.py   # 插件主体
+│       ├── permission_server.py    # 权限确认 HTTP 服务器（IPC 桥梁）
+│       └── permission_hook.sh      # PreToolUse Hook 脚本（Claude Code 调用）
 └── tests/                   # 测试套件
     ├── README.md            # 测试开发指南
     ├── conftest.py          # 共享夹具（mock bot、StubPlugin 等）
@@ -77,6 +81,7 @@ python main.py
 | `文件阅读` | FileReaderPlugin | 上传 txt 文件读取内容 |
 | `Claude` | ClaudeChatPlugin | 多轮智能对话，流式响应实时更新卡片 |
 | `论文日报` | PaperDailyPlugin | ArXiv 论文 AI 筛选与中文摘要，支持订阅每日定时推送 |
+| `CC` | ClaudeCodePlugin | 调用本地 Claude Code CLI，支持飞书交互式权限确认（允许/拒绝危险操作） |
 
 ### 底部菜单栏触发
 
