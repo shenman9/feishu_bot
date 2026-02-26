@@ -71,6 +71,7 @@ class ClaudeCodePlugin(Plugin):
         # 权限确认服务器（懒初始化）
         self._perm_server: Optional[PermissionServer] = None
         self._perm_server_started = False
+        self._perm_server_lock = threading.Lock()
 
     # ---- 元信息 ----
 
@@ -190,29 +191,37 @@ class ClaudeCodePlugin(Plugin):
         return True
 
     def _ensure_permission_server(self) -> None:
-        """确保权限确认服务器已启动（懒初始化）"""
+        """确保权限确认服务器已启动（懒初始化，线程安全）"""
         if self._perm_server_started or not self._needs_permission_server():
             return
 
-        cfg = self._load_plugin_config()
-        port = cfg["permission_server_port"]
-        timeout = cfg["permission_timeout"]
+        with self._perm_server_lock:
+            # 双重检查：加锁后再次确认，防止并发重复初始化
+            if self._perm_server_started:
+                return
 
-        self._perm_server = PermissionServer(
-            port=port,
-            timeout=timeout,
-            on_permission_request=self._on_permission_request,
-        )
-        try:
-            self._perm_server.start()
-            self._perm_server_started = True
-            # 写入端口文件，供 Hook 脚本读取
-            self._write_port_file(port)
-            # 自动注册 Hook 到 Claude 设置
-            self._setup_hook()
-        except Exception as e:
-            logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
-            self._perm_server = None
+            cfg = self._load_plugin_config()
+            port = cfg["permission_server_port"]
+            timeout = cfg["permission_timeout"]
+
+            perm_server = PermissionServer(
+                port=port,
+                timeout=timeout,
+                on_permission_request=self._on_permission_request,
+            )
+            try:
+                perm_server.start()
+                # start() 成功后才赋值，保证 _perm_server 始终指向有效实例
+                self._perm_server = perm_server
+                self._perm_server_started = True
+                # 写入端口文件，供 Hook 脚本读取
+                self._write_port_file(port)
+                # 自动注册 Hook 到 Claude 设置
+                self._setup_hook()
+            except Exception as e:
+                logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
+                # 删除端口文件，避免 hook 脚本向无效端口发请求后等待 curl 超时（每次工具调用卡 180s）
+                self._delete_port_file()
 
     def _write_port_file(self, port: int) -> None:
         """将端口号写入 ~/.claude/.feishu_perm_port，供 Hook 脚本读取"""
@@ -242,6 +251,26 @@ class ClaudeCodePlugin(Plugin):
             logger.info("[CC] 端口文件已写入: %s", port_file)
         except OSError as e:
             logger.error("[CC] 写入端口文件失败: %s", e)
+
+    def _delete_port_file(self) -> None:
+        """删除端口文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
+        cfg = self._load_plugin_config()
+        run_as_user = cfg.get("run_as_user", "")
+
+        if run_as_user and os.getuid() == 0:
+            try:
+                home_dir = pwd.getpwnam(run_as_user).pw_dir
+            except KeyError:
+                home_dir = os.path.expanduser("~")
+        else:
+            home_dir = os.path.expanduser("~")
+
+        port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
+        try:
+            port_file.unlink(missing_ok=True)
+            logger.info("[CC] 端口文件已删除: %s", port_file)
+        except OSError as e:
+            logger.warning("[CC] 删除端口文件失败: %s", e)
 
     def _setup_hook(self) -> None:
         """自动注册 PreToolUse Hook 到 Claude 用户设置
