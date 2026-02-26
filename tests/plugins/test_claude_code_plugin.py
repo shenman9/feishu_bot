@@ -51,6 +51,44 @@ def _make_assistant_event(text):
     })
 
 
+def _make_tool_use_event(tool_name, tool_input, tool_use_id="toolu_001"):
+    """构造包含 tool_use block 的 assistant stream-json 行"""
+    return json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": tool_input}],
+        },
+    })
+
+
+def _make_thinking_event():
+    """构造包含 thinking block 的 assistant stream-json 行"""
+    return json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "let me think..."}],
+        },
+    })
+
+
+def _make_tool_result_event(tool_use_id="toolu_001", content="ok", is_error=False):
+    """构造工具执行结果的 user stream-json 行"""
+    return json.dumps({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            }],
+        },
+    })
+
+
 def _make_result_event(result_text="", cost=0.01, duration=2000, turns=1, session_id="test-session"):
     """构造 result 类型的 stream-json 行"""
     return json.dumps({
@@ -79,6 +117,7 @@ def plugin(mock_bot):
         "timeout": _DEFAULT_TIMEOUT,
         "max_output_chars": _DEFAULT_MAX_OUTPUT,
         "permission_mode": "bypassPermissions",
+        "default_perm_mode": "interactive",
         "max_turns": _DEFAULT_MAX_TURNS,
         "run_as_user": "",
         "permission_server_port": _DEFAULT_PERM_PORT,
@@ -257,22 +296,25 @@ class TestParseStreamLine:
     def test_assistant_event(self):
         """正确提取 assistant 事件中的文本"""
         line = _make_assistant_event("Hello World!")
-        text, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
         assert text == "Hello World!"
+        assert log_actions == []
         assert meta == ""
 
     def test_assistant_event_with_previous(self):
         """有前序文本时 assistant 事件前加分隔符"""
         line = _make_assistant_event("第二段")
-        text, meta = ClaudeCodePlugin._parse_stream_line(line, True)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, True)
         assert "---" in text
         assert "第二段" in text
+        assert log_actions == []
 
     def test_result_event_meta(self):
         """result 事件提取费用/耗时信息"""
         line = _make_result_event(cost=0.05, duration=5000, turns=3)
-        text, meta = ClaudeCodePlugin._parse_stream_line(line, True)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, True)
         assert text == ""  # 有前序文本时不重复追加
+        assert log_actions == []
         assert "$0.0500" in meta
         assert "5.0s" in meta
         assert "3" in meta
@@ -280,21 +322,205 @@ class TestParseStreamLine:
     def test_result_event_text_fallback(self):
         """无前序 assistant 文本时用 result 的文本"""
         line = _make_result_event(result_text="最终结果")
-        text, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
         assert text == "最终结果"
+        assert log_actions == []
 
     def test_invalid_json(self):
         """无效 JSON 返回空"""
-        text, meta = ClaudeCodePlugin._parse_stream_line("not json", False)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line("not json", False)
         assert text == ""
+        assert log_actions == []
         assert meta == ""
 
     def test_unknown_type(self):
         """未知事件类型返回空"""
         line = json.dumps({"type": "system", "message": "info"})
-        text, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
         assert text == ""
+        assert log_actions == []
         assert meta == ""
+
+    def test_tool_use_event(self):
+        """assistant 事件中的 tool_use block 生成 add 日志动作"""
+        line = _make_tool_use_event("Edit", {"file_path": "src/main.py"}, "toolu_001")
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        assert text == ""
+        assert len(log_actions) == 1
+        action = log_actions[0]
+        assert action["action"] == "add"
+        assert action["tool_use_id"] == "toolu_001"
+        assert "Edit" in action["line"]
+        assert "src/main.py" in action["line"]
+
+    def test_thinking_event(self):
+        """assistant 事件中的 thinking block 生成思考日志动作"""
+        line = _make_thinking_event()
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        assert text == ""
+        assert len(log_actions) == 1
+        assert log_actions[0]["action"] == "add"
+        assert "💭" in log_actions[0]["line"]
+        assert log_actions[0]["tool_use_id"] is None
+
+    def test_tool_result_success(self):
+        """user 事件中工具成功结果生成 result 日志动作"""
+        line = _make_tool_result_event("toolu_001", content="file content", is_error=False)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        assert text == ""
+        assert len(log_actions) == 1
+        action = log_actions[0]
+        assert action["action"] == "result"
+        assert action["tool_use_id"] == "toolu_001"
+        assert action["is_error"] is False
+        assert action["summary"] == ""
+
+    def test_tool_result_error(self):
+        """user 事件中工具失败结果包含错误摘要"""
+        line = _make_tool_result_event("toolu_002", content="Permission denied: /etc/passwd", is_error=True)
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        assert len(log_actions) == 1
+        action = log_actions[0]
+        assert action["action"] == "result"
+        assert action["is_error"] is True
+        assert "Permission denied" in action["summary"]
+
+    def test_tool_result_array_content(self):
+        """工具结果 content 为数组时正确提取文本"""
+        line = json.dumps({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_003",
+                    "content": [{"type": "text", "text": "Error: not found"}],
+                    "is_error": True,
+                }],
+            },
+        })
+        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        assert log_actions[0]["is_error"] is True
+        assert "Error: not found" in log_actions[0]["summary"]
+
+
+# ---- 工具调用日志渲染测试 ----
+
+
+class TestRenderLog:
+    """工具调用日志渲染测试"""
+
+    def test_empty_log(self):
+        """无任何日志时返回空字符串"""
+        result = ClaudeCodePlugin._render_log([], [], running=False)
+        assert result == ""
+
+    def test_running_with_log_shows_spinner(self):
+        """执行中且有日志时显示⏳"""
+        streak = [{"line": "📖 Read `file.py`", "tool_use_id": "t1"}]
+        result = ClaudeCodePlugin._render_log([], streak, running=True)
+        assert "⏳" in result
+        assert "📖" in result
+
+    def test_running_without_log_no_spinner(self):
+        """执行中但无任何日志时不显示⏳（纯文字回复场景）"""
+        result = ClaudeCodePlugin._render_log([], [], running=True)
+        assert "⏳" not in result
+
+    def test_streak_within_limit(self):
+        """连续工具调用未超上限时全部显示"""
+        streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(5)]
+        result = ClaudeCodePlugin._render_log([], streak, running=False)
+        for i in range(5):
+            assert f"file{i}.py" in result
+        assert "省略" not in result
+
+    def test_streak_exceeds_limit_folds(self):
+        """连续工具调用超过上限时折叠显示最近 N 条"""
+        from plugins.claude_code.claude_code_plugin import _MAX_STREAK_DISPLAY
+        total = _MAX_STREAK_DISPLAY + 5
+        streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(total)]
+        result = ClaudeCodePlugin._render_log([], streak, running=False)
+        assert "省略" in result
+        assert "5 次" in result
+        # 最后 _MAX_STREAK_DISPLAY 条应显示
+        for i in range(5, total):
+            assert f"file{i}.py" in result
+        # 前 5 条不应显示
+        for i in range(5):
+            assert f"file{i}.py" not in result
+
+    def test_segments_separated_by_blank_line(self):
+        """不同段之间有空行分隔"""
+        segments = [
+            {"type": "tools", "entries": ["📖 Read `a.py`"]},
+        ]
+        streak = [{"line": "📝 Edit `b.py`", "tool_use_id": "t2"}]
+        result = ClaudeCodePlugin._render_log(segments, streak, running=False)
+        # 段间有空行
+        assert "\n\n" in result or "\n \n" in result or result.count("\n") >= 2
+
+
+class TestFormatToolCall:
+    """工具调用格式化测试"""
+
+    def test_read_tool(self):
+        """Read 工具显示文件路径和图标"""
+        line = ClaudeCodePlugin._format_tool_call("Read", {"file_path": "src/main.py"})
+        assert "📖" in line
+        assert "src/main.py" in line
+
+    def test_bash_tool(self):
+        """Bash 工具显示命令"""
+        line = ClaudeCodePlugin._format_tool_call("Bash", {"command": "python -m pytest"})
+        assert "💻" in line
+        assert "python -m pytest" in line
+
+    def test_long_param_truncated(self):
+        """超长参数被截断"""
+        from plugins.claude_code.claude_code_plugin import _TOOL_PARAM_MAX
+        long_path = "a" * (_TOOL_PARAM_MAX + 20)
+        line = ClaudeCodePlugin._format_tool_call("Read", {"file_path": long_path})
+        assert "..." in line
+        assert len(line) < len(long_path) + 20
+
+    def test_unknown_tool(self):
+        """未知工具使用默认图标"""
+        line = ClaudeCodePlugin._format_tool_call("CustomTool", {"key": "value"})
+        assert "🔧" in line
+        assert "CustomTool" in line
+
+    def test_tool_no_params(self):
+        """无参数工具只显示图标和名称"""
+        line = ClaudeCodePlugin._format_tool_call("Bash", {})
+        assert "💻" in line
+        assert "Bash" in line
+
+
+class TestAssembleCardText:
+    """两段式卡片内容组装测试"""
+
+    def test_both_log_and_text(self):
+        """日志和文字都有时用分隔线连接"""
+        result = ClaudeCodePlugin._assemble_card_text("log content", "reply text")
+        assert "log content" in result
+        assert "reply text" in result
+        assert "---" in result
+
+    def test_only_log(self):
+        """只有日志时返回日志"""
+        result = ClaudeCodePlugin._assemble_card_text("log content", "")
+        assert result == "log content"
+
+    def test_only_text(self):
+        """只有文字时返回文字"""
+        result = ClaudeCodePlugin._assemble_card_text("", "reply text")
+        assert result == "reply text"
+
+    def test_both_empty(self):
+        """都为空时返回空字符串"""
+        result = ClaudeCodePlugin._assemble_card_text("", "")
+        assert result == ""
 
 
 # ---- 卡片构建测试 ----
@@ -557,6 +783,59 @@ class TestSubprocessExecution:
 
         env = mock_popen_cls.call_args[1].get("env", {})
         assert "CLAUDECODE" not in env
+
+    @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
+    def test_tool_call_flow_shows_log(self, mock_popen_cls, plugin):
+        """工具调用流程：卡片包含工具日志和文字回复两段"""
+        stdout_lines = [
+            _make_tool_use_event("Read", {"file_path": "src/main.py"}, "toolu_001") + "\n",
+            _make_tool_result_event("toolu_001", content="file content", is_error=False) + "\n",
+            _make_assistant_event("已读取文件。") + "\n",
+            _make_result_event(cost=0.01, duration=1000, turns=1) + "\n",
+        ]
+        mock_popen_cls.return_value = _mock_popen(stdout_lines)
+
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "read file")
+
+        thread = plugin._running_threads.get("u1")
+        if thread:
+            thread.join(timeout=10)
+
+        plugin.bot.patch_message.assert_called()
+        last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
+        content = last_card["elements"][0]["content"]
+        # 日志部分含工具调用和成功标记
+        assert "Read" in content
+        assert "src/main.py" in content
+        assert "✅" in content
+        # 文字回复部分
+        assert "已读取文件。" in content
+        # 分隔线
+        assert "---" in content
+
+    @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
+    def test_tool_call_error_shows_failure(self, mock_popen_cls, plugin):
+        """工具执行失败时显示❌和错误摘要"""
+        stdout_lines = [
+            _make_tool_use_event("Bash", {"command": "make build"}, "toolu_002") + "\n",
+            _make_tool_result_event("toolu_002", content="Permission denied", is_error=True) + "\n",
+            _make_assistant_event("构建失败。") + "\n",
+            _make_result_event() + "\n",
+        ]
+        mock_popen_cls.return_value = _mock_popen(stdout_lines)
+
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "build")
+
+        thread = plugin._running_threads.get("u1")
+        if thread:
+            thread.join(timeout=10)
+
+        last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
+        content = last_card["elements"][0]["content"]
+        assert "❌" in content
+        assert "Permission denied" in content
 
 
 # ---- 命令构建测试 ----

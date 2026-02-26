@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 _PATCH_INTERVAL = 0.5       # 最小更新间隔（秒）
 _PATCH_MIN_CHARS = 50       # 最小新增字符数触发更新
 
+# 工具调用日志显示控制
+_MAX_STREAK_DISPLAY = 15    # 连续工具调用段最多显示条数（超出则折叠）
+_TOOL_PARAM_MAX = 60        # 工具参数摘要最大字符数
+
 # 默认配置
 _DEFAULT_TIMEOUT = 600          # 默认超时 10 分钟
 _DEFAULT_MAX_OUTPUT = 28000     # 飞书卡片 markdown 最大字符数
@@ -682,6 +686,12 @@ class ClaudeCodePlugin(Plugin):
             cost_info = ""
             has_assistant_text = False
 
+            # 工具调用日志状态
+            log_segments: list[dict] = []       # 已完成的工具调用段
+            current_streak: list[dict] = []     # 当前连续工具调用
+            active_tool_ids: dict[str, int] = {}  # tool_use_id → current_streak 索引
+            log_dirty = False                   # 日志是否有变化（触发节流更新）
+
             line_count = 0
             for line in proc.stdout:
                 line = line.strip()
@@ -689,12 +699,44 @@ class ClaudeCodePlugin(Plugin):
                     continue
                 line_count += 1
 
-                text_chunk, meta = self._parse_stream_line(line, has_assistant_text)
+                text_chunk, log_actions, meta = self._parse_stream_line(line, has_assistant_text)
+
+                # 处理日志动作
+                for action in log_actions:
+                    if action["action"] == "add":
+                        idx = len(current_streak)
+                        current_streak.append({
+                            "line": action["line"],
+                            "tool_use_id": action["tool_use_id"],
+                        })
+                        if action["tool_use_id"]:
+                            active_tool_ids[action["tool_use_id"]] = idx
+                        log_dirty = True
+                    elif action["action"] == "result":
+                        tid = action["tool_use_id"]
+                        if tid in active_tool_ids:
+                            idx = active_tool_ids[tid]
+                            suffix = (
+                                f" → ❌ {action['summary']}" if action["is_error"]
+                                else " → ✅"
+                            )
+                            current_streak[idx]["line"] += suffix
+                            log_dirty = True
+
                 if text_chunk:
+                    # 文字输出前将当前 streak 提交到 log_segments
+                    if current_streak:
+                        log_segments.append({
+                            "type": "tools",
+                            "entries": [e["line"] for e in current_streak],
+                        })
+                        current_streak = []
+                        active_tool_ids = {}
                     if not has_assistant_text:
                         logger.info("[CC] 收到首条输出: user=%s, pid=%d", user_id, proc.pid)
                     has_assistant_text = True
                     full_text += text_chunk
+                    log_dirty = True
 
                     # 截断保护
                     if len(full_text) > cfg["max_output_chars"]:
@@ -707,19 +749,22 @@ class ClaudeCodePlugin(Plugin):
                         self._kill_process(user_id)
                         break
 
-                    # 节流更新
-                    if message_id:
-                        now = time.time()
-                        chars_since = len(full_text) - last_patch_len
-                        time_since = now - last_patch_time
-                        if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
-                            self._patch_card(message_id, full_text, running=True)
-                            last_patch_len = len(full_text)
-                            last_patch_time = now
-
                 if meta:
                     cost_info = meta
                     logger.info("[CC] 收到结果统计: user=%s, %s", user_id, meta)
+
+                # 节流更新：日志或文字有变化时，按时间间隔刷新卡片
+                if message_id and log_dirty:
+                    now = time.time()
+                    chars_since = len(full_text) - last_patch_len
+                    time_since = now - last_patch_time
+                    if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
+                        log_text = self._render_log(log_segments, current_streak, running=True)
+                        card_text = self._assemble_card_text(log_text, full_text)
+                        self._patch_card(message_id, card_text, running=True)
+                        last_patch_len = len(full_text)
+                        last_patch_time = now
+                        log_dirty = False
 
             # 等待进程结束
             try:
@@ -750,11 +795,20 @@ class ClaudeCodePlugin(Plugin):
                 if stderr_output:
                     full_text += f"\n\nstderr:\n```\n{stderr_output[:2000]}\n```"
 
+            # 将剩余未提交的 streak 也入段（任务结束时可能还有工具调用未出文字）
+            if current_streak:
+                log_segments.append({
+                    "type": "tools",
+                    "entries": [e["line"] for e in current_streak],
+                })
+
+            log_text = self._render_log(log_segments, [], running=False)
+            card_text = self._assemble_card_text(log_text, full_text)
             if cost_info:
-                full_text += f"\n\n---\n{cost_info}"
+                card_text += f"\n\n---\n{cost_info}"
 
             if message_id:
-                self._patch_card(message_id, full_text, running=False)
+                self._patch_card(message_id, card_text, running=False)
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI 未安装或路径错误，请检查配置。"
@@ -801,7 +855,7 @@ class ClaudeCodePlugin(Plugin):
     # ---- stream-json 解析 ----
 
     @staticmethod
-    def _parse_stream_line(line: str, has_previous_text: bool) -> tuple[str, str]:
+    def _parse_stream_line(line: str, has_previous_text: bool) -> tuple[str, list[dict], str]:
         """解析 stream-json 单行
 
         Args:
@@ -809,33 +863,78 @@ class ClaudeCodePlugin(Plugin):
             has_previous_text: 之前是否已提取到 assistant 文本
 
         Returns:
-            (text_chunk, meta_info) 元组
+            (text_chunk, log_actions, meta_info) 三元组
+
+            text_chunk: 本行提取到的 assistant 文字内容（空字符串表示无）
+
+            log_actions: 工具调用日志动作列表，每项为：
+                {"action": "add",    "line": str, "tool_use_id": str|None}  新增日志行
+                {"action": "result", "tool_use_id": str, "is_error": bool, "summary": str}  更新结果
+
+            meta_info: 统计信息字符串（来自 result 事件）
         """
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
-            return ("", "")
+            return ("", [], "")
 
         event_type = data.get("type", "")
         text_chunk = ""
+        log_actions: list[dict] = []
         meta_info = ""
 
         if event_type == "assistant":
-            # 提取 assistant 消息中的文本块
+            # 处理 assistant 消息中的各类内容块
             message = data.get("message", {})
             content_blocks = message.get("content", [])
-            parts = []
+            text_parts = []
             for block in content_blocks:
-                if block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-            if parts:
-                text_chunk = "\n\n".join(parts)
-                # 如果之前已有文本，加分隔
+                btype = block.get("type", "")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "thinking":
+                    # 只显示图标，不展示原始思考内容
+                    log_actions.append({"action": "add", "line": "💭 思考...", "tool_use_id": None})
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "Unknown")
+                    tool_input = block.get("input", {})
+                    tool_use_id = block.get("id", "")
+                    log_line = ClaudeCodePlugin._format_tool_call(tool_name, tool_input)
+                    log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id})
+            if text_parts:
+                text_chunk = "\n\n".join(text_parts)
+                # 多段文字之间加分隔线
                 if has_previous_text:
                     text_chunk = "\n\n---\n\n" + text_chunk
 
+        elif event_type == "user":
+            # 工具执行结果：追加 ✅/❌ 到对应日志行
+            message = data.get("message", {})
+            content_blocks = message.get("content", [])
+            for block in content_blocks:
+                if block.get("type") == "tool_result":
+                    tool_use_id = block.get("tool_use_id", "")
+                    is_error = bool(block.get("is_error", False))
+                    # content 可能是字符串或 content block 数组
+                    raw_content = block.get("content", "")
+                    if isinstance(raw_content, list):
+                        raw_content = "\n".join(
+                            b.get("text", "") for b in raw_content if b.get("type") == "text"
+                        )
+                    summary = ""
+                    if is_error and raw_content:
+                        # 错误时取首行，最多60字
+                        first_line = str(raw_content).split("\n")[0].strip()
+                        summary = first_line[:_TOOL_PARAM_MAX]
+                    log_actions.append({
+                        "action": "result",
+                        "tool_use_id": tool_use_id,
+                        "is_error": is_error,
+                        "summary": summary,
+                    })
+
         elif event_type == "result":
-            # result 事件提取统计信息，不重复追加文本
+            # result 事件：提取统计信息
             cost = data.get("cost_usd", 0)
             duration = data.get("duration_ms", 0)
             turns = data.get("num_turns", 0)
@@ -852,13 +951,91 @@ class ClaudeCodePlugin(Plugin):
             if meta_parts:
                 meta_info = " | ".join(meta_parts)
 
-            # 如果之前没有 assistant 文本，用 result 的文本
+            # 无 assistant 文本时用 result 的兜底文本
             if not has_previous_text:
                 result_text = data.get("result", "")
                 if result_text:
                     text_chunk = result_text
 
-        return (text_chunk, meta_info)
+        return (text_chunk, log_actions, meta_info)
+
+    # ---- 工具调用日志渲染 ----
+
+    # 工具名 → 展示图标
+    _TOOL_ICONS: dict[str, str] = {
+        "Read":         "📖",
+        "Write":        "✍️",
+        "Edit":         "📝",
+        "NotebookEdit": "📓",
+        "Bash":         "💻",
+        "Glob":         "🔍",
+        "Grep":         "🔍",
+        "Task":         "🤖",
+        "WebFetch":     "🌐",
+    }
+
+    @staticmethod
+    def _format_tool_call(tool_name: str, tool_input: dict) -> str:
+        """将工具调用格式化为单行摘要，用于过程日志"""
+        icon = ClaudeCodePlugin._TOOL_ICONS.get(tool_name, "🔧")
+        # 按优先级提取最有意义的参数作为摘要
+        param: str = (
+            tool_input.get("file_path")
+            or tool_input.get("notebook_path")
+            or tool_input.get("command")
+            or tool_input.get("pattern")
+            or tool_input.get("path")
+            or tool_input.get("description")
+            or tool_input.get("url")
+            or (str(next(iter(tool_input.values()))) if tool_input else "")
+        )
+        if len(param) > _TOOL_PARAM_MAX:
+            param = param[:_TOOL_PARAM_MAX - 3] + "..."
+        return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
+
+    @staticmethod
+    def _render_log(
+        log_segments: list[dict],
+        current_streak: list[dict],
+        running: bool,
+    ) -> str:
+        """将工具调用日志段和当前连续区间渲染为 markdown 文本
+
+        Args:
+            log_segments: 已完成的段列表，每段 {"type": "tools", "entries": list[str]}
+            current_streak: 当前正在进行的连续工具调用，每项 {"line": str, "tool_use_id": str|None}
+            running: 是否仍在执行中（控制末尾⏳提示）
+        """
+        lines: list[str] = []
+
+        for segment in log_segments:
+            entries: list[str] = segment["entries"]
+            n = len(entries)
+            if n > _MAX_STREAK_DISPLAY:
+                lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
+                entries = entries[-_MAX_STREAK_DISPLAY:]
+            lines.extend(entries)
+            lines.append("")  # 段间空行
+
+        if current_streak:
+            entries = [e["line"] for e in current_streak]
+            n = len(entries)
+            if n > _MAX_STREAK_DISPLAY:
+                lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
+                entries = entries[-_MAX_STREAK_DISPLAY:]
+            lines.extend(entries)
+
+        if running and (log_segments or current_streak):
+            lines.append("⏳ 正在处理...")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _assemble_card_text(log_text: str, reply_text: str) -> str:
+        """组装两段式卡片内容：过程日志（上）+ 文字回复（下）"""
+        if log_text and reply_text:
+            return log_text + "\n\n---\n\n" + reply_text
+        return log_text or reply_text
 
     # ---- 飞书卡片 ----
 
