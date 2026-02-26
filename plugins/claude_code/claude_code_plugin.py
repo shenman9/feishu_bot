@@ -1334,7 +1334,12 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, help_text)
             return
 
-        # 9. 并发控制：运行中拒绝新任务
+        # 9. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令）
+        if text.startswith("/"):
+            self.bot.reply(chat_id, f"未知指令 `{text.split()[0]}`，发送 `/help` 查看所有可用指令。")
+            return
+
+        # 10. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
@@ -1343,7 +1348,7 @@ class ClaudeCodePlugin(Plugin):
             )
             return
 
-        # 10. 正常执行：发送 prompt 到 Claude Code
+        # 11. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
         state["last_chat_id"] = chat_id
         logger.info(

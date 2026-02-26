@@ -25,6 +25,7 @@
 
 ## 通用规则（始终生效）
 
+* **禁止自动提交**：除非用户明确要求，否则绝不执行 `git commit`。
 * **注释 & Commit Message 必须使用中文**。Commit 格式: `类型: 描述`。
 * **config.yaml 严禁提交到 git**，配置变更只改 `config.yaml.example`。
 * **主进程永不崩溃**，插件异常必须被 HubBot 捕获。
