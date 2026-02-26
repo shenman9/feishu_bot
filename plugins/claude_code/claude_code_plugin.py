@@ -129,6 +129,19 @@ class ClaudeCodePlugin(Plugin):
         state["bypass_permission"] = False
         return state["session_id"]
 
+    def _format_status(self, user_id: str) -> str:
+        """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
+        state = self._get_state(user_id)
+        working_dir = state.get("working_dir") or "(默认)"
+        status = "运行中" if state["running"] else "空闲"
+        perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
+        return (
+            f"会话: {state['session_id'][:8]}...\n"
+            f"工作目录: {working_dir}\n"
+            f"状态: {status}\n"
+            f"权限模式: {perm_mode}"
+        )
+
     # ---- 权限确认服务器 ----
 
     def _needs_permission_server(self) -> bool:
@@ -737,17 +750,10 @@ class ClaudeCodePlugin(Plugin):
             logger.info("[CC] 用户激活插件: user=%s", user_id)
             state["active"] = True
             state["last_chat_id"] = chat_id
-            session_id = state["session_id"]
-            working_dir = state.get("working_dir") or "(默认)"
-            status = "运行中" if state["running"] else "空闲"
-            perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
             self.bot.reply(
                 chat_id,
                 f"Claude Code 已激活。\n"
-                f"会话: {session_id[:8]}...\n"
-                f"工作目录: {working_dir}\n"
-                f"状态: {status}\n"
-                f"权限模式: {perm_mode}\n\n"
+                f"{self._format_status(user_id)}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
                 f"- `/new` 重置会话\n"
@@ -761,8 +767,8 @@ class ClaudeCodePlugin(Plugin):
         # 2. 特殊指令：新会话
         if text == "/new":
             logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
-            new_sid = self._reset_session(user_id)
-            self.bot.reply(chat_id, f"会话已重置。新会话: {new_sid[:8]}...")
+            self._reset_session(user_id)
+            self.bot.reply(chat_id, f"会话已重置。\n{self._format_status(user_id)}")
             return
 
         # 3. 特殊指令：取消
@@ -778,17 +784,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 4. 特殊指令：状态
         if text == "/status":
-            session_id = state["session_id"]
-            working_dir = state.get("working_dir") or "(默认)"
-            status = "运行中" if state["running"] else "空闲"
-            perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
-            self.bot.reply(
-                chat_id,
-                f"会话: {session_id[:8]}...\n"
-                f"工作目录: {working_dir}\n"
-                f"状态: {status}\n"
-                f"权限模式: {perm_mode}",
-            )
+            self.bot.reply(chat_id, self._format_status(user_id))
             return
 
         # 5. 特殊指令：切换目录
@@ -796,16 +792,16 @@ class ClaudeCodePlugin(Plugin):
             new_dir = text[len("/cd "):].strip()
             if os.path.isdir(new_dir):
                 old_session = state["session_id"]
-                new_sid = self._reset_session(user_id)
+                self._reset_session(user_id)
                 state["working_dir"] = new_dir
                 logger.info(
                     "[CC] 用户切换目录: user=%s, dir=%s, 旧session=%s, 新session=%s",
-                    user_id, new_dir, old_session[:8], new_sid[:8],
+                    user_id, new_dir, old_session[:8], state["session_id"][:8],
                 )
                 self.bot.reply(
                     chat_id,
                     f"工作目录已切换: {new_dir}\n"
-                    f"会话已重置（新会话: {new_sid[:8]}...）",
+                    f"{self._format_status(user_id)}",
                 )
             else:
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
