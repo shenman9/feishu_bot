@@ -42,5 +42,28 @@
 
 * **安装运行依赖**: `pip install lark-oapi pyyaml httpx schedule jinja2 anthropic`
 * **安装测试依赖**: `pip install -r requirements-dev.txt`
-* **运行机器人**: `python main.py`
 * **运行测试**: `pytest`
+
+### 服务管理（必须通过 run.sh，禁止直接执行 python main.py）
+
+| 命令 | 说明 |
+|------|------|
+| `./run.sh start` | 启动机器人（后台守护进程） |
+| `./run.sh stop` | 停止机器人 |
+| `./run.sh restart` | 重启机器人 |
+| `./run.sh status` | 查看运行状态 |
+
+**启动前预检**：`start` / `restart` 会自动执行环境预检，任一项失败则终止启动并给出提示：
+
+* Python 解释器可用性
+* `config.yaml` 文件是否存在
+* `main.py` 文件是否存在
+* 权限服务器端口是否已被占用（从 `config.yaml` 读取，缺省 9876），占用时显示占用进程 PID 与命令名
+
+## CC 插件权限服务器机制
+
+CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权限确认服务器，并将端口号写入 `~/.claude/.feishu_perm_port`，供 `permission_hook.sh` 读取。
+
+**降级机制**：若权限服务器启动失败（如端口被占用），插件会立即删除端口文件。hook 脚本检测不到端口文件时直接 `exit 0` 自动放行，避免因 curl 超时（默认 180s）卡住每次工具调用。
+
+**并发安全**：`_ensure_permission_server()` 内部使用双重检查锁（`_perm_server_lock`），防止多线程同时尝试绑定端口产生 `Address already in use` 错误。
