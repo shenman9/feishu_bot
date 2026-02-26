@@ -124,17 +124,12 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
         logger.info("[权限服务器] 等待用户响应: request_id=%s, timeout=%ds", request_id[:8], timeout)
         responded = event.wait(timeout=timeout)
         elapsed = time.monotonic() - wait_start
-        logger.info(
-            "[权限服务器] 等待结束: request_id=%s, responded=%s, 耗时=%.1fs",
-            request_id[:8], responded, elapsed,
-        )
-
         # 获取决策并清理
         pending = perm_server._pending_requests.pop(request_id, None)
         if not responded or pending is None or pending["decision"] is None:
             logger.warning(
-                "[权限服务器] 等待超时 (%ds): request_id=%s, user=%s",
-                timeout, request_id[:8], user_id,
+                "[权限服务器] 等待结束: request_id=%s, decision=timeout, 耗时=%.1fs",
+                request_id[:8], elapsed,
             )
             self._respond_json(
                 200, _make_hook_response("deny", f"用户未在 {timeout}s 内响应，自动拒绝")
@@ -143,8 +138,8 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
 
         behavior = pending["decision"]
         logger.info(
-            "[权限服务器] 用户已响应: request_id=%s, decision=%s",
-            request_id[:8], behavior,
+            "[权限服务器] 等待结束: request_id=%s, decision=%s, 耗时=%.1fs",
+            request_id[:8], behavior, elapsed,
         )
         resp = _make_hook_response(behavior)
         logger.debug("[权限服务器] 返回响应: %s", resp)

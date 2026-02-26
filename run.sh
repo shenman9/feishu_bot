@@ -15,9 +15,16 @@ _is_running() {
     fi
     local pid
     pid=$(cat "$PID_FILE")
-    # 同时验证进程命令行包含 main.py，防止 PID 被其他进程复用导致误判
-    kill -0 "$pid" 2>/dev/null && \
+    # 进程存活检查
+    kill -0 "$pid" 2>/dev/null || return 1
+    # 验证进程命令行包含 main.py，防止 PID 被其他进程复用导致误判
+    if [ -f "/proc/${pid}/cmdline" ]; then
+        # Linux: 通过 procfs 检查（cmdline 以 NUL 分隔，grep 仍可匹配）
         grep -q "main\.py" "/proc/${pid}/cmdline" 2>/dev/null
+    else
+        # 非 Linux（如 macOS）降级：通过 ps args 检查
+        ps -p "$pid" -o args= 2>/dev/null | grep -q "main\.py"
+    fi
 }
 
 # 从 config.yaml 读取权限服务器端口，缺省 9876

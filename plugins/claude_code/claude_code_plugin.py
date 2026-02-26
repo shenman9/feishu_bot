@@ -211,31 +211,37 @@ class ClaudeCodePlugin(Plugin):
             )
             try:
                 perm_server.start()
-                # start() 成功后才赋值，保证 _perm_server 始终指向有效实例
-                self._perm_server = perm_server
-                self._perm_server_started = True
-                # 写入端口文件，供 Hook 脚本读取
-                self._write_port_file(port)
-                # 自动注册 Hook 到 Claude 设置
-                self._setup_hook()
             except Exception as e:
+                # 仅 start()（端口绑定）失败时删除端口文件，让 hook 降级为自动放行
+                # 避免 hook 脚本向无效端口发请求后等待 curl 超时（每次工具调用卡 180s）
                 logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
-                # 删除端口文件，避免 hook 脚本向无效端口发请求后等待 curl 超时（每次工具调用卡 180s）
                 self._delete_port_file()
+                return
+
+            # start() 成功后才更新状态——_setup_hook 等后续步骤的失败不应回滚端口文件
+            self._perm_server = perm_server
+            self._perm_server_started = True
+            self._write_port_file(port)
+            self._setup_hook()
+
+    def _get_target_home_dir(self, run_as_user: str) -> str | None:
+        """获取目标用户的 HOME 目录。
+
+        若 run_as_user 已设置且当前为 root，返回该用户主目录；
+        用户不存在时返回 None；其余情况返回当前用户主目录。
+        """
+        if run_as_user and os.getuid() == 0:
+            try:
+                return pwd.getpwnam(run_as_user).pw_dir
+            except KeyError:
+                return None
+        return os.path.expanduser("~")
 
     def _write_port_file(self, port: int) -> None:
         """将端口号写入 ~/.claude/.feishu_perm_port，供 Hook 脚本读取"""
         cfg = self._load_plugin_config()
         run_as_user = cfg.get("run_as_user", "")
-
-        # 确定目标用户的 HOME 目录
-        if run_as_user and os.getuid() == 0:
-            try:
-                home_dir = pwd.getpwnam(run_as_user).pw_dir
-            except KeyError:
-                home_dir = os.path.expanduser("~")
-        else:
-            home_dir = os.path.expanduser("~")
+        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
 
         port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
         try:
@@ -256,14 +262,7 @@ class ClaudeCodePlugin(Plugin):
         """删除端口文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
         cfg = self._load_plugin_config()
         run_as_user = cfg.get("run_as_user", "")
-
-        if run_as_user and os.getuid() == 0:
-            try:
-                home_dir = pwd.getpwnam(run_as_user).pw_dir
-            except KeyError:
-                home_dir = os.path.expanduser("~")
-        else:
-            home_dir = os.path.expanduser("~")
+        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
 
         port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
         try:
@@ -279,15 +278,10 @@ class ClaudeCodePlugin(Plugin):
         """
         cfg = self._load_plugin_config()
         run_as_user = cfg.get("run_as_user", "")
-
-        if run_as_user and os.getuid() == 0:
-            try:
-                home_dir = pwd.getpwnam(run_as_user).pw_dir
-            except KeyError:
-                logger.error("[CC] Hook 注册失败: 用户 %s 不存在", run_as_user)
-                return
-        else:
-            home_dir = os.path.expanduser("~")
+        home_dir = self._get_target_home_dir(run_as_user)
+        if home_dir is None:
+            logger.error("[CC] Hook 注册失败: 用户 %s 不存在", run_as_user)
+            return
 
         settings_path = pathlib.Path(home_dir) / ".claude" / "settings.json"
 
@@ -365,13 +359,24 @@ class ClaudeCodePlugin(Plugin):
         若用户当前会话已开启免确认模式（bypass_permission=True），直接放行；
         否则发送飞书交互卡片等待用户点击确认。
         """
+        # 格式化工具调用详情用于日志（无论是否 bypass 均记录）
+        if tool_name == "Bash" and "command" in tool_input:
+            input_summary = tool_input["command"]
+        elif tool_name in ("Edit", "Write"):
+            file_path = tool_input.get("file_path", tool_input.get("path", ""))
+            input_summary = f"file={file_path}"
+        else:
+            input_summary = json.dumps(tool_input, ensure_ascii=False)[:500]
+
         # 检查会话级免确认模式
         state = self._get_state(user_id)
-        if state.get("bypass_permission", False):
-            logger.info(
-                "[CC] 免确认模式自动放行: user=%s, tool=%s, request=%s",
-                user_id, tool_name, request_id[:8],
-            )
+        bypass = state.get("bypass_permission", False)
+        logger.info(
+            "[CC] 权限请求: user=%s, tool=%s, bypass=%s, request=%s, input=%s",
+            user_id, tool_name, bypass, request_id[:8], input_summary.replace("\n", "↵"),
+        )
+
+        if bypass:
             if self._perm_server:
                 self._perm_server.resolve_request(request_id, "allow")
             return
