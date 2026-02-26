@@ -119,6 +119,16 @@ class ClaudeCodePlugin(Plugin):
         self._kill_process(user_id)
         self.user_states.pop(user_id, None)
 
+    def _reset_session(self, user_id: str) -> str:
+        """重置会话状态，终止运行中的进程，返回新会话 ID"""
+        self._kill_process(user_id)
+        state = self._get_state(user_id)
+        state["session_id"] = str(uuid.uuid4())
+        state["session_started"] = False
+        state["running"] = False
+        state["bypass_permission"] = False
+        return state["session_id"]
+
     # ---- 权限确认服务器 ----
 
     def _needs_permission_server(self) -> bool:
@@ -744,22 +754,15 @@ class ClaudeCodePlugin(Plugin):
                 f"- `/cancel` 终止运行中的任务\n"
                 f"- `/status` 查看当前状态\n"
                 f"- `/bypass` 切换权限确认模式\n"
-                f"- `/cd <路径>` 切换工作目录",
+                f"- `/cd <路径>` 切换工作目录（会同时重置会话）",
             )
             return
 
         # 2. 特殊指令：新会话
         if text == "/new":
             logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
-            self._kill_process(user_id)
-            state["session_id"] = str(uuid.uuid4())
-            state["session_started"] = False
-            state["running"] = False
-            state["bypass_permission"] = False  # 新会话恢复交互确认模式
-            self.bot.reply(
-                chat_id,
-                f"会话已重置。新会话: {state['session_id'][:8]}...",
-            )
+            new_sid = self._reset_session(user_id)
+            self.bot.reply(chat_id, f"会话已重置。新会话: {new_sid[:8]}...")
             return
 
         # 3. 特殊指令：取消
@@ -792,21 +795,17 @@ class ClaudeCodePlugin(Plugin):
         if text.startswith("/cd "):
             new_dir = text[len("/cd "):].strip()
             if os.path.isdir(new_dir):
-                logger.info("[CC] 用户切换目录: user=%s, dir=%s", user_id, new_dir)
-                state["working_dir"] = new_dir
-                # 切换目录后重置会话，避免 --resume 在新目录找不到旧 session
                 old_session = state["session_id"]
-                state["session_id"] = str(uuid.uuid4())
-                state["session_started"] = False
-                state["bypass_permission"] = False  # 新会话恢复交互确认模式
+                new_sid = self._reset_session(user_id)
+                state["working_dir"] = new_dir
                 logger.info(
-                    "[CC] 目录切换触发会话重置: user=%s, 旧session=%s, 新session=%s",
-                    user_id, old_session[:8], state["session_id"][:8],
+                    "[CC] 用户切换目录: user=%s, dir=%s, 旧session=%s, 新session=%s",
+                    user_id, new_dir, old_session[:8], new_sid[:8],
                 )
                 self.bot.reply(
                     chat_id,
                     f"工作目录已切换: {new_dir}\n"
-                    f"会话已重置（新会话: {state['session_id'][:8]}...）",
+                    f"会话已重置（新会话: {new_sid[:8]}...）",
                 )
             else:
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
