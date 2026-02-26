@@ -10,7 +10,14 @@ LOG_FILE="$PROJECT_DIR/.bot.log"
 PYTHON="${PYTHON:-python3}"
 
 _is_running() {
-    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+    if [ ! -f "$PID_FILE" ]; then
+        return 1
+    fi
+    local pid
+    pid=$(cat "$PID_FILE")
+    # 同时验证进程命令行包含 main.py，防止 PID 被其他进程复用导致误判
+    kill -0 "$pid" 2>/dev/null && \
+        grep -q "main\.py" "/proc/${pid}/cmdline" 2>/dev/null
 }
 
 # 从 config.yaml 读取权限服务器端口，缺省 9876
