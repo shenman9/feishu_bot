@@ -70,6 +70,7 @@ def _make_result_event(result_text="", cost=0.01, duration=2000, turns=1, sessio
 @pytest.fixture
 def plugin(mock_bot):
     """返回已注册 mock bot 的 ClaudeCodePlugin，并注入测试配置"""
+    from plugins.claude_code.claude_code_plugin import _DEFAULT_PERM_PORT, _DEFAULT_PERM_TIMEOUT
     p = ClaudeCodePlugin()
     p.on_register(mock_bot)
     p._config = {
@@ -80,7 +81,11 @@ def plugin(mock_bot):
         "permission_mode": "bypassPermissions",
         "max_turns": _DEFAULT_MAX_TURNS,
         "run_as_user": "",
+        "permission_server_port": _DEFAULT_PERM_PORT,
+        "permission_timeout": _DEFAULT_PERM_TIMEOUT,
     }
+    # 跳过真实 HTTP 服务器启动，避免端口冲突和测试副作用
+    p._perm_server_started = True
     return p
 
 
@@ -745,3 +750,86 @@ class TestRunAsUser:
             thread.join(timeout=10)
 
         assert mock_popen_cls.call_args[1].get("preexec_fn") is not None
+
+
+# ---- 会话级免确认模式测试 ----
+
+
+class TestPermissionToggle:
+    """会话级权限确认模式切换测试"""
+
+    def test_default_bypass_is_false(self, plugin):
+        """新用户默认为交互确认模式"""
+        state = plugin._get_state("u1")
+        assert state.get("bypass_permission", False) is False
+
+    def test_toggle_on(self, plugin):
+        """发送「免确认」开启免确认模式"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")
+        assert plugin._get_state("u1")["bypass_permission"] is True
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "免确认" in msg
+
+    def test_toggle_off(self, plugin):
+        """再次发送「免确认」恢复交互确认模式"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "免确认")
+        assert plugin._get_state("u1")["bypass_permission"] is False
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "交互确认" in msg
+
+    def test_toggle_blocked_when_running(self, plugin):
+        """任务运行中拒绝切换权限模式"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin._get_state("u1")["running"] = True
+        plugin.handle_message("u1", "c1", "免确认")
+        assert plugin._get_state("u1").get("bypass_permission", False) is False
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "运行中" in msg
+
+    def test_new_session_resets_bypass(self, plugin):
+        """「新会话」重置免确认模式为交互确认"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")
+        assert plugin._get_state("u1")["bypass_permission"] is True
+        plugin.handle_message("u1", "c1", "新会话")
+        assert plugin._get_state("u1")["bypass_permission"] is False
+
+    def test_deactivate_resets_bypass(self, plugin):
+        """deactivate 后重新获取状态默认为交互确认"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")
+        plugin.deactivate_user("u1")
+        assert plugin._get_state("u1").get("bypass_permission", False) is False
+
+    def test_status_shows_interactive_mode(self, plugin):
+        """「状态」显示交互确认模式"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "状态")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "交互确认" in msg
+
+    def test_status_shows_bypass_mode(self, plugin):
+        """开启免确认后「状态」显示免确认模式"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "状态")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "免确认" in msg
+
+    def test_activation_shows_permission_mode(self, plugin):
+        """激活消息包含权限模式信息和「免确认」指令说明"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "权限模式" in msg
+        assert "免确认" in msg
+
+    def test_multiple_users_independent(self, plugin):
+        """多用户权限模式互不干扰"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.handle_message("u2", "c2", PLUGIN_KEYWORD)
+        plugin.handle_message("u1", "c1", "免确认")  # 仅 u1 开启
+        assert plugin._get_state("u1")["bypass_permission"] is True
+        assert plugin._get_state("u2").get("bypass_permission", False) is False

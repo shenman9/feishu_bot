@@ -140,15 +140,15 @@ class TestPermissionServerHTTP:
         yield
         self.server.stop()
 
-    def test_unknown_session_denied(self):
-        """未注册的 session 自动拒绝"""
+    def test_unknown_session_allowed(self):
+        """未注册的 session（CLI 直接调用）自动放行"""
         data = {
             "session_id": "unknown-session",
             "tool_name": "Bash",
             "tool_input": {"command": "ls"},
         }
         resp = _post_json(self.port, "/permission-request", data)
-        assert resp["decision"] == "deny"
+        assert resp["decision"] == "allow"
 
     def test_allow_flow(self):
         """完整的允许流程：注册 session → 发请求 → 用户允许"""
@@ -380,13 +380,13 @@ class TestPluginPermissionIntegration:
         }
         return p
 
-    def test_needs_permission_server_default_mode(self, plugin):
-        """default 模式需要权限服务器"""
+    def test_needs_permission_server_always_true(self, plugin):
+        """权限服务器始终需要启动（默认启用交互确认）"""
         assert plugin._needs_permission_server() is True
 
-    def test_no_permission_server_bypass_mode(self, bypass_plugin):
-        """bypassPermissions 模式不需要权限服务器"""
-        assert bypass_plugin._needs_permission_server() is False
+    def test_needs_permission_server_bypass_mode_also_true(self, bypass_plugin):
+        """bypassPermissions 配置下权限服务器同样需要启动"""
+        assert bypass_plugin._needs_permission_server() is True
 
     def test_perm_allow_card_action(self, plugin):
         """权限允许按钮点击"""
@@ -436,3 +436,41 @@ class TestPluginPermissionIntegration:
         )
         # 不应崩溃
         assert result is not None
+
+    def test_bypass_mode_auto_allows(self, plugin):
+        """会话免确认模式下权限请求自动放行，不发飞书卡片"""
+        plugin._perm_server = MagicMock()
+        plugin.handle_message("u1", "c1", "CC")
+        plugin._get_state("u1")["bypass_permission"] = True
+
+        plugin._on_permission_request(
+            user_id="u1",
+            chat_id="c1",
+            request_id="req-auto",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+
+        # 自动放行，不发送飞书卡片
+        plugin.bot.send_message.assert_not_called()
+        plugin._perm_server.resolve_request.assert_called_once_with("req-auto", "allow")
+
+    def test_interactive_mode_sends_card(self, plugin):
+        """交互确认模式下权限请求发送飞书卡片"""
+        plugin._perm_server = MagicMock()
+        plugin.handle_message("u1", "c1", "CC")
+        assert plugin._get_state("u1").get("bypass_permission", False) is False
+
+        plugin._on_permission_request(
+            user_id="u1",
+            chat_id="c1",
+            request_id="req-card",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf /tmp/test"},
+        )
+
+        # 应发送飞书卡片
+        plugin.bot.send_message.assert_called_once()
+        # 自动放行不应被调用
+        plugin._perm_server.resolve_request.assert_not_called()
+

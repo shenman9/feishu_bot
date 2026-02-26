@@ -106,6 +106,7 @@ class ClaudeCodePlugin(Plugin):
                 "running": False,
                 "working_dir": cfg["default_working_dir"],
                 "last_chat_id": "",
+                "bypass_permission": False,  # 会话级免确认模式，默认关闭
             }
         return self.user_states[user_id]
 
@@ -121,13 +122,12 @@ class ClaudeCodePlugin(Plugin):
     # ---- 权限确认服务器 ----
 
     def _needs_permission_server(self) -> bool:
-        """判断当前配置是否需要启动权限确认服务器
+        """判断是否需要启动权限确认服务器
 
-        仅当 permission_mode 不是 bypassPermissions/dontAsk 时需要。
+        默认始终启用交互式权限确认（用户可在会话内切换免确认模式），
+        因此权限服务器始终需要启动。
         """
-        cfg = self._load_plugin_config()
-        mode = cfg.get("permission_mode", "bypassPermissions")
-        return mode not in ("bypassPermissions", "dontAsk")
+        return True
 
     def _ensure_permission_server(self) -> None:
         """确保权限确认服务器已启动（懒初始化）"""
@@ -271,7 +271,23 @@ class ClaudeCodePlugin(Plugin):
         tool_name: str,
         tool_input: dict,
     ) -> None:
-        """权限请求回调：发送飞书权限确认卡片"""
+        """权限请求回调：根据会话设置决定自动放行或发送飞书确认卡片
+
+        若用户当前会话已开启免确认模式（bypass_permission=True），直接放行；
+        否则发送飞书交互卡片等待用户点击确认。
+        """
+        # 检查会话级免确认模式
+        state = self._get_state(user_id)
+        if state.get("bypass_permission", False):
+            logger.info(
+                "[CC] 免确认模式自动放行: user=%s, tool=%s, request=%s",
+                user_id, tool_name, request_id[:8],
+            )
+            if self._perm_server:
+                self._perm_server.resolve_request(request_id, "allow")
+            return
+
+        # 默认模式：发送飞书权限确认卡片
         card = self._build_permission_card(request_id, tool_name, tool_input)
         try:
             self.bot.send_message(chat_id, "interactive", card)
@@ -360,15 +376,10 @@ class ClaudeCodePlugin(Plugin):
         else:
             cmd.extend(["--session-id", session_id])
         cmd.append("--verbose")
-        # 使用 Feishu 权限确认时，必须以 bypassPermissions 运行：
-        # PreToolUse hook 的 exit 0 无法覆盖 --permission-mode default 的内置检查，
-        # 在非交互（-p）模式下 default 模式会直接拒绝 Write/Bash，hook 形同虚设。
-        # 正确架构：bypassPermissions 跳过内置检查，hook 作为唯一权限门控。
-        if self._needs_permission_server():
-            cmd.extend(["--permission-mode", "bypassPermissions"])
-        else:
-            perm = cfg.get("permission_mode", "bypassPermissions")
-            cmd.extend(["--permission-mode", perm])
+        # 权限服务器（PreToolUse hook）始终作为唯一权限门控：
+        # CLI 以 bypassPermissions 运行，hook 负责拦截并通过飞书卡片或会话级免确认设置决策。
+        # 在非交互（-p）模式下，default 模式会直接拒绝 Write/Bash，hook 形同虚设。
+        cmd.extend(["--permission-mode", "bypassPermissions"])
         max_turns = cfg.get("max_turns", _DEFAULT_MAX_TURNS)
         cmd.extend(["--max-turns", str(max_turns)])
         return cmd
@@ -719,17 +730,20 @@ class ClaudeCodePlugin(Plugin):
             session_id = state["session_id"]
             working_dir = state.get("working_dir") or "(默认)"
             status = "运行中" if state["running"] else "空闲"
+            perm_mode = "免确认" if state.get("bypass_permission", False) else "交互确认"
             self.bot.reply(
                 chat_id,
                 f"Claude Code 已激活。\n"
                 f"会话: {session_id[:8]}...\n"
                 f"工作目录: {working_dir}\n"
-                f"状态: {status}\n\n"
+                f"状态: {status}\n"
+                f"权限模式: {perm_mode}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
                 f"- 「新会话」重置会话\n"
                 f"- 「取消」终止运行中的任务\n"
                 f"- 「状态」查看当前状态\n"
+                f"- 「免确认」切换权限确认模式\n"
                 f"- 「切换目录 <路径>」切换工作目录",
             )
             return
@@ -741,6 +755,7 @@ class ClaudeCodePlugin(Plugin):
             state["session_id"] = str(uuid.uuid4())
             state["session_started"] = False
             state["running"] = False
+            state["bypass_permission"] = False  # 新会话恢复交互确认模式
             self.bot.reply(
                 chat_id,
                 f"会话已重置。新会话: {state['session_id'][:8]}...",
@@ -763,11 +778,13 @@ class ClaudeCodePlugin(Plugin):
             session_id = state["session_id"]
             working_dir = state.get("working_dir") or "(默认)"
             status = "运行中" if state["running"] else "空闲"
+            perm_mode = "免确认" if state.get("bypass_permission", False) else "交互确认"
             self.bot.reply(
                 chat_id,
                 f"会话: {session_id[:8]}...\n"
                 f"工作目录: {working_dir}\n"
-                f"状态: {status}",
+                f"状态: {status}\n"
+                f"权限模式: {perm_mode}",
             )
             return
 
@@ -782,7 +799,29 @@ class ClaudeCodePlugin(Plugin):
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
             return
 
-        # 6. 并发控制：运行中拒绝新任务
+        # 6. 特殊指令：切换权限确认模式
+        if text == "免确认":
+            if state["running"]:
+                self.bot.reply(chat_id, "任务运行中，请等待完成后再切换权限模式。")
+                return
+            state["bypass_permission"] = not state.get("bypass_permission", False)
+            if state["bypass_permission"]:
+                logger.info("[CC] 用户开启免确认模式: user=%s", user_id)
+                self.bot.reply(
+                    chat_id,
+                    "已开启免确认模式。本会话内所有权限请求将自动放行。\n"
+                    "再次发送「免确认」可切换回交互确认模式。",
+                )
+            else:
+                logger.info("[CC] 用户关闭免确认模式: user=%s", user_id)
+                self.bot.reply(
+                    chat_id,
+                    "已恢复交互确认模式。权限请求将通过飞书卡片确认。\n"
+                    "再次发送「免确认」可切换为免确认模式。",
+                )
+            return
+
+        # 7. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
