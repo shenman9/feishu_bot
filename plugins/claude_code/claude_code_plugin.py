@@ -8,6 +8,7 @@ Claude Code 桥接插件
 将 Claude Code 的权限请求转发给飞书用户确认。
 """
 
+import datetime
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ _DEFAULT_MAX_OUTPUT = 28000     # 飞书卡片 markdown 最大字符数
 _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
 _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
+_MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
 
 PLUGIN_KEYWORD = "CC"
 
@@ -55,6 +57,7 @@ class ClaudeCodePlugin(Plugin):
     # detail: /help 中的详细说明
     _SPECIAL_COMMANDS: list[dict] = [
         {"usage": "/new",       "brief": "重置会话",                    "detail": "重置当前会话（清除上下文，开启新对话）"},
+        {"usage": "/sessions",  "brief": "查看并恢复历史会话",             "detail": "列出最近历史会话，可点击选择恢复"},
         {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
         {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
         {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
@@ -76,6 +79,8 @@ class ClaudeCodePlugin(Plugin):
         self._perm_server: Optional[PermissionServer] = None
         self._perm_server_started = False
         self._perm_server_lock = threading.Lock()
+        # 历史会话文件读写锁
+        self._sessions_lock = threading.Lock()
 
     # ---- 元信息 ----
 
@@ -184,6 +189,122 @@ class ClaudeCodePlugin(Plugin):
             f"状态: {status}\n"
             f"权限模式: {perm_mode}"
         )
+
+    # ---- 历史会话持久化 ----
+
+    def _sessions_file_path(self) -> pathlib.Path:
+        """返回历史会话存储文件路径（与 .feishu_perm_port 同目录）"""
+        cfg = self._load_plugin_config()
+        run_as_user = cfg.get("run_as_user", "")
+        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
+        return pathlib.Path(home_dir) / ".claude" / "feishu_sessions.json"
+
+    def _load_user_sessions(self, user_id: str) -> list[dict]:
+        """读取指定用户的历史会话列表（文件不存在则返回空列表）"""
+        path = self._sessions_file_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data.get(user_id, [])
+        except Exception as e:
+            logger.warning("[CC] 读取历史会话文件失败: %s", e)
+        return []
+
+    def _upsert_session(
+        self, user_id: str, session_id: str, working_dir: str, title: str
+    ) -> None:
+        """新增或更新一条历史会话记录，按最近活跃时间倒序保留最多 _MAX_SESSIONS_PER_USER 条"""
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        path = self._sessions_file_path()
+
+        with self._sessions_lock:
+            # 读取全量数据
+            try:
+                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception as e:
+                logger.warning("[CC] 读取历史会话文件失败，重置: %s", e)
+                data = {}
+
+            sessions: list[dict] = data.get(user_id, [])
+
+            # 查找是否已存在该 session_id
+            existing = next((s for s in sessions if s["session_id"] == session_id), None)
+            if existing:
+                existing["last_activity"] = now
+            else:
+                sessions.insert(0, {
+                    "session_id": session_id,
+                    "working_dir": working_dir,
+                    "title": title,
+                    "created_at": now,
+                    "last_activity": now,
+                })
+
+            # 按最近活跃时间倒序，截断
+            sessions.sort(key=lambda s: s["last_activity"], reverse=True)
+            data[user_id] = sessions[:_MAX_SESSIONS_PER_USER]
+
+            # 写回文件
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                logger.error("[CC] 写入历史会话文件失败: %s", e)
+
+    @staticmethod
+    def _build_sessions_card(sessions: list[dict], current_session_id: str) -> str:
+        """构造历史会话选择卡片"""
+        elements: list[dict] = [
+            {
+                "tag": "markdown",
+                "content": "点击选择要恢复的会话（将替换当前会话上下文）",
+            },
+            {"tag": "hr"},
+        ]
+        for session in sessions:
+            sid = session["session_id"]
+            short_id = sid[:8]
+            working_dir = session.get("working_dir") or "默认目录"
+            title = session.get("title", "（无标题）")
+            last_activity = session.get("last_activity", "")
+            # 格式化时间（去掉秒）
+            try:
+                dt = datetime.datetime.fromisoformat(last_activity)
+                time_str = dt.strftime("%m-%d %H:%M")
+            except Exception:
+                time_str = last_activity[:16]
+
+            is_current = sid == current_session_id
+            label = f"{'✓ 当前  ' if is_current else ''}{short_id}…"
+            elements.append({
+                "tag": "markdown",
+                "content": f"**{short_id}…** | `{working_dir}` | {time_str}\n{title}",
+            })
+            elements.append({
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "primary" if is_current else "default",
+                    "value": {
+                        "action": "resume_session",
+                        "plugin": PLUGIN_KEYWORD,
+                        "session_id": sid,
+                        "working_dir": session.get("working_dir", ""),
+                    },
+                }],
+            })
+            elements.append({"tag": "hr"})
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude Code 历史会话"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        return json.dumps(card)
 
     # ---- 权限确认服务器 ----
 
@@ -788,6 +909,13 @@ class ClaudeCodePlugin(Plugin):
             # 进程正常结束后标记会话已启动，后续调用使用 --resume
             if proc.returncode == 0:
                 state["session_started"] = True
+                # 保存/更新历史会话记录
+                title = (prompt[:50] + "…") if len(prompt) > 50 else prompt
+                self._upsert_session(
+                    user_id, session_id,
+                    state.get("working_dir") or cfg["default_working_dir"] or "",
+                    title,
+                )
 
             # 最终内容组装
             if not full_text:
@@ -1127,7 +1255,20 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, self._format_status(user_id))
             return
 
-        # 5. 特殊指令：切换目录（不带路径则重置为默认）
+        # 5. 特殊指令：历史会话
+        if text == "/sessions":
+            sessions = self._load_user_sessions(user_id)
+            if not sessions:
+                self.bot.reply(
+                    chat_id,
+                    "暂无历史会话记录。完成第一次任务后将自动记录，可在此查看并恢复。",
+                )
+                return
+            card = self._build_sessions_card(sessions[:10], state["session_id"])
+            self.bot.send_message(chat_id, "interactive", card)
+            return
+
+        # 6. 特殊指令：切换目录（不带路径则重置为默认）
         if text == "/cd":
             old_session = state["session_id"]
             self._reset_session(user_id)
@@ -1161,7 +1302,7 @@ class ClaudeCodePlugin(Plugin):
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
             return
 
-        # 6. 特殊指令：切换权限确认模式（弹出选择卡片）
+        # 7. 特殊指令：切换权限确认模式（弹出选择卡片）
         if text == "/permission":
             if state["running"]:
                 self.bot.reply(chat_id, "任务运行中，请等待完成后再切换权限模式。")
@@ -1170,7 +1311,7 @@ class ClaudeCodePlugin(Plugin):
             self.bot.send_message(chat_id, "interactive", card)
             return
 
-        # 7. 特殊指令：帮助
+        # 8. 特殊指令：帮助
         if text == "/help":
             help_text = (
                 "**CC 插件使用帮助**\n\n"
@@ -1193,7 +1334,7 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, help_text)
             return
 
-        # 8. 并发控制：运行中拒绝新任务
+        # 9. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
@@ -1202,7 +1343,7 @@ class ClaudeCodePlugin(Plugin):
             )
             return
 
-        # 9. 正常执行：发送 prompt 到 Claude Code
+        # 10. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
         state["last_chat_id"] = chat_id
         logger.info(
@@ -1328,6 +1469,31 @@ class ClaudeCodePlugin(Plugin):
                     toast="已开启 bypass 模式，本会话后续请求自动放行",
                 )
             return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        if action == "resume_session":
+            state = self._get_state(user_id)
+            if state.get("running"):
+                return self.bot.make_card_response(toast="任务运行中，无法切换会话")
+            target_sid = action_value.get("session_id", "")
+            target_dir = action_value.get("working_dir", "")
+            if not target_sid:
+                return self.bot.make_card_response(toast="无效的会话 ID")
+            if target_sid == state["session_id"]:
+                return self.bot.make_card_response(toast="当前会话无需恢复")
+            # 终止旧进程并切换到目标会话
+            self._kill_process(user_id)
+            state["session_id"] = target_sid
+            state["session_started"] = True   # 下次调用使用 --resume
+            state["working_dir"] = target_dir
+            state["running"] = False
+            state["session_perm_mode"] = self._load_plugin_config()["default_perm_mode"]
+            logger.info(
+                "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s",
+                user_id, target_sid[:8], target_dir,
+            )
+            return self.bot.make_card_response(
+                toast=f"已切换到会话 {target_sid[:8]}…，发送消息继续"
+            )
 
         return P2CardActionTriggerResponse()
 
