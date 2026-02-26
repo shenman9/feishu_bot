@@ -132,7 +132,12 @@ class ClaudeCodePlugin(Plugin):
     def _format_status(self, user_id: str) -> str:
         """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
         state = self._get_state(user_id)
-        working_dir = state.get("working_dir") or "(默认)"
+        working_dir = state.get("working_dir")
+        if not working_dir:
+            cfg = self._load_plugin_config()
+            default_dir = cfg.get("default_working_dir", "")
+            effective = default_dir if default_dir else os.getcwd()
+            working_dir = f"{effective} (默认)"
         status = "运行中" if state["running"] else "空闲"
         perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
         return (
@@ -366,6 +371,16 @@ class ClaudeCodePlugin(Plugin):
                             "type": "danger",
                             "value": {
                                 "action": "perm_deny",
+                                "plugin": PLUGIN_KEYWORD,
+                                "request_id": request_id,
+                            },
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "允许本次会话所有请求"},
+                            "type": "default",
+                            "value": {
+                                "action": "perm_bypass",
                                 "plugin": PLUGIN_KEYWORD,
                                 "request_id": request_id,
                             },
@@ -787,7 +802,21 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, self._format_status(user_id))
             return
 
-        # 5. 特殊指令：切换目录
+        # 5. 特殊指令：切换目录（不带路径则重置为默认）
+        if text == "/cd":
+            old_session = state["session_id"]
+            self._reset_session(user_id)
+            state["working_dir"] = ""
+            logger.info(
+                "[CC] 用户重置工作目录为默认: user=%s, 旧session=%s, 新session=%s",
+                user_id, old_session[:8], state["session_id"][:8],
+            )
+            self.bot.reply(
+                chat_id,
+                f"工作目录已重置为默认。\n{self._format_status(user_id)}",
+            )
+            return
+
         if text.startswith("/cd "):
             new_dir = text[len("/cd "):].strip()
             if os.path.isdir(new_dir):
@@ -829,7 +858,32 @@ class ClaudeCodePlugin(Plugin):
                 )
             return
 
-        # 7. 并发控制：运行中拒绝新任务
+        # 7. 特殊指令：帮助
+        if text == "/help":
+            help_text = (
+                "**CC 插件使用帮助**\n\n"
+                "**基本用法**\n"
+                "直接发送任意文本，即可将其作为 prompt 提交给 Claude Code 执行。\n\n"
+                "**特殊指令**\n"
+                "• `/new` — 重置当前会话（清除上下文，开启新对话）\n"
+                "• `/cancel` — 终止当前正在运行的任务\n"
+                "• `/status` — 查看当前会话状态（目录、session、权限模式等）\n"
+                "• `/cd <路径>` — 切换工作目录并重置会话\n"
+                "• `/cd` — 重置工作目录为默认并重置会话\n"
+                "• `/bypass` — 切换权限确认模式（交互确认 ↔ 自动放行）\n"
+                "• `/help` — 显示此帮助信息\n\n"
+                "**权限确认**\n"
+                "Claude Code 执行敏感操作时，会通过飞书卡片请求确认。\n"
+                "• 「允许」— 放行本次请求\n"
+                "• 「拒绝」— 拒绝本次请求\n"
+                "• 「允许本次会话所有请求」— 开启 bypass 模式，后续请求自动放行\n\n"
+                "**退出插件**\n"
+                "发送「退出」或「返回」可退出 CC 插件，回到主菜单。"
+            )
+            self.bot.reply(chat_id, help_text)
+            return
+
+        # 8. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
@@ -838,7 +892,7 @@ class ClaudeCodePlugin(Plugin):
             )
             return
 
-        # 7. 正常执行：发送 prompt 到 Claude Code
+        # 9. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
         state["last_chat_id"] = chat_id
         logger.info(
@@ -900,6 +954,30 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(
                     card=json.loads(handled_card),
                     toast=f"已{behavior_cn}",
+                )
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        if action == "perm_bypass":
+            request_id = action_value.get("request_id", "")
+
+            if not self._perm_server:
+                return self.bot.make_card_response(toast="权限服务器未启动")
+
+            # 开启会话级免确认模式
+            state = self._get_state(user_id)
+            state["bypass_permission"] = True
+            logger.info(
+                "[CC] 用户通过权限卡片开启 bypass 模式: user=%s, request=%s",
+                user_id, request_id[:8] if request_id else "?",
+            )
+
+            # 同时放行当前挂起的请求
+            ok = self._perm_server.resolve_request(request_id, "allow")
+            if ok:
+                handled_card = self._build_permission_handled_card("允许（已开启 bypass 模式）")
+                return self.bot.make_card_response(
+                    card=json.loads(handled_card),
+                    toast="已开启 bypass 模式，本会话后续请求自动放行",
                 )
             return self.bot.make_card_response(toast="该请求已过期或已处理")
 
