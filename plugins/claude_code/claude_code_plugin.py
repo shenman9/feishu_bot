@@ -730,7 +730,7 @@ class ClaudeCodePlugin(Plugin):
             session_id = state["session_id"]
             working_dir = state.get("working_dir") or "(默认)"
             status = "运行中" if state["running"] else "空闲"
-            perm_mode = "免确认" if state.get("bypass_permission", False) else "交互确认"
+            perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
             self.bot.reply(
                 chat_id,
                 f"Claude Code 已激活。\n"
@@ -740,16 +740,16 @@ class ClaudeCodePlugin(Plugin):
                 f"权限模式: {perm_mode}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
-                f"- 「新会话」重置会话\n"
-                f"- 「取消」终止运行中的任务\n"
-                f"- 「状态」查看当前状态\n"
-                f"- 「免确认」切换权限确认模式\n"
-                f"- 「切换目录 <路径>」切换工作目录",
+                f"- `/new` 重置会话\n"
+                f"- `/cancel` 终止运行中的任务\n"
+                f"- `/status` 查看当前状态\n"
+                f"- `/bypass` 切换权限确认模式\n"
+                f"- `/cd <路径>` 切换工作目录",
             )
             return
 
         # 2. 特殊指令：新会话
-        if text == "新会话":
+        if text == "/new":
             logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
             self._kill_process(user_id)
             state["session_id"] = str(uuid.uuid4())
@@ -763,7 +763,7 @@ class ClaudeCodePlugin(Plugin):
             return
 
         # 3. 特殊指令：取消
-        if text == "取消":
+        if text == "/cancel":
             if state["running"]:
                 logger.info("[CC] 用户取消任务: user=%s", user_id)
                 self._kill_process(user_id)
@@ -774,11 +774,11 @@ class ClaudeCodePlugin(Plugin):
             return
 
         # 4. 特殊指令：状态
-        if text == "状态":
+        if text == "/status":
             session_id = state["session_id"]
             working_dir = state.get("working_dir") or "(默认)"
             status = "运行中" if state["running"] else "空闲"
-            perm_mode = "免确认" if state.get("bypass_permission", False) else "交互确认"
+            perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
             self.bot.reply(
                 chat_id,
                 f"会话: {session_id[:8]}...\n"
@@ -789,8 +789,8 @@ class ClaudeCodePlugin(Plugin):
             return
 
         # 5. 特殊指令：切换目录
-        if text.startswith("切换目录 "):
-            new_dir = text[len("切换目录 "):].strip()
+        if text.startswith("/cd "):
+            new_dir = text[len("/cd "):].strip()
             if os.path.isdir(new_dir):
                 logger.info("[CC] 用户切换目录: user=%s, dir=%s", user_id, new_dir)
                 state["working_dir"] = new_dir
@@ -800,7 +800,7 @@ class ClaudeCodePlugin(Plugin):
             return
 
         # 6. 特殊指令：切换权限确认模式
-        if text == "免确认":
+        if text == "/bypass":
             if state["running"]:
                 self.bot.reply(chat_id, "任务运行中，请等待完成后再切换权限模式。")
                 return
@@ -809,15 +809,15 @@ class ClaudeCodePlugin(Plugin):
                 logger.info("[CC] 用户开启免确认模式: user=%s", user_id)
                 self.bot.reply(
                     chat_id,
-                    "已开启免确认模式。本会话内所有权限请求将自动放行。\n"
-                    "再次发送「免确认」可切换回交互确认模式。",
+                    "已开启 bypass 模式。本会话内所有权限请求将自动放行。\n"
+                    "再次发送 `/bypass` 可切换回交互确认模式。",
                 )
             else:
                 logger.info("[CC] 用户关闭免确认模式: user=%s", user_id)
                 self.bot.reply(
                     chat_id,
                     "已恢复交互确认模式。权限请求将通过飞书卡片确认。\n"
-                    "再次发送「免确认」可切换为免确认模式。",
+                    "再次发送 `/bypass` 可切换为 bypass 模式。",
                 )
             return
 
@@ -826,7 +826,7 @@ class ClaudeCodePlugin(Plugin):
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
                 chat_id,
-                "上一个任务仍在运行中，请等待完成或发送「取消」终止。",
+                "上一个任务仍在运行中，请等待完成或发送 `/cancel` 终止。",
             )
             return
 

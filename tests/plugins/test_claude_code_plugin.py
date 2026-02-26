@@ -165,7 +165,7 @@ class TestUserCommands:
         # 模拟已完成过一次调用
         plugin._get_state("u1")["session_started"] = True
 
-        plugin.handle_message("u1", "c1", "新会话")
+        plugin.handle_message("u1", "c1", "/new")
         state = plugin._get_state("u1")
 
         assert state["session_id"] != old_session
@@ -184,7 +184,7 @@ class TestUserCommands:
         proc.wait = Mock()
         plugin._running_processes["u1"] = proc
 
-        plugin.handle_message("u1", "c1", "取消")
+        plugin.handle_message("u1", "c1", "/cancel")
 
         proc.terminate.assert_called_once()
         assert state["running"] is False
@@ -194,7 +194,7 @@ class TestUserCommands:
     def test_cancel_when_idle(self, plugin):
         """空闲时「取消」给出友好提示"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "取消")
+        plugin.handle_message("u1", "c1", "/cancel")
 
         msg = plugin.bot.reply.call_args[0][1]
         assert "没有运行中" in msg
@@ -202,7 +202,7 @@ class TestUserCommands:
     def test_status(self, plugin):
         """「状态」显示当前信息"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "状态")
+        plugin.handle_message("u1", "c1", "/status")
 
         msg = plugin.bot.reply.call_args[0][1]
         assert "会话" in msg
@@ -212,7 +212,7 @@ class TestUserCommands:
         """「切换目录」到有效目录"""
         with patch("plugins.claude_code.claude_code_plugin.os.path.isdir", return_value=True):
             plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-            plugin.handle_message("u1", "c1", "切换目录 /tmp")
+            plugin.handle_message("u1", "c1", "/cd /tmp")
 
         state = plugin._get_state("u1")
         assert state["working_dir"] == "/tmp"
@@ -223,7 +223,7 @@ class TestUserCommands:
         """「切换目录」到不存在的目录"""
         with patch("plugins.claude_code.claude_code_plugin.os.path.isdir", return_value=False):
             plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-            plugin.handle_message("u1", "c1", "切换目录 /nonexistent")
+            plugin.handle_message("u1", "c1", "/cd /nonexistent")
 
         msg = plugin.bot.reply.call_args[0][1]
         assert "不存在" in msg
@@ -617,8 +617,8 @@ class TestUserIsolation:
         plugin.handle_message("u2", "c2", PLUGIN_KEYWORD)
 
         with patch("plugins.claude_code.claude_code_plugin.os.path.isdir", return_value=True):
-            plugin.handle_message("u1", "c1", "切换目录 /project_a")
-            plugin.handle_message("u2", "c2", "切换目录 /project_b")
+            plugin.handle_message("u1", "c1", "/cd /project_a")
+            plugin.handle_message("u2", "c2", "/cd /project_b")
 
         assert plugin._get_state("u1")["working_dir"] == "/project_a"
         assert plugin._get_state("u2")["working_dir"] == "/project_b"
@@ -766,16 +766,16 @@ class TestPermissionToggle:
     def test_toggle_on(self, plugin):
         """发送「免确认」开启免确认模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "/bypass")
         assert plugin._get_state("u1")["bypass_permission"] is True
         msg = plugin.bot.reply.call_args[0][1]
-        assert "免确认" in msg
+        assert "/bypass" in msg
 
     def test_toggle_off(self, plugin):
         """再次发送「免确认」恢复交互确认模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")
-        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "/bypass")
+        plugin.handle_message("u1", "c1", "/bypass")
         assert plugin._get_state("u1")["bypass_permission"] is False
         msg = plugin.bot.reply.call_args[0][1]
         assert "交互确认" in msg
@@ -784,7 +784,7 @@ class TestPermissionToggle:
         """任务运行中拒绝切换权限模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin._get_state("u1")["running"] = True
-        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "/bypass")
         assert plugin._get_state("u1").get("bypass_permission", False) is False
         msg = plugin.bot.reply.call_args[0][1]
         assert "运行中" in msg
@@ -792,44 +792,44 @@ class TestPermissionToggle:
     def test_new_session_resets_bypass(self, plugin):
         """「新会话」重置免确认模式为交互确认"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "/bypass")
         assert plugin._get_state("u1")["bypass_permission"] is True
-        plugin.handle_message("u1", "c1", "新会话")
+        plugin.handle_message("u1", "c1", "/new")
         assert plugin._get_state("u1")["bypass_permission"] is False
 
     def test_deactivate_resets_bypass(self, plugin):
         """deactivate 后重新获取状态默认为交互确认"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")
+        plugin.handle_message("u1", "c1", "/bypass")
         plugin.deactivate_user("u1")
         assert plugin._get_state("u1").get("bypass_permission", False) is False
 
     def test_status_shows_interactive_mode(self, plugin):
-        """「状态」显示交互确认模式"""
+        """「status」显示交互确认模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "状态")
+        plugin.handle_message("u1", "c1", "/status")
         msg = plugin.bot.reply.call_args[0][1]
-        assert "交互确认" in msg
+        assert "interactive" in msg
 
     def test_status_shows_bypass_mode(self, plugin):
-        """开启免确认后「状态」显示免确认模式"""
+        """开启 bypass 后「status」显示 bypass 模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")
-        plugin.handle_message("u1", "c1", "状态")
+        plugin.handle_message("u1", "c1", "/bypass")
+        plugin.handle_message("u1", "c1", "/status")
         msg = plugin.bot.reply.call_args[0][1]
-        assert "免确认" in msg
+        assert "bypass" in msg
 
     def test_activation_shows_permission_mode(self, plugin):
-        """激活消息包含权限模式信息和「免确认」指令说明"""
+        """激活消息包含权限模式信息和 bypass 指令说明"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         msg = plugin.bot.reply.call_args[0][1]
         assert "权限模式" in msg
-        assert "免确认" in msg
+        assert "/bypass" in msg
 
     def test_multiple_users_independent(self, plugin):
         """多用户权限模式互不干扰"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u2", "c2", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "免确认")  # 仅 u1 开启
+        plugin.handle_message("u1", "c1", "/bypass")  # 仅 u1 开启
         assert plugin._get_state("u1")["bypass_permission"] is True
         assert plugin._get_state("u2").get("bypass_permission", False) is False
