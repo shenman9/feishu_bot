@@ -46,6 +46,19 @@ class ClaudeCodePlugin(Plugin):
     将用户飞书消息作为 prompt，流式回显 Claude Code 的输出。
     """
 
+    # 特殊指令定义表（统一维护，供激活消息和 /help 复用）
+    # brief: 激活欢迎词中的简短说明（None 表示不在简短列表中显示）
+    # detail: /help 中的详细说明
+    _SPECIAL_COMMANDS: list[dict] = [
+        {"usage": "/new",       "brief": "重置会话",                    "detail": "重置当前会话（清除上下文，开启新对话）"},
+        {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
+        {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
+        {"usage": "/bypass",    "brief": "切换权限确认模式",             "detail": "切换权限确认模式（交互确认 ↔ 自动放行）"},
+        {"usage": "/cd <路径>", "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
+        {"usage": "/cd",        "brief": None,                          "detail": "重置工作目录为默认并重置会话"},
+        {"usage": "/help",      "brief": "查看帮助信息",                 "detail": "显示此帮助信息"},
+    ]
+
     def __init__(self):
         super().__init__()
         # user_id -> 用户状态
@@ -72,6 +85,25 @@ class ClaudeCodePlugin(Plugin):
     @property
     def description(self) -> str:
         return "通过飞书远程使用 Claude Code"
+
+    @classmethod
+    def _commands_brief(cls) -> str:
+        """生成激活欢迎词中的简短指令列表（brief 为 None 的条目跳过）"""
+        lines = [
+            f"- `{cmd['usage']}` {cmd['brief']}"
+            for cmd in cls._SPECIAL_COMMANDS
+            if cmd["brief"] is not None
+        ]
+        return "\n".join(lines)
+
+    @classmethod
+    def _commands_detail(cls) -> str:
+        """生成 /help 中的详细指令列表（包含所有条目）"""
+        lines = [
+            f"• `{cmd['usage']}` — {cmd['detail']}"
+            for cmd in cls._SPECIAL_COMMANDS
+        ]
+        return "\n".join(lines)
 
     # ---- 配置 ----
 
@@ -771,11 +803,7 @@ class ClaudeCodePlugin(Plugin):
                 f"{self._format_status(user_id)}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
-                f"- `/new` 重置会话\n"
-                f"- `/cancel` 终止运行中的任务\n"
-                f"- `/status` 查看当前状态\n"
-                f"- `/bypass` 切换权限确认模式\n"
-                f"- `/cd <路径>` 切换工作目录（会同时重置会话）",
+                f"{self._commands_brief()}",
             )
             return
 
@@ -865,13 +893,7 @@ class ClaudeCodePlugin(Plugin):
                 "**基本用法**\n"
                 "直接发送任意文本，即可将其作为 prompt 提交给 Claude Code 执行。\n\n"
                 "**特殊指令**\n"
-                "• `/new` — 重置当前会话（清除上下文，开启新对话）\n"
-                "• `/cancel` — 终止当前正在运行的任务\n"
-                "• `/status` — 查看当前会话状态（目录、session、权限模式等）\n"
-                "• `/cd <路径>` — 切换工作目录并重置会话\n"
-                "• `/cd` — 重置工作目录为默认并重置会话\n"
-                "• `/bypass` — 切换权限确认模式（交互确认 ↔ 自动放行）\n"
-                "• `/help` — 显示此帮助信息\n\n"
+                f"{self._commands_detail()}\n\n"
                 "**权限确认**\n"
                 "Claude Code 执行敏感操作时，会通过飞书卡片请求确认。\n"
                 "• 「允许」— 放行本次请求\n"
