@@ -794,7 +794,20 @@ class ClaudeCodePlugin(Plugin):
             if os.path.isdir(new_dir):
                 logger.info("[CC] 用户切换目录: user=%s, dir=%s", user_id, new_dir)
                 state["working_dir"] = new_dir
-                self.bot.reply(chat_id, f"工作目录已切换: {new_dir}")
+                # 切换目录后重置会话，避免 --resume 在新目录找不到旧 session
+                old_session = state["session_id"]
+                state["session_id"] = str(uuid.uuid4())
+                state["session_started"] = False
+                state["bypass_permission"] = False  # 新会话恢复交互确认模式
+                logger.info(
+                    "[CC] 目录切换触发会话重置: user=%s, 旧session=%s, 新session=%s",
+                    user_id, old_session[:8], state["session_id"][:8],
+                )
+                self.bot.reply(
+                    chat_id,
+                    f"工作目录已切换: {new_dir}\n"
+                    f"会话已重置（新会话: {state['session_id'][:8]}...）",
+                )
             else:
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
             return
