@@ -19,6 +19,9 @@
 | 插件开发 | `.claude/guides/plugin-dev.md` | 新增插件流程、隔离规则、错误处理模式 |
 | 测试 | `.claude/guides/testing.md` | pytest 使用规范、测试命名、异步测试 |
 | 代码风格 | `.claude/guides/code-style.md` | 类型提示、Docstring、命名规范、Commit 格式 |
+| **提交 commit** | `.claude/guides/commit.md` | 文档同步要求、Commit 前检查清单、Message 格式 |
+
+> **重要**：每次执行 `git commit` 前，必须先阅读 `.claude/guides/commit.md`，确认文档已与代码同步更新后方可提交。提交commit后，告知用户文档已与代码同步更新。
 
 ## 通用规则（始终生效）
 
