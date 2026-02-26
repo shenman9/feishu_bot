@@ -24,10 +24,10 @@
 
 ```python
 try:
-    await plugin.handle_message(message)
+    plugin.handle_message(user_id, chat_id, text)
 except Exception as e:
     logger.error(f"插件 {plugin.name} 运行错误: {e}")
-    await self.reply_text(message.chat_id, "⚠️ 抱歉，该功能运行出错，请联系管理员。")
+    self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")
     # 绝对不能让这个异常导致 main loop 退出
 ```
 

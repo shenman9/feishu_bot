@@ -25,7 +25,9 @@ feishu_bot/
 │   └── claude_code/         # Claude Code 桥接（调用本地 CLI，支持飞书交互式权限确认）
 │       ├── claude_code_plugin.py   # 插件主体
 │       ├── permission_server.py    # 权限确认 HTTP 服务器（IPC 桥梁）
-│       └── permission_hook.sh      # PreToolUse Hook 脚本（Claude Code 调用）
+│       ├── permission_hook.sh      # PreToolUse Hook 脚本（Claude Code 调用）
+│       ├── standalone.py           # 独立运行模式（跳过 HubBot，直连飞书）
+│       └── __main__.py             # python -m plugins.claude_code 入口
 └── tests/                   # 测试套件
     ├── README.md            # 测试开发指南
     ├── conftest.py          # 共享夹具（mock bot、StubPlugin 等）
@@ -81,7 +83,7 @@ python main.py
 | `文件阅读` | FileReaderPlugin | 上传 txt 文件读取内容 |
 | `Claude` | ClaudeChatPlugin | 多轮智能对话，流式响应实时更新卡片 |
 | `论文日报` | PaperDailyPlugin | ArXiv 论文 AI 筛选与中文摘要，支持订阅每日定时推送 |
-| `CC` | ClaudeCodePlugin | 调用本地 Claude Code CLI，支持飞书交互式权限确认（允许/拒绝危险操作） |
+| `CC` | ClaudeCodePlugin | 调用本地 Claude Code CLI，支持飞书交互式权限确认（允许/拒绝/bypass 危险操作），发送 `/help` 查看完整指令列表 |
 
 ### 底部菜单栏触发
 

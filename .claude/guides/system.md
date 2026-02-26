@@ -25,9 +25,9 @@
 ## 技术栈
 
 * **语言**: Python 3.10+
-* **并发模式**: `asyncio` (异步 I/O)。所有 I/O 操作（网络请求、数据库）必须是异步的 (`await`)。
+* **并发模式**: 主线程处理飞书 WebSocket 事件（同步调用插件）；阻塞型 I/O（子进程调用、流式 HTTP 请求等）通过 `threading.Thread` 在后台线程中执行，避免阻塞主线程。
 * **核心依赖**: `lark-oapi`（飞书 SDK）、`pyyaml`（配置解析）、`httpx`（HTTP 客户端）、`schedule`（定时任务）、`jinja2`（模板引擎）
-* **依赖管理**: `pip` + `requirements.txt`。
+* **依赖管理**: `pip`（运行依赖直接安装；测试依赖通过 `requirements-dev.txt`）。
 * **测试框架**: `pytest`。
 
 ## 敏感信息与配置管理
@@ -40,6 +40,7 @@
 
 ## 常用命令
 
-* **安装依赖**: `pip install -r requirements.txt`
+* **安装运行依赖**: `pip install lark-oapi pyyaml httpx schedule jinja2 anthropic`
+* **安装测试依赖**: `pip install -r requirements-dev.txt`
 * **运行机器人**: `python main.py`
 * **运行测试**: `pytest`

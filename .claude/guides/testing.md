@@ -8,8 +8,8 @@
 ## 常用命令
 
 * **运行全部测试**: `pytest`
-* **运行指定插件测试**: `pytest plugins/some_plugin/`
-* **运行指定测试目录**: `pytest tests/test_core/`
+* **运行指定插件测试**: `pytest tests/plugins/test_some_plugin.py`
+* **运行指定测试目录**: `pytest tests/core/`
 
 ## 测试规范
 

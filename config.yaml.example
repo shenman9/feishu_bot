@@ -37,7 +37,7 @@ claude_code:
   max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
   permission_mode: "default"            # 已废弃，不再影响运行行为，保留仅供兼容性参考。
                                         # 权限确认现在默认始终启用，用户可在会话内发送
-                                        # 「免确认」指令进行会话级切换。
+                                        # /bypass 指令进行会话级切换。
   max_turns: 50                         # Claude Code 最大轮次
   run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
   permission_server_port: 9876          # 权限确认 HTTP 服务器端口
@@ -53,5 +53,5 @@ claude_code:
   #   会通过飞书卡片询问用户确认，用户可选择「允许」或「拒绝」。
   # - 插件会自动启动 HTTP 服务器（端口见 permission_server_port），并向 Claude
   #   的 settings.json 注册 PreToolUse Hook。
-  # - 用户可在会话内发送「免确认」指令切换为自动放行模式，再次发送可恢复确认。
+  # - 用户可在会话内发送 /bypass 指令切换为自动放行模式，再次发送可恢复确认。
   #   此设置仅限当前会话，开启新会话后自动恢复交互确认。

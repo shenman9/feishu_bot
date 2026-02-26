@@ -27,7 +27,11 @@ tests/
 │   ├── test_hub_bot.py        # 消息路由、插件注册
 │   └── test_plugin.py         # 插件基类
 └── plugins/                   # 插件测试（每个插件一个文件）
-    └── test_rps_plugin.py     # 石头剪刀布插件
+    ├── test_claude_chat_plugin.py   # Claude 对话插件
+    ├── test_claude_code_plugin.py   # Claude Code 桥接插件
+    ├── test_file_reader_plugin.py   # 文件阅读插件
+    ├── test_permission_server.py    # 权限确认 HTTP 服务器
+    └── test_rps_plugin.py           # 石头剪刀布插件
 ```
 
 ## 核心机制：lark_oapi Mock

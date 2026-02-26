@@ -47,6 +47,10 @@ class MyPlugin(Plugin):
         """处理卡片按钮点击。不需要卡片交互的插件可以不实现。"""
         ...
 
+    def handle_file_message(self, user_id, chat_id, message_id, file_key, file_name) -> None:
+        """处理文件消息（用户上传文件时调用）。不需要文件处理的插件可以不实现。"""
+        ...
+
     def is_user_active(self, user_id: str) -> bool:
         """返回 True 表示用户仍在本插件会话中，后续消息继续路由到本插件。
         返回 False（默认）则每次消息处理完后自动退出插件。"""
@@ -69,6 +73,7 @@ class MyPlugin(Plugin):
 | `self.bot.send_message_get_id(chat_id, msg_type, content)` | 发送消息并返回 message_id |
 | `self.bot.patch_message(message_id, content)` | 更新已发送的卡片内容（用于进度更新、流式响应等） |
 | `self.bot.make_card_response(card=None, toast=None)` | 构造卡片按钮点击的响应（更新卡片/弹 toast） |
+| `self.bot.download_file(message_id, file_key)` | 下载消息中的文件，返回二进制内容（失败时抛 RuntimeError） |
 
 ## 生命周期钩子
 
