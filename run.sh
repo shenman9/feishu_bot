@@ -13,10 +13,79 @@ _is_running() {
     [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
+# 从 config.yaml 读取权限服务器端口，缺省 9876
+_get_perm_port() {
+    local port=""
+    if [ -f "$PROJECT_DIR/config.yaml" ]; then
+        port=$(awk '/^[[:space:]]*permission_server_port:[[:space:]]*/{ print $2; exit }' \
+            "$PROJECT_DIR/config.yaml" 2>/dev/null || true)
+    fi
+    echo "${port:-9876}"
+}
+
+# 启动前环境预检，任一失败则打印错误并返回 1
+_preflight_check() {
+    local failed=false
+
+    # 1. Python 可用性
+    if ! "$PYTHON" -c "" 2>/dev/null; then
+        echo "  [错误] Python 解释器不可用: $PYTHON"
+        failed=true
+    fi
+
+    # 2. 配置文件
+    if [ ! -f "$PROJECT_DIR/config.yaml" ]; then
+        echo "  [错误] 配置文件不存在，请参考 config.yaml.example 创建"
+        failed=true
+    fi
+
+    # 3. 主程序入口
+    if [ ! -f "$PROJECT_DIR/main.py" ]; then
+        echo "  [错误] 主程序不存在: $PROJECT_DIR/main.py"
+        failed=true
+    fi
+
+    # 4. 权限服务器端口占用检查
+    local port
+    port=$(_get_perm_port)
+    local holder_pid="" holder_cmd="" port_occupied=false
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tlnp 2>/dev/null | grep -q ":${port}[[:space:]]"; then
+            port_occupied=true
+            holder_pid=$(ss -tlnp 2>/dev/null \
+                | sed -n "/:${port}[[:space:]]/s/.*pid=\([0-9]*\).*/\1/p" \
+                | head -1 || true)
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+            port_occupied=true
+            holder_pid=$(lsof -iTCP:"${port}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
+        fi
+    fi
+
+    if [ "$port_occupied" = true ]; then
+        [ -n "$holder_pid" ] && \
+            holder_cmd=$(ps -p "$holder_pid" -o comm= 2>/dev/null || true)
+        echo "  [错误] 权限服务器端口 $port 已被占用" \
+            "${holder_pid:+(PID: $holder_pid${holder_cmd:+, $holder_cmd})}"
+        echo "         若为未正常退出的机器人进程，请先执行: ./run.sh stop"
+        echo "         若为其他进程，请修改 config.yaml 中的 permission_server_port"
+        failed=true
+    fi
+
+    [ "$failed" = false ]
+}
+
 do_start() {
     if _is_running; then
         echo "机器人已在运行中 (PID: $(cat "$PID_FILE"))"
         return 0
+    fi
+    echo "正在检查运行环境..."
+    if ! _preflight_check; then
+        echo "预检未通过，启动取消"
+        return 1
     fi
     echo "正在启动机器人..."
     cd "$PROJECT_DIR"
