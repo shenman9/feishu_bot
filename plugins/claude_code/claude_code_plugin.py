@@ -53,8 +53,8 @@ class ClaudeCodePlugin(Plugin):
         {"usage": "/new",       "brief": "重置会话",                    "detail": "重置当前会话（清除上下文，开启新对话）"},
         {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
         {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
-        {"usage": "/bypass",    "brief": "切换权限确认模式",             "detail": "切换权限确认模式（交互确认 ↔ 自动放行）"},
-        {"usage": "/cd <路径>", "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
+        {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
+        {"usage": "/cd <路径>",    "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
         {"usage": "/cd",        "brief": None,                          "detail": "重置工作目录为默认并重置会话"},
         {"usage": "/help",      "brief": "查看帮助信息",                 "detail": "显示此帮助信息"},
     ]
@@ -119,6 +119,7 @@ class ClaudeCodePlugin(Plugin):
                 "timeout": cc_cfg.get("timeout", _DEFAULT_TIMEOUT),
                 "max_output_chars": cc_cfg.get("max_output_chars", _DEFAULT_MAX_OUTPUT),
                 "permission_mode": cc_cfg.get("permission_mode", "bypassPermissions"),
+                "default_perm_mode": cc_cfg.get("default_perm_mode", "interactive"),
                 "max_turns": cc_cfg.get("max_turns", _DEFAULT_MAX_TURNS),
                 "run_as_user": cc_cfg.get("run_as_user", ""),
                 "permission_server_port": cc_cfg.get("permission_server_port", _DEFAULT_PERM_PORT),
@@ -139,7 +140,7 @@ class ClaudeCodePlugin(Plugin):
                 "running": False,
                 "working_dir": cfg["default_working_dir"],
                 "last_chat_id": "",
-                "bypass_permission": False,  # 会话级免确认模式，默认关闭
+                "session_perm_mode": cfg["default_perm_mode"],  # 会话级权限模式: interactive / bypass / accept_edits
             }
         return self.user_states[user_id]
 
@@ -159,7 +160,7 @@ class ClaudeCodePlugin(Plugin):
         state["session_id"] = str(uuid.uuid4())
         state["session_started"] = False
         state["running"] = False
-        state["bypass_permission"] = False
+        state["session_perm_mode"] = self._load_plugin_config()["default_perm_mode"]
         return state["session_id"]
 
     def _format_status(self, user_id: str) -> str:
@@ -172,7 +173,7 @@ class ClaudeCodePlugin(Plugin):
             effective = default_dir if default_dir else os.getcwd()
             working_dir = f"{effective} (默认)"
         status = "运行中" if state["running"] else "空闲"
-        perm_mode = "bypass" if state.get("bypass_permission", False) else "interactive"
+        perm_mode = state.get("session_perm_mode", "interactive")
         return (
             f"会话: {state['session_id'][:8]}...\n"
             f"工作目录: {working_dir}\n"
@@ -354,12 +355,14 @@ class ClaudeCodePlugin(Plugin):
         tool_name: str,
         tool_input: dict,
     ) -> None:
-        """权限请求回调：根据会话设置决定自动放行或发送飞书确认卡片
+        """权限请求回调：根据会话权限模式决定自动放行或发送飞书确认卡片
 
-        若用户当前会话已开启免确认模式（bypass_permission=True），直接放行；
-        否则发送飞书交互卡片等待用户点击确认。
+        三种模式:
+        - interactive (默认): 所有请求均通过飞书卡片确认
+        - bypass: 所有请求自动放行
+        - accept_edits: Write/Edit/NotebookEdit 在工作目录内自动放行，其余仍需确认
         """
-        # 格式化工具调用详情用于日志（无论是否 bypass 均记录）
+        # 格式化工具调用详情用于日志
         if tool_name == "Bash" and "command" in tool_input:
             input_summary = tool_input["command"]
         elif tool_name in ("Edit", "Write"):
@@ -368,21 +371,45 @@ class ClaudeCodePlugin(Plugin):
         else:
             input_summary = json.dumps(tool_input, ensure_ascii=False)[:500]
 
-        # 检查会话级免确认模式
+        # 读取当前会话权限模式
         state = self._get_state(user_id)
-        bypass = state.get("bypass_permission", False)
+        perm_mode = state.get("session_perm_mode", "interactive")
         logger.info(
-            "[CC] 权限请求: user=%s, tool=%s, bypass=%s, request=%s, input=%s",
-            user_id, tool_name, bypass, request_id[:8], input_summary.replace("\n", "↵"),
+            "[CC] 权限请求: user=%s, tool=%s, perm_mode=%s, request=%s, input=%s",
+            user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
         )
 
-        if bypass:
+        # bypass 模式：直接放行所有请求
+        if perm_mode == "bypass":
             if self._perm_server:
                 self._perm_server.resolve_request(request_id, "allow")
             return
 
-        # 默认模式：发送飞书权限确认卡片
-        card = self._build_permission_card(request_id, tool_name, tool_input)
+        # accept_edits 模式：文件修改类工具在工作目录内自动放行
+        if perm_mode == "accept_edits":
+            if tool_name in ("Write", "Edit", "NotebookEdit"):
+                fp = tool_input.get("file_path") or tool_input.get("notebook_path", "")
+                working_dir = state.get("working_dir", "")
+                if fp and self._is_within_working_dir(fp, working_dir):
+                    logger.info(
+                        "[CC] accept_edits 模式自动放行: tool=%s, file=%s", tool_name, fp,
+                    )
+                    if self._perm_server:
+                        self._perm_server.resolve_request(request_id, "allow")
+                    return
+            # 工作目录外的文件修改或其他工具（Bash 等）继续走卡片确认
+
+        # interactive 模式或 accept_edits 模式未匹配自动放行：发送飞书权限确认卡片
+        # 仅当请求本身属于 accept_edits 自动放行范围（工作目录内的文件修改）时，
+        # 才在卡片上显示「允许本次会话所有修改」按钮，否则该按钮语义上不合适
+        fp = tool_input.get("file_path") or tool_input.get("notebook_path", "")
+        show_accept_edits_option = (
+            perm_mode == "interactive"
+            and tool_name in ("Write", "Edit", "NotebookEdit")
+            and bool(fp)
+            and self._is_within_working_dir(fp, state.get("working_dir", ""))
+        )
+        card = self._build_permission_card(request_id, tool_name, tool_input, show_accept_edits_option)
         try:
             self.bot.send_message(chat_id, "interactive", card)
             logger.info(
@@ -394,8 +421,71 @@ class ClaudeCodePlugin(Plugin):
             raise
 
     @staticmethod
-    def _build_permission_card(request_id: str, tool_name: str, tool_input: dict) -> str:
-        """构造权限确认飞书卡片"""
+    def _is_within_working_dir(file_path: str, working_dir: str) -> bool:
+        """检查文件路径是否在工作目录内（含工作目录本身）
+
+        用于 accept_edits 模式判断是否可以自动放行文件修改请求。
+        """
+        if not working_dir:
+            working_dir = os.getcwd()
+        try:
+            abs_file = os.path.realpath(os.path.abspath(file_path))
+            abs_dir = os.path.realpath(os.path.abspath(working_dir))
+            return os.path.commonpath([abs_file, abs_dir]) == abs_dir
+        except (ValueError, OSError):
+            return False
+
+    @staticmethod
+    def _build_permission_mode_card(current_mode: str) -> str:
+        """构造权限模式选择卡片，高亮当前模式"""
+        mode_labels = {
+            "interactive": "交互确认（Interactive）",
+            "accept_edits": "自动接受编辑（Accept Edits）",
+            "bypass": "全部放行（Bypass）",
+        }
+        mode_descs = {
+            "interactive": "所有操作均通过飞书卡片确认，安全性最高",
+            "accept_edits": "工作目录内的文件修改自动放行，Bash 等操作仍需确认",
+            "bypass": "所有操作自动放行，无需任何确认（危险，慎用）",
+        }
+        buttons = []
+        for mode, label in mode_labels.items():
+            is_current = mode == current_mode
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": f"{'✓ ' if is_current else ''}{label}"},
+                "type": "primary" if is_current else "default",
+                "value": {"action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": mode},
+            })
+        elements = [
+            {"tag": "markdown", "content": f"当前模式：**{mode_labels[current_mode]}**\n{mode_descs[current_mode]}"},
+            {"tag": "hr"},
+        ]
+        for mode, label in mode_labels.items():
+            elements.append({"tag": "markdown", "content": f"**{label}**\n{mode_descs[mode]}"})
+        elements.append({"tag": "action", "actions": buttons})
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude Code 权限模式"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        return json.dumps(card)
+
+    @staticmethod
+    def _build_permission_card(
+        request_id: str, tool_name: str, tool_input: dict, show_accept_edits_option: bool = False
+    ) -> str:
+        """构造权限确认飞书卡片
+
+        快捷升级按钮根据当前请求类型动态显示：
+        - show_accept_edits_option=True（工作目录内的文件修改）:
+          同时显示「允许本次会话所有修改」和「允许本次会话所有请求」
+        - show_accept_edits_option=False（Bash 等其他操作，或工作目录外的文件修改）:
+          仅显示「允许本次会话所有请求」，因为 accept_edits 模式对当前请求无效
+        """
         # 格式化工具输入的展示内容
         if tool_name == "Bash" and "command" in tool_input:
             input_display = f"```\n{tool_input['command']}\n```"
@@ -405,6 +495,36 @@ class ClaudeCodePlugin(Plugin):
         else:
             # 通用展示：JSON 格式
             input_display = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)[:1000]}\n```"
+
+        actions = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "允许"},
+                "type": "primary",
+                "value": {"action": "perm_allow", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "拒绝"},
+                "type": "danger",
+                "value": {"action": "perm_deny", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
+            },
+        ]
+        # 仅当请求属于 accept_edits 范围（工作目录内的文件修改）时显示该按钮
+        if show_accept_edits_option:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "允许本次会话所有修改"},
+                "type": "default",
+                "value": {"action": "perm_accept_edits", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
+            })
+        # interactive 和 accept_edits 模式均显示「允许本次会话所有请求」（升级到 bypass）
+        actions.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "允许本次会话所有请求"},
+            "type": "default",
+            "value": {"action": "perm_bypass", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
+        })
 
         card = {
             "config": {"wide_screen_mode": True},
@@ -418,41 +538,7 @@ class ClaudeCodePlugin(Plugin):
                     "content": f"**工具**: {tool_name}\n**操作**:\n{input_display}",
                 },
                 {"tag": "hr"},
-                {
-                    "tag": "action",
-                    "actions": [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "允许"},
-                            "type": "primary",
-                            "value": {
-                                "action": "perm_allow",
-                                "plugin": PLUGIN_KEYWORD,
-                                "request_id": request_id,
-                            },
-                        },
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "拒绝"},
-                            "type": "danger",
-                            "value": {
-                                "action": "perm_deny",
-                                "plugin": PLUGIN_KEYWORD,
-                                "request_id": request_id,
-                            },
-                        },
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": "允许本次会话所有请求"},
-                            "type": "default",
-                            "value": {
-                                "action": "perm_bypass",
-                                "plugin": PLUGIN_KEYWORD,
-                                "request_id": request_id,
-                            },
-                        },
-                    ],
-                },
+                {"tag": "action", "actions": actions},
             ],
         }
         return json.dumps(card)
@@ -898,26 +984,13 @@ class ClaudeCodePlugin(Plugin):
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
             return
 
-        # 6. 特殊指令：切换权限确认模式
-        if text == "/bypass":
+        # 6. 特殊指令：切换权限确认模式（弹出选择卡片）
+        if text == "/permission":
             if state["running"]:
                 self.bot.reply(chat_id, "任务运行中，请等待完成后再切换权限模式。")
                 return
-            state["bypass_permission"] = not state.get("bypass_permission", False)
-            if state["bypass_permission"]:
-                logger.info("[CC] 用户开启免确认模式: user=%s", user_id)
-                self.bot.reply(
-                    chat_id,
-                    "已开启 bypass 模式。本会话内所有权限请求将自动放行。\n"
-                    "再次发送 `/bypass` 可切换回交互确认模式。",
-                )
-            else:
-                logger.info("[CC] 用户关闭免确认模式: user=%s", user_id)
-                self.bot.reply(
-                    chat_id,
-                    "已恢复交互确认模式。权限请求将通过飞书卡片确认。\n"
-                    "再次发送 `/bypass` 可切换为 bypass 模式。",
-                )
+            card = self._build_permission_mode_card(state["session_perm_mode"])
+            self.bot.send_message(chat_id, "interactive", card)
             return
 
         # 7. 特殊指令：帮助
@@ -929,10 +1002,14 @@ class ClaudeCodePlugin(Plugin):
                 "**特殊指令**\n"
                 f"{self._commands_detail()}\n\n"
                 "**权限确认**\n"
-                "Claude Code 执行敏感操作时，会通过飞书卡片请求确认。\n"
+                "Claude Code 执行敏感操作时，会通过飞书卡片请求确认：\n"
                 "• 「允许」— 放行本次请求\n"
                 "• 「拒绝」— 拒绝本次请求\n"
-                "• 「允许本次会话所有请求」— 开启 bypass 模式，后续请求自动放行\n\n"
+                "• 「允许本次会话所有请求」— 切换为 bypass 模式，后续请求自动放行\n\n"
+                "**权限模式**（发送 `/permission` 可切换）\n"
+                "• `interactive` — 所有操作均需确认（默认）\n"
+                "• `accept_edits` — 工作目录内文件修改自动放行，其余仍需确认\n"
+                "• `bypass` — 所有操作自动放行（危险，慎用）\n\n"
                 "**退出插件**\n"
                 "发送「退出」或「返回」可退出 CC 插件，回到主菜单。"
             )
@@ -1013,15 +1090,53 @@ class ClaudeCodePlugin(Plugin):
                 )
             return self.bot.make_card_response(toast="该请求已过期或已处理")
 
+        if action == "set_perm_mode":
+            new_mode = action_value.get("mode", "interactive")
+            if new_mode not in ("interactive", "accept_edits", "bypass"):
+                return self.bot.make_card_response(toast="无效的权限模式")
+            state = self._get_state(user_id)
+            if state["running"]:
+                return self.bot.make_card_response(toast="任务运行中，无法切换权限模式")
+            state["session_perm_mode"] = new_mode
+            mode_cn = {"interactive": "交互确认", "accept_edits": "自动接受编辑", "bypass": "全部放行"}[new_mode]
+            logger.info("[CC] 用户切换权限模式: user=%s, mode=%s", user_id, new_mode)
+            updated_card = self._build_permission_mode_card(new_mode)
+            return self.bot.make_card_response(
+                card=json.loads(updated_card),
+                toast=f"已切换为{mode_cn}模式",
+            )
+
+        if action == "perm_accept_edits":
+            request_id = action_value.get("request_id", "")
+
+            if not self._perm_server:
+                return self.bot.make_card_response(toast="权限服务器未启动")
+
+            # 切换为 accept_edits 模式，同时放行当前挂起的请求
+            state = self._get_state(user_id)
+            state["session_perm_mode"] = "accept_edits"
+            logger.info(
+                "[CC] 用户通过权限卡片开启 accept_edits 模式: user=%s, request=%s",
+                user_id, request_id[:8] if request_id else "?",
+            )
+            ok = self._perm_server.resolve_request(request_id, "allow")
+            if ok:
+                handled_card = self._build_permission_handled_card("允许（已开启 accept_edits 模式）")
+                return self.bot.make_card_response(
+                    card=json.loads(handled_card),
+                    toast="已开启 accept_edits 模式，工作目录内文件修改自动放行",
+                )
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
         if action == "perm_bypass":
             request_id = action_value.get("request_id", "")
 
             if not self._perm_server:
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
-            # 开启会话级免确认模式
+            # 开启会话级 bypass 模式
             state = self._get_state(user_id)
-            state["bypass_permission"] = True
+            state["session_perm_mode"] = "bypass"
             logger.info(
                 "[CC] 用户通过权限卡片开启 bypass 模式: user=%s, request=%s",
                 user_id, request_id[:8] if request_id else "?",

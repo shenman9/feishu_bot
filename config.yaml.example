@@ -36,8 +36,11 @@ claude_code:
   timeout: 600                          # 单次执行超时（秒）
   max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
   permission_mode: "default"            # 已废弃，不再影响运行行为，保留仅供兼容性参考。
-                                        # 权限确认现在默认始终启用，用户可在会话内发送
-                                        # /bypass 指令进行会话级切换。
+  default_perm_mode: "interactive"      # 新会话默认权限模式，可选值：
+                                        #   interactive  - 所有操作通过飞书卡片确认（默认）
+                                        #   accept_edits - 工作目录内文件修改自动放行，其余仍需确认
+                                        #   bypass       - 所有操作自动放行（危险，慎用）
+                                        # 用户也可在会话内通过 /bypass 或 /accept-edits 临时切换。
   max_turns: 50                         # Claude Code 最大轮次
   run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
   permission_server_port: 9876          # 权限确认 HTTP 服务器端口

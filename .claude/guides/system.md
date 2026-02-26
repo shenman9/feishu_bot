@@ -67,3 +67,30 @@ CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权�
 **降级机制**：若权限服务器启动失败（如端口被占用），插件会立即删除端口文件。hook 脚本检测不到端口文件时直接 `exit 0` 自动放行，避免因 curl 超时（默认 180s）卡住每次工具调用。
 
 **并发安全**：`_ensure_permission_server()` 内部使用双重检查锁（`_perm_server_lock`），防止多线程同时尝试绑定端口产生 `Address already in use` 错误。
+
+### 权限模式（session_perm_mode）
+
+每个用户会话维护独立的权限模式，共三种，通过 `/permission` 指令弹出卡片切换：
+
+| 模式 | 说明 |
+|------|------|
+| `interactive` | 所有操作均通过飞书卡片确认（默认） |
+| `accept_edits` | 工作目录内的 Write/Edit/NotebookEdit 自动放行，其余仍需确认 |
+| `bypass` | 所有操作自动放行，无需任何确认 |
+
+新会话的默认模式由 `config.yaml` 中的 `claude_code.default_perm_mode` 决定，缺省为 `interactive`。
+
+只读工具（`Read`、`Glob`、`Grep`）由 `permission_hook.sh` 在 hook 入口直接放行，不进入权限服务器流程，与原始 Claude Code 默认行为一致。
+
+### 权限确认卡片按钮
+
+需要用户确认时，飞书卡片上的按钮组合取决于当前请求的类型：
+
+| 按钮 | action | 显示条件 |
+|------|--------|---------|
+| 「允许」 | `perm_allow` | 始终显示 |
+| 「拒绝」 | `perm_deny` | 始终显示 |
+| 「允许本次会话所有修改」 | `perm_accept_edits` | 仅当请求属于 accept_edits 范围：工具为 Write/Edit/NotebookEdit **且**目标文件在工作目录内 |
+| 「允许本次会话所有请求」 | `perm_bypass` | 始终显示（bypass 模式下不会出现卡片，此处始终可见） |
+
+「允许本次会话所有修改」不在 accept_edits 范围内的请求（如 `bash git status`，或工作目录外的文件写入）上隐藏，是因为切换到 accept_edits 模式对这类请求无效，显示该按钮会产生语义误导。

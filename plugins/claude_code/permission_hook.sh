@@ -31,6 +31,14 @@ SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin)
 
 _log "=== 权限请求: tool=${TOOL_NAME}, session=${SESSION_ID} ==="
 
+# 只读工具白名单：与原始 Claude Code 默认行为保持一致，这些工具无需飞书卡片确认
+case "$TOOL_NAME" in
+    Read|Glob|Grep)
+        _log "只读工具 (${TOOL_NAME})，自动放行"
+        exit 0
+        ;;
+esac
+
 # 读取端口号：文件不存在说明飞书 Bot 未运行，直接允许
 PORT_FILE="${HOME}/.claude/.feishu_perm_port"
 if [ ! -f "$PORT_FILE" ]; then
