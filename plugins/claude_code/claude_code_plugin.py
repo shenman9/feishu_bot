@@ -847,11 +847,11 @@ class ClaudeCodePlugin(Plugin):
             cost_info = ""
             has_assistant_text = False
 
-            # 工具调用日志状态
-            log_segments: list[dict] = []       # 已完成的工具调用段
-            current_streak: list[dict] = []     # 当前连续工具调用
-            active_tool_ids: dict[str, int] = {}  # tool_use_id → current_streak 索引
-            log_dirty = False                   # 日志是否有变化（触发节流更新）
+            # 统一内容段列表：工具调用段与文字段按实际执行顺序交错存储
+            segments: list[dict] = []            # {"type":"tools","entries":[...]} 或 {"type":"text","content":"..."}
+            current_streak: list[dict] = []      # 当前连续工具调用
+            active_tool_ids: dict[str, int] = {} # tool_use_id → current_streak 索引
+            log_dirty = False                    # 是否有变化（触发节流更新）
 
             line_count = 0
             for line in proc.stdout:
@@ -860,8 +860,9 @@ class ClaudeCodePlugin(Plugin):
                     continue
                 line_count += 1
 
+                # 分隔符由下方循环体负责处理，此处始终传 False 避免重复添加
                 text_chunk, log_actions, meta = self._parse_stream_line(
-                    line, has_assistant_text, cwd or ""
+                    line, False, cwd or ""
                 )
 
                 # 处理日志动作
@@ -887,24 +888,32 @@ class ClaudeCodePlugin(Plugin):
                             log_dirty = True
 
                 if text_chunk:
-                    # 文字输出前将当前 streak 提交到 log_segments
                     if current_streak:
-                        log_segments.append({
+                        # 将工具调用段刷入统一列表，工具段本身已提供视觉分隔
+                        segments.append({
                             "type": "tools",
                             "entries": [e["line"] for e in current_streak],
                         })
                         current_streak = []
                         active_tool_ids = {}
+                    elif has_assistant_text and segments and segments[-1]["type"] == "text":
+                        # 连续文字段（无工具调用间隔），补分隔线
+                        text_chunk = "\n\n---\n\n" + text_chunk
+
                     if not has_assistant_text:
                         logger.info("[CC] 收到首条输出: user=%s, pid=%d", user_id, proc.pid)
                     has_assistant_text = True
+                    # 将文字段加入统一列表，保持与工具调用的交错顺序
+                    segments.append({"type": "text", "content": text_chunk})
                     full_text += text_chunk
                     log_dirty = True
 
                     # 截断保护
                     if len(full_text) > cfg["max_output_chars"]:
                         full_text = full_text[:cfg["max_output_chars"]]
-                        full_text += "\n\n**[输出已截断，超出飞书卡片字符限制]**"
+                        trunc_msg = "\n\n**[输出已截断，超出飞书卡片字符限制]**"
+                        segments[-1]["content"] += trunc_msg
+                        full_text += trunc_msg
                         logger.warning(
                             "[CC] 输出截断: user=%s, 字符数已达 %d 上限",
                             user_id, cfg["max_output_chars"],
@@ -916,14 +925,13 @@ class ClaudeCodePlugin(Plugin):
                     cost_info = meta
                     logger.info("[CC] 收到结果统计: user=%s, %s", user_id, meta)
 
-                # 节流更新：日志或文字有变化时，按时间间隔刷新卡片
+                # 节流更新：有变化时按时间间隔刷新卡片
                 if message_id and log_dirty:
                     now = time.time()
                     chars_since = len(full_text) - last_patch_len
                     time_since = now - last_patch_time
                     if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
-                        log_text = self._render_log(log_segments, current_streak, running=True)
-                        card_text = self._assemble_card_text(log_text, full_text)
+                        card_text = self._render_log(segments, current_streak, running=True)
                         self._patch_card(message_id, card_text, running=True)
                         last_patch_len = len(full_text)
                         last_patch_time = now
@@ -961,19 +969,19 @@ class ClaudeCodePlugin(Plugin):
 
             # 最终内容组装
             if not full_text:
-                full_text = "Claude Code 未产生输出。"
+                fallback = "Claude Code 未产生输出。"
                 if stderr_output:
-                    full_text += f"\n\nstderr:\n```\n{stderr_output[:2000]}\n```"
+                    fallback += f"\n\nstderr:\n```\n{stderr_output[:2000]}\n```"
+                segments.append({"type": "text", "content": fallback})
 
             # 将剩余未提交的 streak 也入段（任务结束时可能还有工具调用未出文字）
             if current_streak:
-                log_segments.append({
+                segments.append({
                     "type": "tools",
                     "entries": [e["line"] for e in current_streak],
                 })
 
-            log_text = self._render_log(log_segments, [], running=False)
-            card_text = self._assemble_card_text(log_text, full_text)
+            card_text = self._render_log(segments, [], running=False)
             if cost_info:
                 card_text += f"\n\n---\n{cost_info}"
 
@@ -1171,23 +1179,31 @@ class ClaudeCodePlugin(Plugin):
         current_streak: list[dict],
         running: bool,
     ) -> str:
-        """将工具调用日志段和当前连续区间渲染为 markdown 文本
+        """将统一内容段列表和当前连续区间渲染为 markdown 文本
+
+        工具调用段与文字段按实际执行顺序交错渲染，保持与原始 CC 输出一致的顺序。
 
         Args:
-            log_segments: 已完成的段列表，每段 {"type": "tools", "entries": list[str]}
+            log_segments: 已完成的段列表，每段为以下之一：
+                {"type": "tools", "entries": list[str]}  工具调用段
+                {"type": "text",  "content": str}        文字段
             current_streak: 当前正在进行的连续工具调用，每项 {"line": str, "tool_use_id": str|None}
             running: 是否仍在执行中（控制末尾⏳提示）
         """
         lines: list[str] = []
 
         for segment in log_segments:
-            entries: list[str] = segment["entries"]
-            n = len(entries)
-            if n > _MAX_STREAK_DISPLAY:
-                lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
-                entries = entries[-_MAX_STREAK_DISPLAY:]
-            lines.extend(entries)
-            lines.append("")  # 段间空行
+            if segment["type"] == "tools":
+                entries: list[str] = segment["entries"]
+                n = len(entries)
+                if n > _MAX_STREAK_DISPLAY:
+                    lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
+                    entries = entries[-_MAX_STREAK_DISPLAY:]
+                lines.extend(entries)
+                lines.append("")  # 段间空行
+            elif segment["type"] == "text":
+                lines.append(segment["content"])
+                lines.append("")  # 段间空行
 
         if current_streak:
             entries = [e["line"] for e in current_streak]

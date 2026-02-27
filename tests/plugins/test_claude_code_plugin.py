@@ -460,6 +460,34 @@ class TestRenderLog:
         # 段间有空行
         assert "\n\n" in result or "\n \n" in result or result.count("\n") >= 2
 
+    def test_interleaved_tools_and_text_order(self):
+        """工具调用与文字段按实际执行顺序交错渲染（非两段式）"""
+        segments = [
+            {"type": "tools", "entries": ["📖 Read `a.py` → ✅"]},
+            {"type": "text", "content": "分析结果：文件已读取"},
+            {"type": "tools", "entries": ["💻 Bash `git commit` → ✅"]},
+            {"type": "text", "content": "提交完成"},
+        ]
+        result = ClaudeCodePlugin._render_log(segments, [], running=False)
+        idx_tool1 = result.index("Read")
+        idx_text1 = result.index("分析结果")
+        idx_tool2 = result.index("Bash")
+        idx_text2 = result.index("提交完成")
+        # 必须严格按 工具1 → 文字1 → 工具2 → 文字2 顺序排列
+        assert idx_tool1 < idx_text1 < idx_tool2 < idx_text2
+
+    def test_text_segment_rendered_inline(self):
+        """文字段内联渲染，不被折叠或放到末尾"""
+        segments = [
+            {"type": "tools", "entries": ["📖 Read `x.py` → ✅"]},
+            {"type": "text", "content": "这是中间文字"},
+            {"type": "tools", "entries": ["💻 Bash `ls` → ✅"]},
+        ]
+        result = ClaudeCodePlugin._render_log(segments, [], running=False)
+        assert "这是中间文字" in result
+        # 文字夹在两段工具调用之间
+        assert result.index("Read") < result.index("这是中间文字") < result.index("Bash")
+
 
 class TestFormatToolCall:
     """工具调用格式化测试"""
@@ -1043,38 +1071,42 @@ class TestPermissionToggle:
         assert state.get("bypass_permission", False) is False
 
     def test_toggle_on(self, plugin):
-        """发送「免确认」开启免确认模式"""
+        """卡片动作 set_perm_mode 可切换为 bypass 模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "/bypass")
-        assert plugin._get_state("u1")["bypass_permission"] is True
-        msg = plugin.bot.reply.call_args[0][1]
-        assert "/bypass" in msg
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
+        })
+        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
 
     def test_toggle_off(self, plugin):
-        """再次发送「免确认」恢复交互确认模式"""
+        """卡片动作 set_perm_mode 可切换回 interactive 模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "/bypass")
-        plugin.handle_message("u1", "c1", "/bypass")
-        assert plugin._get_state("u1")["bypass_permission"] is False
-        msg = plugin.bot.reply.call_args[0][1]
-        assert "交互确认" in msg
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
+        })
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "interactive"
+        })
+        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
 
     def test_toggle_blocked_when_running(self, plugin):
-        """任务运行中拒绝切换权限模式"""
+        """任务运行中，/permission 指令被拒绝并提示"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin._get_state("u1")["running"] = True
-        plugin.handle_message("u1", "c1", "/bypass")
-        assert plugin._get_state("u1").get("bypass_permission", False) is False
+        plugin.handle_message("u1", "c1", "/permission")
         msg = plugin.bot.reply.call_args[0][1]
         assert "运行中" in msg
+        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
 
     def test_new_session_resets_bypass(self, plugin):
-        """「新会话」重置免确认模式为交互确认"""
+        """「/new」重置权限模式为默认（interactive）"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "/bypass")
-        assert plugin._get_state("u1")["bypass_permission"] is True
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
+        })
+        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
         plugin.handle_message("u1", "c1", "/new")
-        assert plugin._get_state("u1")["bypass_permission"] is False
+        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
 
     def test_deactivate_resets_bypass(self, plugin):
         """deactivate 后重新获取状态默认为交互确认"""
@@ -1091,24 +1123,28 @@ class TestPermissionToggle:
         assert "interactive" in msg
 
     def test_status_shows_bypass_mode(self, plugin):
-        """开启 bypass 后「status」显示 bypass 模式"""
+        """切换 bypass 后，「/status」显示 bypass 模式"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "/bypass")
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
+        })
         plugin.handle_message("u1", "c1", "/status")
         msg = plugin.bot.reply.call_args[0][1]
         assert "bypass" in msg
 
     def test_activation_shows_permission_mode(self, plugin):
-        """激活消息包含权限模式信息和 bypass 指令说明"""
+        """激活消息包含权限模式信息和 /permission 指令"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         msg = plugin.bot.reply.call_args[0][1]
         assert "权限模式" in msg
-        assert "/bypass" in msg
+        assert "/permission" in msg
 
     def test_multiple_users_independent(self, plugin):
         """多用户权限模式互不干扰"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u2", "c2", PLUGIN_KEYWORD)
-        plugin.handle_message("u1", "c1", "/bypass")  # 仅 u1 开启
-        assert plugin._get_state("u1")["bypass_permission"] is True
-        assert plugin._get_state("u2").get("bypass_permission", False) is False
+        plugin.handle_card_action("u1", "c1", "m1", {
+            "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
+        })
+        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
+        assert plugin._get_state("u2")["session_perm_mode"] == "interactive"
