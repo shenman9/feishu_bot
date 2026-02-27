@@ -865,6 +865,7 @@ class ClaudeCodePlugin(Plugin):
             active_tool_ids: dict[str, int] = {} # tool_use_id → current_streak 索引
             log_dirty = False                    # 是否有变化（触发节流更新）
             model_thinking = True                # 初始即为思考阶段；收到 assistant 事件后置 False
+            phase_start_time = start_time        # 当前阶段（思考/处理）开始时间；阶段切换时重置
 
             line_count = 0
             while True:
@@ -883,12 +884,13 @@ class ClaudeCodePlugin(Plugin):
                         break
                     # 无新数据时刷新进度计时
                     if message_id:
-                        elapsed = int(time.time() - start_time)
+                        elapsed = int(time.time() - phase_start_time)
                         card_text = self._render_log(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
-                        self._patch_card(message_id, card_text, running=True)
+                        self._patch_card(message_id, card_text, running=True,
+                                         elapsed=int(time.time() - start_time))
                         last_patch_time = time.time()
                     continue
 
@@ -904,17 +906,28 @@ class ClaudeCodePlugin(Plugin):
                     line, has_assistant_text, cwd
                 )
 
-                # 更新模型思考阶段状态：
-                # - user 事件（工具结果返回）→ 模型将开始推理，置 True
-                # - assistant 事件产出任意内容（thinking/tool_use/text）→ 模型已响应，置 False
+                # 更新模型思考阶段状态，并在阶段切换时重置计时器：
+                # - user 事件（工具结果返回）→ 模型将开始推理，置 True，重置计时
+                # - assistant 事件产出任意内容（thinking/tool_use/text）→ 模型已响应，置 False，重置计时
+                # thinking block 在切换前计算本次思考用时，并更新对应日志行
                 has_tool_results = any(a["action"] == "result" for a in log_actions)
                 has_assistant_output = (
                     any(a["action"] == "add" for a in log_actions) or bool(text_chunk)
                 )
+                prev_thinking = model_thinking
                 if has_tool_results:
                     model_thinking = True
                 if has_assistant_output:
+                    if model_thinking:
+                        # 从思考阶段切换到处理阶段：计算本次思考用时，更新 thinking block 日志行
+                        thinking_duration = int(time.time() - phase_start_time)
+                        for action in log_actions:
+                            if action.get("is_thinking"):
+                                action["line"] = f"💭 思考完成 (用时 {thinking_duration}s)"
                     model_thinking = False
+                # 阶段发生切换时重置计时器
+                if model_thinking != prev_thinking:
+                    phase_start_time = time.time()
 
                 # 处理日志动作
                 for action in log_actions:
@@ -982,12 +995,13 @@ class ClaudeCodePlugin(Plugin):
                     chars_since = len(full_text) - last_patch_len
                     time_since = now - last_patch_time
                     if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
-                        elapsed = int(now - start_time)
+                        elapsed = int(now - phase_start_time)
                         card_text = self._render_log(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
-                        self._patch_card(message_id, card_text, running=True)
+                        self._patch_card(message_id, card_text, running=True,
+                                         elapsed=int(now - start_time))
                         last_patch_len = len(full_text)
                         last_patch_time = now
                         log_dirty = False
@@ -1126,8 +1140,8 @@ class ClaudeCodePlugin(Plugin):
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
                 elif btype == "thinking":
-                    # 只显示图标，不展示原始思考内容
-                    log_actions.append({"action": "add", "line": "💭 思考...", "tool_use_id": None})
+                    # 只显示图标，不展示原始思考内容；is_thinking 标记供主循环计算用时后更新
+                    log_actions.append({"action": "add", "line": "💭 思考...", "tool_use_id": None, "is_thinking": True})
                 elif btype == "tool_use":
                     tool_name = block.get("name", "Unknown")
                     tool_input = block.get("input", {})
@@ -1288,11 +1302,14 @@ class ClaudeCodePlugin(Plugin):
     # ---- 飞书卡片 ----
 
     @staticmethod
-    def _build_card(text: str, running: bool = False) -> str:
+    def _build_card(text: str, running: bool = False, elapsed: int = 0) -> str:
         """构造飞书卡片 JSON"""
         if running:
             template = "turquoise"
-            header_content = "Claude Code (执行中...)"
+            if elapsed > 0:
+                header_content = f"Claude Code (执行中...已用时 {elapsed}s)"
+            else:
+                header_content = "Claude Code (执行中...)"
         else:
             template = "blue"
             header_content = "Claude Code"
@@ -1323,9 +1340,9 @@ class ClaudeCodePlugin(Plugin):
 
         return json.dumps(card)
 
-    def _patch_card(self, message_id: str, text: str, running: bool = True) -> None:
+    def _patch_card(self, message_id: str, text: str, running: bool = True, elapsed: int = 0) -> None:
         """更新飞书卡片消息"""
-        content = self._build_card(text, running=running)
+        content = self._build_card(text, running=running, elapsed=elapsed)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
             debug_log = _CC_DATA_DIR / "cc_card_debug.log"
