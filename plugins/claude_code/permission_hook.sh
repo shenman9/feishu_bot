@@ -9,14 +9,18 @@
 #   0 = 允许工具调用继续
 #   2 = 拒绝工具调用（stderr 内容反馈给 Claude）
 #
-# 端口号从 ~/.claude/.feishu_perm_port 文件读取。
+# 端口号从 <项目根目录>/data/claude_code/.feishu_perm_port 文件读取。
 # 如果端口文件不存在（飞书 Bot 未运行），直接允许（exit 0）。
-# 执行过程记录到 ~/.claude/.feishu_hook.log，方便调试。
+# 执行过程记录到 <项目根目录>/data/claude_code/feishu_hook.log，方便调试。
 
 set -euo pipefail
 
+# 从脚本自身位置推算项目根目录（plugins/claude_code/ 上两级即为项目根）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJ_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
 # 日志文件
-LOG_FILE="${HOME}/.claude/.feishu_hook.log"
+LOG_FILE="${PROJ_ROOT}/data/claude_code/feishu_hook.log"
 
 _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
@@ -40,7 +44,7 @@ case "$TOOL_NAME" in
 esac
 
 # 读取端口号：文件不存在说明飞书 Bot 未运行，直接允许
-PORT_FILE="${HOME}/.claude/.feishu_perm_port"
+PORT_FILE="${PROJ_ROOT}/data/claude_code/.feishu_perm_port"
 if [ ! -f "$PORT_FILE" ]; then
     _log "端口文件不存在 (${PORT_FILE})，直接允许"
     exit 0

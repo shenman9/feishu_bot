@@ -14,6 +14,7 @@ import logging
 import os
 import pathlib
 import pwd
+import select
 import subprocess
 import threading
 import time
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 # 流式更新控制（与 claude_chat 一致）
 _PATCH_INTERVAL = 0.5       # 最小更新间隔（秒）
 _PATCH_MIN_CHARS = 50       # 最小新增字符数触发更新
+_IDLE_PATCH_INTERVAL = 2.0  # 无新数据时进度提示刷新间隔（秒）
 
 # 工具调用日志显示控制
 _MAX_STREAK_DISPLAY = 15    # 连续工具调用段最多显示条数（超出则折叠）
@@ -41,6 +43,11 @@ _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
 _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
+
+# 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
+_PLUGIN_DIR = pathlib.Path(__file__).parent      # plugins/claude_code/
+_PROJECT_ROOT = _PLUGIN_DIR.parent.parent        # feishu_bot/
+_CC_DATA_DIR = _PROJECT_ROOT / "data" / "claude_code"
 
 PLUGIN_KEYWORD = "CC"
 
@@ -72,6 +79,15 @@ def _display_path(path: str, base: str = "") -> str:
     elif path.startswith(home + os.sep):
         candidates.append("~" + path[len(home):])
     return min(candidates, key=len)
+
+
+def _resolve_working_dir(raw: str = "") -> str:
+    """将 working_dir 配置值解析为有效绝对路径
+
+    空字符串表示"使用默认目录"，回落到进程当前工作目录 os.getcwd()。
+    这样 state["working_dir"] 始终持有真实绝对路径，避免下游散落多处 fallback。
+    """
+    return raw if raw else os.getcwd()
 
 
 class ClaudeCodePlugin(Plugin):
@@ -179,7 +195,7 @@ class ClaudeCodePlugin(Plugin):
                 "session_id": str(uuid.uuid4()),
                 "session_started": False,
                 "running": False,
-                "working_dir": cfg["default_working_dir"],
+                "working_dir": _resolve_working_dir(cfg["default_working_dir"]),
                 "last_chat_id": "",
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
             }
@@ -216,12 +232,11 @@ class ClaudeCodePlugin(Plugin):
     def _format_status(self, user_id: str) -> str:
         """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
         state = self._get_state(user_id)
-        working_dir = state.get("working_dir")
-        if not working_dir:
-            cfg = self._load_plugin_config()
-            default_dir = cfg.get("default_working_dir", "")
-            effective = default_dir if default_dir else os.getcwd()
-            working_dir_display = f"{_display_path(effective)} (默认)"
+        working_dir = state["working_dir"]  # 始终为有效绝对路径（由 _resolve_working_dir 保证）
+        cfg = self._load_plugin_config()
+        default_dir = _resolve_working_dir(cfg.get("default_working_dir", ""))
+        if working_dir == default_dir:
+            working_dir_display = f"{_display_path(working_dir)} (默认)"
         else:
             working_dir_display = _display_path(working_dir)
         status = "运行中" if state["running"] else "空闲"
@@ -236,11 +251,8 @@ class ClaudeCodePlugin(Plugin):
     # ---- 历史会话持久化 ----
 
     def _sessions_file_path(self) -> pathlib.Path:
-        """返回历史会话存储文件路径（与 .feishu_perm_port 同目录）"""
-        cfg = self._load_plugin_config()
-        run_as_user = cfg.get("run_as_user", "")
-        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
-        return pathlib.Path(home_dir) / ".claude" / "feishu_sessions.json"
+        """返回历史会话存储文件路径"""
+        return _CC_DATA_DIR / "feishu_sessions.json"
 
     def _load_user_sessions(self, user_id: str) -> list[dict]:
         """读取指定用户的历史会话列表（文件不存在则返回空列表）"""
@@ -407,16 +419,14 @@ class ClaudeCodePlugin(Plugin):
         return os.path.expanduser("~")
 
     def _write_port_file(self, port: int) -> None:
-        """将端口号写入 ~/.claude/.feishu_perm_port，供 Hook 脚本读取"""
-        cfg = self._load_plugin_config()
-        run_as_user = cfg.get("run_as_user", "")
-        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
-
-        port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
+        """将端口号写入项目数据目录下的 .feishu_perm_port，供 Hook 脚本读取"""
+        port_file = _CC_DATA_DIR / ".feishu_perm_port"
         try:
             port_file.parent.mkdir(parents=True, exist_ok=True)
             port_file.write_text(str(port))
-            # 如果以 root 运行且有 run_as_user，修正文件归属
+            # 如果以 root 运行且有 run_as_user，修正文件归属让 hook 脚本可读
+            cfg = self._load_plugin_config()
+            run_as_user = cfg.get("run_as_user", "")
             if run_as_user and os.getuid() == 0:
                 try:
                     pw = pwd.getpwnam(run_as_user)
@@ -429,11 +439,7 @@ class ClaudeCodePlugin(Plugin):
 
     def _delete_port_file(self) -> None:
         """删除端口文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
-        cfg = self._load_plugin_config()
-        run_as_user = cfg.get("run_as_user", "")
-        home_dir = self._get_target_home_dir(run_as_user) or os.path.expanduser("~")
-
-        port_file = pathlib.Path(home_dir) / ".claude" / ".feishu_perm_port"
+        port_file = _CC_DATA_DIR / ".feishu_perm_port"
         try:
             port_file.unlink(missing_ok=True)
             logger.info("[CC] 端口文件已删除: %s", port_file)
@@ -542,13 +548,7 @@ class ClaudeCodePlugin(Plugin):
         # 读取当前会话权限模式
         state = self._get_state(user_id)
         perm_mode = state.get("session_perm_mode", "interactive")
-        # 解析有效工作目录（state 中未设置时回落到配置默认值或 cwd）
-        _perm_cfg = self._load_plugin_config()
-        effective_working_dir = (
-            state.get("working_dir", "")
-            or _perm_cfg.get("default_working_dir", "")
-            or os.getcwd()
-        )
+        effective_working_dir = state["working_dir"]  # 始终为有效绝对路径
         logger.info(
             "[CC] 权限请求: user=%s, tool=%s, perm_mode=%s, request=%s, input=%s",
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
@@ -826,7 +826,7 @@ class ClaudeCodePlugin(Plugin):
                 prompt, state["session_id"],
                 resume=state.get("session_started", False),
             )
-            cwd = state.get("working_dir") or cfg["default_working_dir"] or None
+            cwd = state["working_dir"]  # 始终为有效绝对路径
 
             logger.info(
                 "[CC] 启动子进程: user=%s, session=%s, resume=%s, cwd=%s",
@@ -864,18 +864,57 @@ class ClaudeCodePlugin(Plugin):
             current_streak: list[dict] = []      # 当前连续工具调用
             active_tool_ids: dict[str, int] = {} # tool_use_id → current_streak 索引
             log_dirty = False                    # 是否有变化（触发节流更新）
+            model_thinking = True                # 初始即为思考阶段；收到 assistant 事件后置 False
 
             line_count = 0
-            for line in proc.stdout:
+            while True:
+                # 使用 select 等待新数据（最多 _IDLE_PATCH_INTERVAL 秒）；
+                # select 不可用时（如测试 mock 对象）直接降级为阻塞读
+                timed_out = False
+                try:
+                    ready, _, _ = select.select([proc.stdout], [], [], _IDLE_PATCH_INTERVAL)
+                    timed_out = not ready
+                except (TypeError, ValueError, OSError):
+                    pass  # select 不可用，timed_out 保持 False，直接 readline
+
+                if timed_out:
+                    # 超时：无新数据，检查进程是否已结束
+                    if proc.poll() is not None:
+                        break
+                    # 无新数据时刷新进度计时
+                    if message_id:
+                        elapsed = int(time.time() - start_time)
+                        card_text = self._render_log(
+                            segments, current_streak, running=True,
+                            elapsed=elapsed, thinking=model_thinking,
+                        )
+                        self._patch_card(message_id, card_text, running=True)
+                        last_patch_time = time.time()
+                    continue
+
+                line = proc.stdout.readline()
+                if not line:
+                    break
                 line = line.strip()
                 if not line:
                     continue
                 line_count += 1
 
-                # 分隔符由下方循环体负责处理，此处始终传 False 避免重复添加
                 text_chunk, log_actions, meta = self._parse_stream_line(
-                    line, False, cwd or ""
+                    line, has_assistant_text, cwd
                 )
+
+                # 更新模型思考阶段状态：
+                # - user 事件（工具结果返回）→ 模型将开始推理，置 True
+                # - assistant 事件产出任意内容（thinking/tool_use/text）→ 模型已响应，置 False
+                has_tool_results = any(a["action"] == "result" for a in log_actions)
+                has_assistant_output = (
+                    any(a["action"] == "add" for a in log_actions) or bool(text_chunk)
+                )
+                if has_tool_results:
+                    model_thinking = True
+                if has_assistant_output:
+                    model_thinking = False
 
                 # 处理日志动作
                 for action in log_actions:
@@ -943,7 +982,11 @@ class ClaudeCodePlugin(Plugin):
                     chars_since = len(full_text) - last_patch_len
                     time_since = now - last_patch_time
                     if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
-                        card_text = self._render_log(segments, current_streak, running=True)
+                        elapsed = int(now - start_time)
+                        card_text = self._render_log(
+                            segments, current_streak, running=True,
+                            elapsed=elapsed, thinking=model_thinking,
+                        )
                         self._patch_card(message_id, card_text, running=True)
                         last_patch_len = len(full_text)
                         last_patch_time = now
@@ -975,7 +1018,7 @@ class ClaudeCodePlugin(Plugin):
                 title = (prompt[:50] + "…") if len(prompt) > 50 else prompt
                 self._upsert_session(
                     user_id, session_id,
-                    state.get("working_dir") or cfg["default_working_dir"] or "",
+                    state["working_dir"],
                     title,
                 )
 
@@ -1093,9 +1136,6 @@ class ClaudeCodePlugin(Plugin):
                     log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id})
             if text_parts:
                 text_chunk = "\n\n".join(text_parts)
-                # 多段文字之间加分隔线
-                if has_previous_text:
-                    text_chunk = "\n\n---\n\n" + text_chunk
 
         elif event_type == "user":
             # 工具执行结果：追加 ✅/❌ 到对应日志行
@@ -1190,6 +1230,8 @@ class ClaudeCodePlugin(Plugin):
         log_segments: list[dict],
         current_streak: list[dict],
         running: bool,
+        elapsed: int = 0,
+        thinking: bool = False,
     ) -> str:
         """将统一内容段列表和当前连续区间渲染为 markdown 文本
 
@@ -1200,7 +1242,9 @@ class ClaudeCodePlugin(Plugin):
                 {"type": "tools", "entries": list[str]}  工具调用段
                 {"type": "text",  "content": str}        文字段
             current_streak: 当前正在进行的连续工具调用，每项 {"line": str, "tool_use_id": str|None}
-            running: 是否仍在执行中（控制末尾⏳提示）
+            running: 是否仍在执行中（控制末尾提示）
+            elapsed: 任务已运行秒数（>0 时在提示后附加计时）
+            thinking: 是否处于模型思考阶段（工具结果已返回、等待模型下一步响应）
         """
         lines: list[str] = []
 
@@ -1225,8 +1269,12 @@ class ClaudeCodePlugin(Plugin):
                 entries = entries[-_MAX_STREAK_DISPLAY:]
             lines.extend(entries)
 
-        if running and (log_segments or current_streak):
-            lines.append("⏳ 正在处理...")
+        if running:
+            elapsed_text = f" (已等待 {elapsed}s)" if elapsed > 0 else ""
+            if thinking:
+                lines.append(f"💭 思考中...{elapsed_text}")
+            else:
+                lines.append(f"⏳ 正在处理...{elapsed_text}")
 
         return "\n".join(lines)
 
@@ -1278,6 +1326,16 @@ class ClaudeCodePlugin(Plugin):
     def _patch_card(self, message_id: str, text: str, running: bool = True) -> None:
         """更新飞书卡片消息"""
         content = self._build_card(text, running=running)
+        # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
+        try:
+            debug_log = _CC_DATA_DIR / "cc_card_debug.log"
+            debug_log.parent.mkdir(parents=True, exist_ok=True)
+            with debug_log.open("a", encoding="utf-8") as _f:
+                _f.write(f"\n{'='*60}\n[{datetime.datetime.now().isoformat()}] message_id={message_id} running={running}\n")
+                _f.write(text)
+                _f.write("\n")
+        except Exception:
+            pass
         try:
             self.bot.patch_message(message_id, content)
         except Exception as e:
@@ -1346,7 +1404,7 @@ class ClaudeCodePlugin(Plugin):
         if text == "/cd":
             old_session = state["session_id"]
             self._reset_session(user_id)
-            state["working_dir"] = ""
+            state["working_dir"] = _resolve_working_dir(self._load_plugin_config().get("default_working_dir", ""))
             logger.info(
                 "[CC] 用户重置工作目录为默认: user=%s, 旧session=%s, 新session=%s",
                 user_id, old_session[:8], state["session_id"][:8],
@@ -1565,7 +1623,7 @@ class ClaudeCodePlugin(Plugin):
             self._kill_process(user_id)
             state["session_id"] = target_sid
             state["session_started"] = True   # 下次调用使用 --resume
-            state["working_dir"] = target_dir
+            state["working_dir"] = _resolve_working_dir(target_dir)
             state["running"] = False
             default_perm = self._load_plugin_config()["default_perm_mode"]
             state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm

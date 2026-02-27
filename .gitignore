@@ -9,6 +9,8 @@ plugins/paper_daily/cache/
 plugins/paper_daily/reports/
 plugins/paper_daily/logs/
 plugins/paper_daily/subscribers.json
+# CC 插件运行时数据（会话历史、端口文件、日志等）
+data/
 # 启动脚本运行时产物
 .bot.pid
 .bot.log

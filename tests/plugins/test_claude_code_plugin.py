@@ -2,6 +2,7 @@
 Claude Code 桥接插件单元测试
 """
 
+import io
 import json
 import subprocess
 from unittest.mock import MagicMock, Mock, patch, PropertyMock
@@ -24,12 +25,15 @@ def _mock_popen(stdout_lines, returncode=0, stderr=""):
     """构造 subprocess.Popen 的 mock
 
     Args:
-        stdout_lines: stdout 每行输出（含换行符）
+        stdout_lines: stdout 每行输出（不含换行符）
         returncode: 进程退出码
         stderr: stderr 输出内容
     """
     proc = Mock()
-    proc.stdout = iter(stdout_lines)
+    # 使用 io.StringIO 模拟支持 readline() 的标准输出流
+    # select.select 对 StringIO 会抛 TypeError，被生产代码的降级逻辑捕获后直接 readline()
+    content = "\n".join(stdout_lines) + ("\n" if stdout_lines else "")
+    proc.stdout = io.StringIO(content)
     proc.stderr = Mock()
     proc.stderr.read = Mock(return_value=stderr)
     proc.poll = Mock(return_value=returncode)
@@ -302,11 +306,10 @@ class TestParseStreamLine:
         assert meta == ""
 
     def test_assistant_event_with_previous(self):
-        """有前序文本时 assistant 事件前加分隔符"""
+        """有前序文本时 assistant 事件直接返回文本，分隔符由主循环负责"""
         line = _make_assistant_event("第二段")
         text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, True)
-        assert "---" in text
-        assert "第二段" in text
+        assert text == "第二段"
         assert log_actions == []
 
     def test_result_event_meta(self):
@@ -422,10 +425,10 @@ class TestRenderLog:
         assert "⏳" in result
         assert "📖" in result
 
-    def test_running_without_log_no_spinner(self):
-        """执行中但无任何日志时不显示⏳（纯文字回复场景）"""
+    def test_running_without_log_shows_spinner(self):
+        """执行中且无日志时也显示⏳（初始思考阶段）"""
         result = ClaudeCodePlugin._render_log([], [], running=True)
-        assert "⏳" not in result
+        assert "⏳" in result
 
     def test_streak_within_limit(self):
         """连续工具调用未超上限时全部显示"""
