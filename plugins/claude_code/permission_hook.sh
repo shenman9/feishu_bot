@@ -52,6 +52,12 @@ fi
 PORT=$(cat "$PORT_FILE")
 _log "端口文件读取成功: port=${PORT}"
 
+# curl 错误日志文件（超过 100KB 时自动截断，避免无限增长）
+CURL_ERR_FILE="${PROJ_ROOT}/data/claude_code/feishu_hook_curl_err.log"
+if [ -f "$CURL_ERR_FILE" ] && [ "$(stat -c%s "$CURL_ERR_FILE" 2>/dev/null || echo 0)" -gt 102400 ]; then
+    tail -100 "$CURL_ERR_FILE" > "${CURL_ERR_FILE}.trim" && mv "${CURL_ERR_FILE}.trim" "$CURL_ERR_FILE"
+fi
+
 # 转发请求到权限确认服务器（阻塞等待响应）
 _log "发送请求到权限服务器 http://127.0.0.1:${PORT}/permission-request ..."
 CURL_EXIT=0
@@ -59,10 +65,10 @@ RESPONSE=$(echo "$INPUT" | curl -sS --max-time 180 \
     -X POST \
     -H "Content-Type: application/json" \
     -d @- \
-    "http://127.0.0.1:${PORT}/permission-request" 2>/tmp/.feishu_hook_curl_err) || CURL_EXIT=$?
+    "http://127.0.0.1:${PORT}/permission-request" 2>>"$CURL_ERR_FILE") || CURL_EXIT=$?
 
 if [ $CURL_EXIT -ne 0 ]; then
-    CURL_ERR=$(cat /tmp/.feishu_hook_curl_err 2>/dev/null || true)
+    CURL_ERR=$(tail -1 "$CURL_ERR_FILE" 2>/dev/null || true)
     _log "curl 失败: exit=${CURL_EXIT}, err=${CURL_ERR}"
 fi
 

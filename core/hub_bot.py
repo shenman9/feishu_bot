@@ -3,13 +3,15 @@ HubBot - 统一入口机器人
 管理插件注册、功能菜单展示、消息/卡片事件路由。
 """
 
-from typing import Dict, List
+import logging
 
-from core.feishu_bot import FeishuBot, _log
+from core.feishu_bot import FeishuBot
 from core.plugin import Plugin
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 MENU_KEYWORDS = {"菜单", "menu", "帮助", "help"}
 EXIT_KEYWORDS = {"退出", "exit", "返回"}
@@ -19,17 +21,23 @@ class HubBot(FeishuBot):
 
     def __init__(self, app_id: str, app_secret: str):
         super().__init__(app_id, app_secret)
-        self.plugins: Dict[str, Plugin] = {}       # keyword -> Plugin
-        self.active_plugin: Dict[str, str] = {}    # user_id -> keyword
+        self.plugins: dict[str, Plugin] = {}       # keyword -> Plugin
+        self.active_plugin: dict[str, str] = {}    # user_id -> keyword
 
     # ---- 插件管理 ----
 
     def register(self, plugin: Plugin) -> None:
+        if plugin.keyword in self.plugins:
+            existing = self.plugins[plugin.keyword]
+            raise ValueError(
+                f"插件关键词冲突: '{plugin.keyword}' 已被插件 '{existing.name}' 注册，"
+                f"无法再注册插件 '{plugin.name}'"
+            )
         plugin.on_register(self)
         self.plugins[plugin.keyword] = plugin
-        _log("INFO", f"已注册插件: {plugin.name} (关键词='{plugin.keyword}')")
+        logger.info("已注册插件: %s (关键词='%s')", plugin.name, plugin.keyword)
 
-    def register_all(self, plugins: List[Plugin]) -> None:
+    def register_all(self, plugins: list[Plugin]) -> None:
         for p in plugins:
             self.register(p)
 

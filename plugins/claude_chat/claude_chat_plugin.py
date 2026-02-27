@@ -158,6 +158,7 @@ class ClaudeChatPlugin(Plugin):
                 try:
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
+                    logger.debug("SSE JSON 解析失败, 原始数据: %s", data_str[:200])
                     continue
 
                 # 提取增量文本

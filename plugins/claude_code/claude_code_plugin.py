@@ -85,10 +85,11 @@ def _display_path(path: str, base: str = "") -> str:
 def _resolve_working_dir(raw: str = "") -> str:
     """将 working_dir 配置值解析为有效绝对路径
 
+    使用 realpath 归一化，解析符号链接和 .. 等相对路径组件。
     空字符串表示"使用默认目录"，回落到进程当前工作目录 os.getcwd()。
     这样 state["working_dir"] 始终持有真实绝对路径，避免下游散落多处 fallback。
     """
-    return raw if raw else os.getcwd()
+    return os.path.realpath(raw) if raw else os.path.realpath(os.getcwd())
 
 
 class ClaudeCodePlugin(Plugin):
@@ -300,10 +301,12 @@ class ClaudeCodePlugin(Plugin):
             sessions.sort(key=lambda s: s["last_activity"], reverse=True)
             data[user_id] = sessions[:_MAX_SESSIONS_PER_USER]
 
-            # 写回文件
+            # 写回文件（原子操作：先写临时文件，再 rename 替换）
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp_path = path.with_suffix(".json.tmp")
+                tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(str(tmp_path), str(path))
             except Exception as e:
                 logger.error("[CC] 写入历史会话文件失败: %s", e)
 
@@ -1441,7 +1444,7 @@ class ClaudeCodePlugin(Plugin):
             return
 
         if text.startswith("/cd "):
-            new_dir = text[len("/cd "):].strip()
+            new_dir = os.path.realpath(text[len("/cd "):].strip())
             if os.path.isdir(new_dir):
                 old_session = state["session_id"]
                 self._reset_session(user_id)
@@ -1648,11 +1651,17 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(toast="无效的会话 ID")
             if target_sid == state["session_id"]:
                 return self.bot.make_card_response(toast="当前会话无需恢复")
+            # 校验工作目录是否存在
+            resolved_dir = _resolve_working_dir(target_dir)
+            if not os.path.isdir(resolved_dir):
+                return self.bot.make_card_response(
+                    toast=f"工作目录已不存在: {resolved_dir}，请使用 /cd 切换到有效目录"
+                )
             # 终止旧进程并切换到目标会话
             self._kill_process(user_id)
             state["session_id"] = target_sid
             state["session_started"] = True   # 下次调用使用 --resume
-            state["working_dir"] = _resolve_working_dir(target_dir)
+            state["working_dir"] = resolved_dir
             state["running"] = False
             default_perm = self._load_plugin_config()["default_perm_mode"]
             state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm

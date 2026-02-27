@@ -4,15 +4,12 @@
 """
 
 import json
+import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from datetime import datetime, timezone, timedelta
 from typing import Optional
-
-# 消息去重缓存最大容量和过期时间
-_DEDUP_MAX_SIZE = 500
-_DEDUP_TTL = 300  # 5 分钟
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
@@ -26,14 +23,11 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     CallBackToast,
 )
 
+logger = logging.getLogger(__name__)
 
-_BEIJING_TZ = timezone(timedelta(hours=8))
-
-
-def _log(level: str, msg: str) -> None:
-    """带时间戳的日志输出（北京时间）"""
-    ts = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
+# 消息去重缓存最大容量和过期时间
+_DEDUP_MAX_SIZE = 500
+_DEDUP_TTL = 300  # 5 分钟
 
 
 class FeishuBot(ABC):
@@ -49,6 +43,7 @@ class FeishuBot(ABC):
         self.app_id = app_id
         self.app_secret = app_secret
         self._seen_messages: OrderedDict[str, float] = OrderedDict()
+        self._dedup_lock = threading.Lock()
 
         self.client = lark.Client.builder() \
             .app_id(app_id) \
@@ -66,21 +61,22 @@ class FeishuBot(ABC):
 
     def _is_duplicate(self, message_id: str) -> bool:
         """检查消息是否重复，同时清理过期条目"""
-        now = time.time()
-        if message_id in self._seen_messages:
-            return True
-        # 清理过期条目
-        while self._seen_messages:
-            oldest_id, ts = next(iter(self._seen_messages.items()))
-            if now - ts > _DEDUP_TTL:
-                self._seen_messages.pop(oldest_id)
-            else:
-                break
-        # 容量上限兜底
-        if len(self._seen_messages) >= _DEDUP_MAX_SIZE:
-            self._seen_messages.popitem(last=False)
-        self._seen_messages[message_id] = now
-        return False
+        with self._dedup_lock:
+            now = time.time()
+            if message_id in self._seen_messages:
+                return True
+            # 清理过期条目
+            while self._seen_messages:
+                oldest_id, ts = next(iter(self._seen_messages.items()))
+                if now - ts > _DEDUP_TTL:
+                    self._seen_messages.pop(oldest_id)
+                else:
+                    break
+            # 容量上限兜底
+            if len(self._seen_messages) >= _DEDUP_MAX_SIZE:
+                self._seen_messages.popitem(last=False)
+            self._seen_messages[message_id] = now
+            return False
 
     @staticmethod
     def _strip_mentions(text: str, mentions: list) -> str:
@@ -106,32 +102,33 @@ class FeishuBot(ABC):
 
         # 消息去重，防止飞书重试导致重复处理
         if self._is_duplicate(message_id):
-            _log("INFO", f"跳过重复消息: message_id={message_id}")
+            logger.info("跳过重复消息: message_id=%s", message_id)
             return
 
         # 群聊非 @消息直接忽略（后续可扩展为被动监控）
         if chat_type == "group" and not mentions:
-            _log("DEBUG", f"忽略群聊非@消息: chat={chat_id}, user={sender_id}")
+            logger.debug("忽略群聊非@消息: chat=%s, user=%s", chat_id, sender_id)
             return
 
         try:
             content_dict = json.loads(message.content)
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning("消息内容解析失败: message_id=%s, error=%s", message_id, type(e).__name__)
             return
 
         if msg_type == "file":
             file_key = content_dict.get("file_key", "")
             file_name = content_dict.get("file_name", "")
-            _log("INFO", f"收到文件: user={sender_id}, chat_type={chat_type}, "
-                 f"message_id={message_id}, file={file_name}")
+            logger.info("收到文件: user=%s, chat_type=%s, message_id=%s, file=%s",
+                       sender_id, chat_type, message_id, file_name)
             self.on_file_message(sender_id, chat_id, message_id, file_key, file_name)
         else:
             text = content_dict.get("text", "").strip()
             # 群聊消息剥离 @提及 占位符
             if chat_type == "group" and mentions:
                 text = self._strip_mentions(text, mentions)
-            _log("INFO", f"收到消息: user={sender_id}, chat_type={chat_type}, "
-                 f"message_id={message_id}, text={text}")
+            logger.info("收到消息: user=%s, chat_type=%s, message_id=%s, text=%s",
+                       sender_id, chat_type, message_id, text)
             self.on_message(sender_id, chat_id, text)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
@@ -140,7 +137,7 @@ class FeishuBot(ABC):
         chat_id = data.event.context.open_chat_id
         message_id = data.event.context.open_message_id
         action_value = data.event.action.value or {}
-        _log("INFO", f"卡片点击: user={user_id}, action={action_value}")
+        logger.info("卡片点击: user=%s, action=%s", user_id, action_value)
         return self.on_card_action(user_id, chat_id, message_id, action_value)
 
     def _on_raw_bot_menu(self, data: P2ApplicationBotMenuV6) -> None:
@@ -149,7 +146,7 @@ class FeishuBot(ABC):
         user_id = operator.operator_id.user_id
         open_id = operator.operator_id.open_id
         event_key = data.event.event_key
-        _log("INFO", f"菜单点击: user={user_id}, event_key={event_key}")
+        logger.info("菜单点击: user=%s, event_key=%s", user_id, event_key)
         self.on_bot_menu(user_id, open_id, event_key)
 
     @staticmethod
@@ -172,7 +169,7 @@ class FeishuBot(ABC):
             .build()
         response = self.client.im.v1.message.create(request)
         if not response.success():
-            _log("ERROR", f"发送失败: code={response.code}, msg={response.msg}")
+            logger.error("发送失败: code=%s, msg=%s", response.code, response.msg)
 
     def send_message_get_id(self, chat_id: str, msg_type: str, content: str) -> Optional[str]:
         """发送消息并返回 message_id，失败时返回 None"""
@@ -187,7 +184,7 @@ class FeishuBot(ABC):
             .build()
         response = self.client.im.v1.message.create(request)
         if not response.success():
-            _log("ERROR", f"发送失败: code={response.code}, msg={response.msg}")
+            logger.error("发送失败: code=%s, msg=%s", response.code, response.msg)
             return None
         try:
             return response.data.message_id
@@ -204,7 +201,7 @@ class FeishuBot(ABC):
             .build()
         response = self.client.im.v1.message.patch(request)
         if not response.success():
-            _log("ERROR", f"消息更新失败: code={response.code}, msg={response.msg}")
+            logger.error("消息更新失败: code=%s, msg=%s", response.code, response.msg)
 
     def urgent_message(self, message_id: str, user_ids: list[str]) -> bool:
         """对已有消息发送应用内加急通知
@@ -225,7 +222,7 @@ class FeishuBot(ABC):
             .build()
         response = self.client.im.v1.message.urgent_app(request)
         if not response.success():
-            _log("ERROR", f"加急通知失败: code={response.code}, msg={response.msg}")
+            logger.error("加急通知失败: code=%s, msg=%s", response.code, response.msg)
             return False
         return True
 
@@ -311,5 +308,5 @@ class FeishuBot(ABC):
             event_handler=self._event_handler,
             log_level=lark.LogLevel.INFO,
         )
-        _log("INFO", "机器人启动中，正在连接飞书...")
+        logger.info("机器人启动中，正在连接飞书...")
         ws_client.start()
