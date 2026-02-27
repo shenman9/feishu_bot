@@ -42,11 +42,12 @@
 
 | 模式 | 标识 | 说明 |
 |------|------|------|
-| 交互确认 | `interactive` | **默认模式**。所有操作均需飞书卡片确认 |
+| 交互确认 | `interactive` | 所有操作均需飞书卡片确认 |
 | 自动放行编辑 | `accept_edits` | 工作目录内的文件写入/编辑自动放行，其余操作仍需确认 |
 | 全部放行 | `bypass` | 所有操作自动放行，适合高度信任场景（谨慎使用）|
+| 手动选择 | `manual_select` | 新会话创建后弹出权限选择卡片，由用户手动选择模式 |
 
-默认模式由配置项 `claude_code.default_perm_mode` 控制，新会话启动时生效。
+默认模式由配置项 `claude_code.default_perm_mode` 控制，新会话启动时生效。`manual_select` 仅作为配置项值使用，表示每次新建会话时自动弹出选择卡片；运行时实际使用的始终是 `interactive`、`accept_edits`、`bypass` 三者之一。
 
 ## 权限确认流程
 
@@ -103,7 +104,7 @@ claude_code:
   timeout: 600                        # 单次任务超时时间（秒）
   max_output_chars: 28000             # 飞书卡片最大字符数（超出则截断）
   default_perm_mode: "interactive"    # 新会话默认权限模式
-                                      #   interactive / accept_edits / bypass
+                                      #   interactive   / accept_edits / bypass / manual_select
   max_turns: 50                       # Claude Code 最大对话轮数
   run_as_user: ""                     # 子进程切换到指定系统用户运行（解决 root 限制）
   permission_server_port: 9876        # 权限确认服务监听端口
@@ -116,7 +117,7 @@ claude_code:
 | `default_working_dir` | `""` | 默认工作目录，留空使用进程当前目录 |
 | `timeout` | `600` | 任务执行超时（秒），超时后自动终止子进程 |
 | `max_output_chars` | `28000` | 飞书卡片字符上限，超出则保留最新内容 |
-| `default_perm_mode` | `"interactive"` | 新会话启动时的默认权限模式 |
+| `default_perm_mode` | `"interactive"` | 新会话启动时的默认权限模式，可选值：`interactive` / `accept_edits` / `bypass` / `manual_select` |
 | `max_turns` | `50` | Claude Code `--max-turns` 参数值 |
 | `run_as_user` | `""` | 以指定系统用户运行子进程，适用于 Docker root 环境 |
 | `permission_server_port` | `9876` | 权限服务 HTTP 监听端口，需确保未被占用 |

@@ -171,6 +171,9 @@ class ClaudeCodePlugin(Plugin):
         """获取用户会话状态，不存在则初始化"""
         if user_id not in self.user_states:
             cfg = self._load_plugin_config()
+            default_perm = cfg["default_perm_mode"]
+            # manual_select 模式：新会话暂用 interactive 作为安全默认，创建后弹卡片由用户选择
+            init_perm = "interactive" if default_perm == "manual_select" else default_perm
             self.user_states[user_id] = {
                 "active": False,
                 "session_id": str(uuid.uuid4()),
@@ -178,7 +181,7 @@ class ClaudeCodePlugin(Plugin):
                 "running": False,
                 "working_dir": cfg["default_working_dir"],
                 "last_chat_id": "",
-                "session_perm_mode": cfg["default_perm_mode"],  # 会话级权限模式: interactive / bypass / accept_edits
+                "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
             }
         return self.user_states[user_id]
 
@@ -198,8 +201,17 @@ class ClaudeCodePlugin(Plugin):
         state["session_id"] = str(uuid.uuid4())
         state["session_started"] = False
         state["running"] = False
-        state["session_perm_mode"] = self._load_plugin_config()["default_perm_mode"]
+        default_perm = self._load_plugin_config()["default_perm_mode"]
+        # manual_select 模式：暂用 interactive 作为安全默认，后续弹卡片由用户选择
+        state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
         return state["session_id"]
+
+    def _send_perm_select_card_if_manual(self, chat_id: str, user_id: str) -> None:
+        """若 default_perm_mode 配置为 manual_select，向用户发送权限模式选择卡片"""
+        if self._load_plugin_config()["default_perm_mode"] == "manual_select":
+            state = self._get_state(user_id)
+            card = self._build_permission_mode_card(state["session_perm_mode"])
+            self.bot.send_message(chat_id, "interactive", card)
 
     def _format_status(self, user_id: str) -> str:
         """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
@@ -1290,6 +1302,7 @@ class ClaudeCodePlugin(Plugin):
                 f"特殊指令:\n"
                 f"{self._commands_brief()}",
             )
+            self._send_perm_select_card_if_manual(chat_id, user_id)
             return
 
         # 2. 特殊指令：新会话
@@ -1297,6 +1310,7 @@ class ClaudeCodePlugin(Plugin):
             logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
             self._reset_session(user_id)
             self.bot.reply(chat_id, f"会话已重置。\n{self._format_status(user_id)}")
+            self._send_perm_select_card_if_manual(chat_id, user_id)
             return
 
         # 3. 特殊指令：取消
@@ -1341,6 +1355,7 @@ class ClaudeCodePlugin(Plugin):
                 chat_id,
                 f"工作目录已重置为默认。\n{self._format_status(user_id)}",
             )
+            self._send_perm_select_card_if_manual(chat_id, user_id)
             return
 
         if text.startswith("/cd "):
@@ -1358,6 +1373,7 @@ class ClaudeCodePlugin(Plugin):
                     f"工作目录已切换: {new_dir}\n"
                     f"{self._format_status(user_id)}",
                 )
+                self._send_perm_select_card_if_manual(chat_id, user_id)
             else:
                 self.bot.reply(chat_id, f"目录不存在: {new_dir}")
             return
@@ -1551,11 +1567,13 @@ class ClaudeCodePlugin(Plugin):
             state["session_started"] = True   # 下次调用使用 --resume
             state["working_dir"] = target_dir
             state["running"] = False
-            state["session_perm_mode"] = self._load_plugin_config()["default_perm_mode"]
+            default_perm = self._load_plugin_config()["default_perm_mode"]
+            state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
             logger.info(
                 "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s",
                 user_id, target_sid[:8], target_dir,
             )
+            self._send_perm_select_card_if_manual(chat_id, user_id)
             return self.bot.make_card_response(
                 toast=f"已切换到会话 {target_sid[:8]}…，发送消息继续"
             )
