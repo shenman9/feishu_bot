@@ -45,6 +45,35 @@ _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
 PLUGIN_KEYWORD = "CC"
 
 
+def _display_path(path: str, base: str = "") -> str:
+    """格式化路径用于展示：若相对路径更短则优先使用
+
+    Args:
+        path: 原始路径（若非绝对路径则原样返回）
+        base: 参考基准目录（通常为工作目录），用于计算相对路径
+
+    Returns:
+        原路径、相对于 base 的路径、以及 ~ 缩写中最短的一个
+    """
+    if not path or not os.path.isabs(path):
+        return path
+    candidates = [path]
+    # 尝试相对于 base 的路径
+    if base:
+        try:
+            rel = os.path.relpath(path, base)
+            candidates.append(rel)
+        except ValueError:
+            pass
+    # 尝试 ~ 缩写
+    home = os.path.expanduser("~")
+    if path == home:
+        candidates.append("~")
+    elif path.startswith(home + os.sep):
+        candidates.append("~" + path[len(home):])
+    return min(candidates, key=len)
+
+
 class ClaudeCodePlugin(Plugin):
     """Claude Code 桥接插件
 
@@ -180,12 +209,14 @@ class ClaudeCodePlugin(Plugin):
             cfg = self._load_plugin_config()
             default_dir = cfg.get("default_working_dir", "")
             effective = default_dir if default_dir else os.getcwd()
-            working_dir = f"{effective} (默认)"
+            working_dir_display = f"{_display_path(effective)} (默认)"
+        else:
+            working_dir_display = _display_path(working_dir)
         status = "运行中" if state["running"] else "空闲"
         perm_mode = state.get("session_perm_mode", "interactive")
         return (
             f"会话: {state['session_id'][:8]}...\n"
-            f"工作目录: {working_dir}\n"
+            f"工作目录: {working_dir_display}\n"
             f"状态: {status}\n"
             f"权限模式: {perm_mode}"
         )
@@ -264,7 +295,7 @@ class ClaudeCodePlugin(Plugin):
         for session in sessions:
             sid = session["session_id"]
             short_id = sid[:8]
-            working_dir = session.get("working_dir") or "默认目录"
+            working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
             title = session.get("title", "（无标题）")
             last_activity = session.get("last_activity", "")
             # 格式化时间（去掉秒）
@@ -499,6 +530,13 @@ class ClaudeCodePlugin(Plugin):
         # 读取当前会话权限模式
         state = self._get_state(user_id)
         perm_mode = state.get("session_perm_mode", "interactive")
+        # 解析有效工作目录（state 中未设置时回落到配置默认值或 cwd）
+        _perm_cfg = self._load_plugin_config()
+        effective_working_dir = (
+            state.get("working_dir", "")
+            or _perm_cfg.get("default_working_dir", "")
+            or os.getcwd()
+        )
         logger.info(
             "[CC] 权限请求: user=%s, tool=%s, perm_mode=%s, request=%s, input=%s",
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
@@ -514,8 +552,7 @@ class ClaudeCodePlugin(Plugin):
         if perm_mode == "accept_edits":
             if tool_name in ("Write", "Edit", "NotebookEdit"):
                 fp = tool_input.get("file_path") or tool_input.get("notebook_path", "")
-                working_dir = state.get("working_dir", "")
-                if fp and self._is_within_working_dir(fp, working_dir):
+                if fp and self._is_within_working_dir(fp, effective_working_dir):
                     logger.info(
                         "[CC] accept_edits 模式自动放行: tool=%s, file=%s", tool_name, fp,
                     )
@@ -532,9 +569,11 @@ class ClaudeCodePlugin(Plugin):
             perm_mode == "interactive"
             and tool_name in ("Write", "Edit", "NotebookEdit")
             and bool(fp)
-            and self._is_within_working_dir(fp, state.get("working_dir", ""))
+            and self._is_within_working_dir(fp, effective_working_dir)
         )
-        card = self._build_permission_card(request_id, tool_name, tool_input, show_accept_edits_option)
+        card = self._build_permission_card(
+            request_id, tool_name, tool_input, show_accept_edits_option, effective_working_dir
+        )
         try:
             self.bot.send_message(chat_id, "interactive", card)
             logger.info(
@@ -601,7 +640,8 @@ class ClaudeCodePlugin(Plugin):
 
     @staticmethod
     def _build_permission_card(
-        request_id: str, tool_name: str, tool_input: dict, show_accept_edits_option: bool = False
+        request_id: str, tool_name: str, tool_input: dict,
+        show_accept_edits_option: bool = False, working_dir: str = ""
     ) -> str:
         """构造权限确认飞书卡片
 
@@ -616,7 +656,7 @@ class ClaudeCodePlugin(Plugin):
             input_display = f"```\n{tool_input['command']}\n```"
         elif tool_name == "Edit" or tool_name == "Write":
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
-            input_display = f"文件: `{file_path}`"
+            input_display = f"文件: `{_display_path(file_path, working_dir)}`"
         else:
             # 通用展示：JSON 格式
             input_display = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)[:1000]}\n```"
@@ -820,7 +860,9 @@ class ClaudeCodePlugin(Plugin):
                     continue
                 line_count += 1
 
-                text_chunk, log_actions, meta = self._parse_stream_line(line, has_assistant_text)
+                text_chunk, log_actions, meta = self._parse_stream_line(
+                    line, has_assistant_text, cwd or ""
+                )
 
                 # 处理日志动作
                 for action in log_actions:
@@ -983,7 +1025,7 @@ class ClaudeCodePlugin(Plugin):
     # ---- stream-json 解析 ----
 
     @staticmethod
-    def _parse_stream_line(line: str, has_previous_text: bool) -> tuple[str, list[dict], str]:
+    def _parse_stream_line(line: str, has_previous_text: bool, working_dir: str = "") -> tuple[str, list[dict], str]:
         """解析 stream-json 单行
 
         Args:
@@ -1027,7 +1069,7 @@ class ClaudeCodePlugin(Plugin):
                     tool_name = block.get("name", "Unknown")
                     tool_input = block.get("input", {})
                     tool_use_id = block.get("id", "")
-                    log_line = ClaudeCodePlugin._format_tool_call(tool_name, tool_input)
+                    log_line = ClaudeCodePlugin._format_tool_call(tool_name, tool_input, working_dir)
                     log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id})
             if text_parts:
                 text_chunk = "\n\n".join(text_parts)
@@ -1103,7 +1145,7 @@ class ClaudeCodePlugin(Plugin):
     }
 
     @staticmethod
-    def _format_tool_call(tool_name: str, tool_input: dict) -> str:
+    def _format_tool_call(tool_name: str, tool_input: dict, working_dir: str = "") -> str:
         """将工具调用格式化为单行摘要，用于过程日志"""
         icon = ClaudeCodePlugin._TOOL_ICONS.get(tool_name, "🔧")
         # 按优先级提取最有意义的参数作为摘要
@@ -1117,6 +1159,8 @@ class ClaudeCodePlugin(Plugin):
             or tool_input.get("url")
             or (str(next(iter(tool_input.values()))) if tool_input else "")
         )
+        # 对路径类参数尝试缩短显示（非路径的 command/pattern 等调用后安全，因为非绝对路径时原样返回）
+        param = _display_path(param, working_dir)
         if len(param) > _TOOL_PARAM_MAX:
             param = param[:_TOOL_PARAM_MAX - 3] + "..."
         return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
