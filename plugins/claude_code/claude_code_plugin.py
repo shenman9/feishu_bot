@@ -102,7 +102,7 @@ class ClaudeCodePlugin(Plugin):
     # detail: /help 中的详细说明
     _SPECIAL_COMMANDS: list[dict] = [
         {"usage": "/new",       "brief": "重置会话",                    "detail": "重置当前会话（清除上下文，开启新对话）"},
-        {"usage": "/sessions",  "brief": "查看并恢复历史会话",             "detail": "列出最近历史会话，可点击选择恢复"},
+        {"usage": "/session",   "brief": "查看并恢复历史会话",             "detail": "列出最近历史会话，可点击选择恢复"},
         {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
         {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
         {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
@@ -1086,6 +1086,12 @@ class ClaudeCodePlugin(Plugin):
             # 移除权限服务器中的会话映射
             if self._perm_server and self._perm_server_started:
                 self._perm_server.unregister_session(session_id)
+            # 任务结束后发送加急通知，让用户收到提醒
+            if message_id:
+                try:
+                    self.bot.urgent_message(message_id, [user_id])
+                except Exception as ue:
+                    logger.debug("[CC] 加急通知发送失败: %s", ue)
             logger.info("[CC] 任务清理完成: user=%s", user_id)
 
     def _start_timeout_timer(self, user_id: str, timeout: int) -> threading.Timer:
@@ -1405,7 +1411,7 @@ class ClaudeCodePlugin(Plugin):
             return
 
         # 5. 特殊指令：历史会话
-        if text == "/sessions":
+        if text == "/session":
             sessions = self._load_user_sessions(user_id)
             if not sessions:
                 self.bot.reply(

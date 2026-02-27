@@ -206,6 +206,29 @@ class FeishuBot(ABC):
         if not response.success():
             _log("ERROR", f"消息更新失败: code={response.code}, msg={response.msg}")
 
+    def urgent_message(self, message_id: str, user_ids: list[str]) -> bool:
+        """对已有消息发送应用内加急通知
+
+        Args:
+            message_id: 要加急的消息 ID
+            user_ids: 接收加急通知的用户 user_id 列表
+
+        Returns:
+            是否成功
+        """
+        request = UrgentAppMessageRequest.builder() \
+            .message_id(message_id) \
+            .user_id_type("user_id") \
+            .request_body(UrgentReceivers.builder()
+                .user_id_list(user_ids)
+                .build()) \
+            .build()
+        response = self.client.im.v1.message.urgent_app(request)
+        if not response.success():
+            _log("ERROR", f"加急通知失败: code={response.code}, msg={response.msg}")
+            return False
+        return True
+
     def reply(self, chat_id: str, text: str) -> None:
         """发送文本消息"""
         self.send_message(chat_id, "text", json.dumps({"text": text}))
