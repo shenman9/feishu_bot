@@ -21,7 +21,7 @@ def plugin(mock_bot):
     """返回已注册 mock bot 的 ClaudeChatPlugin，并注入测试配置"""
     p = ClaudeChatPlugin()
     p.on_register(mock_bot)
-    # 直接注入配置，跳过 config.yaml 读取
+    # 直接注入配置，跳过配置文件读取
     p._config = {
         "api_url": "https://api.test.com/v1/messages",
         "api_key": "sk-test-key",

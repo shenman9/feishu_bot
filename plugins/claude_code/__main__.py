@@ -7,9 +7,9 @@ Claude Code 独立机器人启动入口
 等效于在 Hub 机器人中只加载 CC 插件，但使用专属飞书应用凭证，
 支持飞书 /命令 推荐框等独立机器人特性。
 
-配置文件：项目根目录的 config.yaml（与 Hub 模式共用同一份）
-  - app_id / app_secret：填写 CC 专属机器人的凭证
-  - claude_code.*：CC 插件配置（与 Hub 模式相同）
+配置文件：项目根目录 config/ 目录（与 Hub 模式共用）
+  - config/system.yaml：填写 CC 专属机器人的 app_id / app_secret
+  - config/claude_code.yaml：CC 插件配置（与 Hub 模式相同）
 """
 
 import logging

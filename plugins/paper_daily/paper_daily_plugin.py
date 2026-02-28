@@ -15,7 +15,7 @@ from typing import Optional
 
 import schedule
 
-from config import load_config
+from config import load_plugin_config
 from core.plugin import Plugin
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
@@ -72,18 +72,17 @@ class PaperDailyPlugin(Plugin):
     # ---- 配置 ----
 
     def _load_plugin_config(self) -> dict:
-        """懒加载插件配置"""
+        """懒加载插件配置，从 config/paper_daily.yaml 读取"""
         if self._config is None:
-            cfg = load_config()
-            pd_cfg = cfg.get("paper_daily", {})
+            pd = load_plugin_config("paper_daily")
             self._config = {
-                "topics": pd_cfg.get("topics", []),
-                "categories": pd_cfg.get("categories", ["cs.CL", "cs.AI", "cs.LG"]),
-                "max_papers": pd_cfg.get("max_papers", 50),
-                "llm_base_url": pd_cfg.get("llm_base_url", ""),
-                "llm_api_key": pd_cfg.get("llm_api_key", ""),
-                "llm_model": pd_cfg.get("llm_model", "claude-opus-4-6"),
-                "schedule_time": pd_cfg.get("schedule_time", "10:00"),
+                "topics": pd.get("topics", []),
+                "categories": pd.get("categories", ["cs.CL", "cs.AI", "cs.LG"]),
+                "max_papers": pd.get("max_papers", 50),
+                "llm_base_url": pd.get("llm_base_url", ""),
+                "llm_api_key": pd.get("llm_api_key", ""),
+                "llm_model": pd.get("llm_model", "claude-opus-4-6"),
+                "schedule_time": pd.get("schedule_time", "10:00"),
             }
         return self._config
 

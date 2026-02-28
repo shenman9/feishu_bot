@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-config.yaml
+config/*.yaml
+!config/*.yaml.example
 # .claude 目录：忽略本地配置，但跟踪开发指南
 .claude/*
 !.claude/guides/

@@ -1,0 +1,29 @@
+# Claude Code 桥接插件配置
+claude_path: "/usr/bin/claude"        # Claude Code CLI 路径
+default_working_dir: ""               # 默认工作目录（空=机器人进程当前目录）
+timeout: 600                          # 单次执行超时（秒）
+max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
+default_perm_mode: "interactive"      # 新会话默认权限模式，可选值：
+                                      #   interactive   - 所有操作通过飞书卡片确认（默认）
+                                      #   accept_edits  - 工作目录内文件修改自动放行，其余仍需确认
+                                      #   bypass        - 所有操作自动放行（危险，慎用）
+                                      #   manual_select - 新会话创建后弹出权限选择卡片，由用户手动选择
+                                      # 用户也可在会话内通过 /permission 指令随时切换权限模式。
+max_turns: 50                         # Claude Code 最大轮次
+run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
+permission_server_port: 9876          # 权限确认 HTTP 服务器端口
+permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝
+
+# Docker 部署说明：
+# 1. 在容器中创建非 root 用户: useradd -m claudebot
+# 2. 设置 run_as_user: "claudebot"
+# 3. 在该用户主目录下完成 claude 鉴权: su - claudebot -c "claude auth login"
+# 4. 工作目录建议设在用户主目录下: default_working_dir: "/home/claudebot/work"
+#
+# 权限确认模式说明：
+# - 默认始终启用交互式权限确认：Claude Code 执行危险操作（如 Bash 命令）前
+#   会通过飞书卡片询问用户确认，用户可选择「允许」或「拒绝」。
+# - 插件会自动启动 HTTP 服务器（端口见 permission_server_port），并向 Claude
+#   的 settings.json 注册 PreToolUse Hook。
+# - 用户可在会话内发送 /bypass 指令切换为自动放行模式，再次发送可恢复确认。
+#   此设置仅限当前会话，开启新会话后自动恢复交互确认。

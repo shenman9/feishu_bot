@@ -56,16 +56,15 @@ claude_chat/
 
 ## 配置
 
-在 `config.yaml` 的 `claude` 节点下配置（参考 `config.yaml.example`）：
+在 `config/claude_chat.yaml` 中配置（参考 `config/claude_chat.yaml.example`）：
 
 ```yaml
-claude:
-  api_url: "https://api.anthropic.com/v1/messages"  # API 地址（可替换为代理）
-  api_key: "your_claude_api_key_here"               # Anthropic API Key
-  model: "claude-opus-4-6"                          # 使用的模型
-  max_history: 20                                   # 保留的最大历史消息条数
-  max_tokens: 4096                                  # 单次回复最大 Token 数
-  system_prompt: ""                                 # 可选的系统提示词
+api_url: "https://api.anthropic.com/v1/messages"  # API 地址（可替换为代理）
+api_key: "your_claude_api_key_here"               # Anthropic API Key
+model: "claude-opus-4-6"                          # 使用的模型
+max_history: 20                                   # 保留的最大历史消息条数
+max_tokens: 4096                                  # 单次回复最大 Token 数
+system_prompt: ""                                 # 可选的系统提示词
 ```
 
 | 配置项 | 默认值 | 说明 |

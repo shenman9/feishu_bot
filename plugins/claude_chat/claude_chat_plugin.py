@@ -12,7 +12,7 @@ from typing import Optional
 
 import requests
 
-from config import load_config
+from config import load_plugin_config
 from core.plugin import Plugin
 
 logger = logging.getLogger(__name__)
@@ -58,17 +58,16 @@ class ClaudeChatPlugin(Plugin):
     # ---- 内部方法 ----
 
     def _load_claude_config(self) -> dict:
-        """懒加载 Claude 配置，首次调用时从 config.yaml 读取"""
+        """懒加载 Claude 配置，首次调用时从 config/claude_chat.yaml 读取"""
         if self._config is None:
-            cfg = load_config()
-            claude_cfg = cfg.get("claude", {})
+            cc = load_plugin_config("claude_chat")
             self._config = {
-                "api_url": claude_cfg.get("api_url", ""),
-                "api_key": claude_cfg.get("api_key", ""),
-                "model": claude_cfg.get("model", DEFAULT_MODEL),
-                "max_history": claude_cfg.get("max_history", DEFAULT_MAX_HISTORY),
-                "max_tokens": claude_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
-                "system_prompt": claude_cfg.get("system_prompt", ""),
+                "api_url": cc.get("api_url", ""),
+                "api_key": cc.get("api_key", ""),
+                "model": cc.get("model", DEFAULT_MODEL),
+                "max_history": cc.get("max_history", DEFAULT_MAX_HISTORY),
+                "max_tokens": cc.get("max_tokens", DEFAULT_MAX_TOKENS),
+                "system_prompt": cc.get("system_prompt", ""),
             }
         return self._config
 

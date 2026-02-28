@@ -8,6 +8,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_FILE="$PROJECT_DIR/.bot.pid"
 LOG_FILE="$PROJECT_DIR/.bot.log"
 PYTHON="${PYTHON:-python3}"
+PROC_NAME="feishu_bot"     # 进程名，用于 ps/pgrep/pkill 精准识别
 
 _is_running() {
     if [ ! -f "$PID_FILE" ]; then
@@ -17,22 +18,22 @@ _is_running() {
     pid=$(cat "$PID_FILE")
     # 进程存活检查
     kill -0 "$pid" 2>/dev/null || return 1
-    # 验证进程命令行包含 main.py，防止 PID 被其他进程复用导致误判
+    # 验证进程命令行包含 PROC_NAME，防止 PID 被其他进程复用导致误判
     if [ -f "/proc/${pid}/cmdline" ]; then
         # Linux: 通过 procfs 检查（cmdline 以 NUL 分隔，grep 仍可匹配）
-        grep -q "main\.py" "/proc/${pid}/cmdline" 2>/dev/null
+        grep -q "$PROC_NAME" "/proc/${pid}/cmdline" 2>/dev/null
     else
         # 非 Linux（如 macOS）降级：通过 ps args 检查
-        ps -p "$pid" -o args= 2>/dev/null | grep -q "main\.py"
+        ps -p "$pid" -o args= 2>/dev/null | grep -q "$PROC_NAME"
     fi
 }
 
-# 从 config.yaml 读取权限服务器端口，缺省 9876
+# 从 config/claude_code.yaml 读取权限服务器端口，缺省 9876
 _get_perm_port() {
     local port=""
-    if [ -f "$PROJECT_DIR/config.yaml" ]; then
+    if [ -f "$PROJECT_DIR/config/claude_code.yaml" ]; then
         port=$(awk '/^[[:space:]]*permission_server_port:[[:space:]]*/{ print $2; exit }' \
-            "$PROJECT_DIR/config.yaml" 2>/dev/null || true)
+            "$PROJECT_DIR/config/claude_code.yaml" 2>/dev/null || true)
     fi
     echo "${port:-9876}"
 }
@@ -48,8 +49,8 @@ _preflight_check() {
     fi
 
     # 2. 配置文件
-    if [ ! -f "$PROJECT_DIR/config.yaml" ]; then
-        echo "  [错误] 配置文件不存在，请参考 config.yaml.example 创建"
+    if [ ! -f "$PROJECT_DIR/config/system.yaml" ]; then
+        echo "  [错误] 系统配置文件不存在，请参考 config/system.yaml.example 创建"
         failed=true
     fi
 
@@ -84,7 +85,7 @@ _preflight_check() {
         echo "  [错误] 权限服务器端口 $port 已被占用" \
             "${holder_pid:+(PID: $holder_pid${holder_cmd:+, $holder_cmd})}"
         echo "         若为未正常退出的机器人进程，请先执行: ./run.sh stop"
-        echo "         若为其他进程，请修改 config.yaml 中的 permission_server_port"
+        echo "         若为其他进程，请修改 config/claude_code.yaml 中的 permission_server_port"
         failed=true
     fi
 
@@ -103,7 +104,7 @@ do_start() {
     fi
     echo "正在启动机器人..."
     cd "$PROJECT_DIR"
-    nohup "$PYTHON" main.py >> "$LOG_FILE" 2>&1 &
+    nohup bash -c "exec -a \"$PROC_NAME\" \"$PYTHON\" main.py" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 1
     if _is_running; then

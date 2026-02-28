@@ -32,11 +32,20 @@
 
 ## 敏感信息与配置管理
 
-* **config.yaml**: 你可以读取和修改此文件以进行本地调试。
+配置按职责拆分在 `config/` 目录下：
+
+| 文件 | 说明 |
+|------|------|
+| `config/system.yaml` | 全局配置（app_id, app_secret） |
+| `config/claude_chat.yaml` | Claude 对话插件配置 |
+| `config/claude_code.yaml` | Claude Code 桥接插件配置 |
+| `config/paper_daily.yaml` | 论文日报插件配置 |
+
+* **config/\*.yaml**: 你可以读取和修改这些文件以进行本地调试。
 * **Git 约束**:
-    * 严禁将包含真实密钥（App ID, Secret）的 `config.yaml` 提交到 git 历史中。
-    * 始终确保 `.gitignore` 包含 `config.yaml`。
-    * 提交配置变更时，仅修改 `config.yaml.example`。
+    * 严禁将包含真实密钥的 `config/*.yaml` 提交到 git 历史中。
+    * 始终确保 `.gitignore` 包含 `config/*.yaml`（已排除 `.example` 文件）。
+    * 提交配置变更时，仅修改 `config/*.yaml.example`。
 
 ## 常用命令
 
@@ -56,9 +65,9 @@
 **启动前预检**：`start` / `restart` 会自动执行环境预检，任一项失败则终止启动并给出提示：
 
 * Python 解释器可用性
-* `config.yaml` 文件是否存在
+* `config/system.yaml` 文件是否存在
 * `main.py` 文件是否存在
-* 权限服务器端口是否已被占用（从 `config.yaml` 读取，缺省 9876），占用时显示占用进程 PID 与命令名
+* 权限服务器端口是否已被占用（从 `config/claude_code.yaml` 读取，缺省 9876），占用时显示占用进程 PID 与命令名
 
 ## CC 插件权限服务器机制
 
@@ -78,7 +87,7 @@ CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权�
 | `accept_edits` | 工作目录内的 Write/Edit/NotebookEdit 自动放行，其余仍需确认 |
 | `bypass` | 所有操作自动放行，无需任何确认 |
 
-新会话的默认模式由 `config.yaml` 中的 `claude_code.default_perm_mode` 决定，缺省为 `interactive`。
+新会话的默认模式由 `config/claude_code.yaml` 中的 `default_perm_mode` 决定，缺省为 `interactive`。
 
 只读工具（`Read`、`Glob`、`Grep`）由 `permission_hook.sh` 在 hook 入口直接放行，不进入权限服务器流程，与原始 Claude Code 默认行为一致。
 

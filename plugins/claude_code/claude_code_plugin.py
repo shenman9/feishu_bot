@@ -22,7 +22,7 @@ import time
 import uuid
 from typing import Optional
 
-from config import load_config
+from config import load_plugin_config
 from core.plugin import Plugin
 from plugins.claude_code.permission_server import PermissionServer
 
@@ -166,20 +166,19 @@ class ClaudeCodePlugin(Plugin):
     # ---- 配置 ----
 
     def _load_plugin_config(self) -> dict:
-        """懒加载插件配置"""
+        """懒加载插件配置，从 config/claude_code.yaml 读取"""
         if self._config is None:
-            cfg = load_config()
-            cc_cfg = cfg.get("claude_code", {})
+            cc = load_plugin_config("claude_code")
             self._config = {
-                "claude_path": cc_cfg.get("claude_path", "/usr/bin/claude"),
-                "default_working_dir": cc_cfg.get("default_working_dir", ""),
-                "timeout": cc_cfg.get("timeout", _DEFAULT_TIMEOUT),
-                "max_output_chars": cc_cfg.get("max_output_chars", _DEFAULT_MAX_OUTPUT),
-                "default_perm_mode": cc_cfg.get("default_perm_mode", "interactive"),
-                "max_turns": cc_cfg.get("max_turns", _DEFAULT_MAX_TURNS),
-                "run_as_user": cc_cfg.get("run_as_user", ""),
-                "permission_server_port": cc_cfg.get("permission_server_port", _DEFAULT_PERM_PORT),
-                "permission_timeout": cc_cfg.get("permission_timeout", _DEFAULT_PERM_TIMEOUT),
+                "claude_path": cc.get("claude_path", "/usr/bin/claude"),
+                "default_working_dir": cc.get("default_working_dir", ""),
+                "timeout": cc.get("timeout", _DEFAULT_TIMEOUT),
+                "max_output_chars": cc.get("max_output_chars", _DEFAULT_MAX_OUTPUT),
+                "default_perm_mode": cc.get("default_perm_mode", "interactive"),
+                "max_turns": cc.get("max_turns", _DEFAULT_MAX_TURNS),
+                "run_as_user": cc.get("run_as_user", ""),
+                "permission_server_port": cc.get("permission_server_port", _DEFAULT_PERM_PORT),
+                "permission_timeout": cc.get("permission_timeout", _DEFAULT_PERM_TIMEOUT),
             }
         return self._config
 

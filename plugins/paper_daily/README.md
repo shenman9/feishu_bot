@@ -58,29 +58,28 @@ paper_daily/
 | `notifier.py` | 将论文数据转换为飞书消息卡片 |
 | `reporter.py` | 生成 HTML 或文本格式的报告内容 |
 | `models.py` | `Paper` 等数据结构定义 |
-| `config.py` | 从 `config.yaml` 加载并校验插件配置 |
+| `config.py` | `AppConfig` 数据类定义 |
 
 ## 配置
 
-在 `config.yaml` 的 `paper_daily` 节点下配置（参考 `config.yaml.example`）：
+在 `config/paper_daily.yaml` 中配置（参考 `config/paper_daily.yaml.example`）：
 
 ```yaml
-paper_daily:
-  topics:                          # 关注的研究方向（LLM 筛选依据）
-    - "Attention机制"
-    - "Memory机制"
-    - "KV cache压缩"
-    - "Retrieval(检索)"
-    - "长序列"
-  categories:                      # ArXiv 分类（cs.CL / cs.AI / cs.LG 等）
-    - "cs.CL"
-    - "cs.AI"
-    - "cs.LG"
-  max_papers: 50                   # 每次最多处理的论文数量
-  llm_base_url: "https://api.anthropic.com"  # LLM API 地址
-  llm_api_key: "your_llm_api_key_here"       # LLM API Key
-  llm_model: "claude-opus-4-6"               # 用于筛选和摘要的模型
-  schedule_time: "10:00"           # 每日定时推送时间（北京时间 HH:MM）
+topics:                          # 关注的研究方向（LLM 筛选依据）
+  - "Attention机制"
+  - "Memory机制"
+  - "KV cache压缩"
+  - "Retrieval(检索)"
+  - "长序列"
+categories:                      # ArXiv 分类（cs.CL / cs.AI / cs.LG 等）
+  - "cs.CL"
+  - "cs.AI"
+  - "cs.LG"
+max_papers: 50                   # 每次最多处理的论文数量
+llm_base_url: "https://api.anthropic.com"  # LLM API 地址
+llm_api_key: "your_llm_api_key_here"       # LLM API Key
+llm_model: "claude-opus-4-6"               # 用于筛选和摘要的模型
+schedule_time: "10:00"           # 每日定时推送时间（北京时间 HH:MM）
 ```
 
 | 配置项 | 默认值 | 说明 |

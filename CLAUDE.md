@@ -27,7 +27,7 @@
 
 * **禁止自动提交**：除非用户明确要求，否则绝不执行 `git commit`。
 * **注释 & Commit Message 必须使用中文**。Commit 格式: `类型: 描述`。
-* **config.yaml 严禁提交到 git**，配置变更只改 `config.yaml.example`。
+* **config/ 目录下的 `*.yaml` 严禁提交到 git**，配置变更只改 `config/*.yaml.example`。
 * **主进程永不崩溃**，插件异常必须被 HubBot 捕获。
 * **禁止使用内置 WebFetch 工具**。由于地区限制，WebFetch 预检会被 Anthropic 拦截（302 → app-unavailable-in-region）。需要抓取网页内容时，一律通过 Bash 执行 `curl -sL <URL>` 获取，再对输出进行分析。
 * **服务的启动、停止、重启必须通过 `run.sh` 脚本进行**，禁止直接执行 `python main.py` 或手动 kill 进程。

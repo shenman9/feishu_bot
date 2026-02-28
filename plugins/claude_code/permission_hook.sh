@@ -59,7 +59,7 @@ TIMEOUT_FILE="${PROJ_ROOT}/data/claude_code/.feishu_perm_timeout"
 if [ -f "$TIMEOUT_FILE" ]; then
     PERM_TIMEOUT=$(cat "$TIMEOUT_FILE")
 else
-    PERM_TIMEOUT=120  # 默认值与 config.yaml.example 一致
+    PERM_TIMEOUT=120  # 默认值与 config/claude_code.yaml.example 一致
 fi
 CURL_MAX_TIME=$((PERM_TIMEOUT + 10))
 _log "超时配置: perm_timeout=${PERM_TIMEOUT}s, curl_max_time=${CURL_MAX_TIME}s"

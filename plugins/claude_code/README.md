@@ -124,20 +124,19 @@ claude_code/
 
 ## 配置
 
-在 `config.yaml` 的 `claude_code` 节点下配置（参考 `config.yaml.example`）：
+在 `config/claude_code.yaml` 中配置（参考 `config/claude_code.yaml.example`）：
 
 ```yaml
-claude_code:
-  claude_path: "/usr/bin/claude"      # claude CLI 可执行文件路径
-  default_working_dir: ""             # 默认工作目录（空则使用当前目录）
-  timeout: 600                        # 单次任务超时时间（秒）
-  max_output_chars: 28000             # 飞书卡片最大字符数（超出则截断）
-  default_perm_mode: "interactive"    # 新会话默认权限模式
-                                      #   interactive   / accept_edits / bypass / manual_select
-  max_turns: 50                       # Claude Code 最大对话轮数
-  run_as_user: ""                     # 子进程切换到指定系统用户运行（解决 root 限制）
-  permission_server_port: 9876        # 权限确认服务监听端口
-  permission_timeout: 120             # 用户确认超时时间（秒），超时自动拒绝
+claude_path: "/usr/bin/claude"      # claude CLI 可执行文件路径
+default_working_dir: ""             # 默认工作目录（空则使用当前目录）
+timeout: 600                        # 单次任务超时时间（秒）
+max_output_chars: 28000             # 飞书卡片最大字符数（超出则截断）
+default_perm_mode: "interactive"    # 新会话默认权限模式
+                                    #   interactive   / accept_edits / bypass / manual_select
+max_turns: 50                       # Claude Code 最大对话轮数
+run_as_user: ""                     # 子进程切换到指定系统用户运行（解决 root 限制）
+permission_server_port: 9876        # 权限确认服务监听端口
+permission_timeout: 120             # 用户确认超时时间（秒），超时自动拒绝
 ```
 
 | 配置项 | 默认值 | 说明 |
