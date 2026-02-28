@@ -79,6 +79,45 @@ class FeishuBot(ABC):
             return False
 
     @staticmethod
+    def _extract_text(msg_type: str, content_dict: dict) -> str:
+        """从飞书消息中提取纯文本内容
+
+        - text 类型：直接取 text 字段
+        - post 富文本：遍历 content 二维数组，提取所有 tag=text 的文本
+        - 其他类型（sticker/image/video/audio 等）：返回空字符串
+        """
+        if msg_type == "text":
+            return content_dict.get("text", "").strip()
+
+        if msg_type == "post":
+            # 富文本结构: {"title": "...", "content": [[{"tag": "text", "text": "..."}, ...]]}
+            # content 可能在顶层或按语言嵌套（如 content.zh_cn）
+            paragraphs = content_dict.get("content")
+            if isinstance(paragraphs, dict):
+                # 按语言嵌套时取第一个语言的内容
+                for lang_content in paragraphs.values():
+                    if isinstance(lang_content, dict):
+                        paragraphs = lang_content.get("content", [])
+                    else:
+                        paragraphs = lang_content
+                    break
+            if not isinstance(paragraphs, list):
+                return ""
+            parts: list[str] = []
+            for para in paragraphs:
+                if not isinstance(para, list):
+                    continue
+                for elem in para:
+                    if isinstance(elem, dict) and elem.get("tag") == "text":
+                        t = elem.get("text", "").strip()
+                        if t:
+                            parts.append(t)
+            return " ".join(parts)
+
+        # sticker/image/video/audio 等无文本消息
+        return ""
+
+    @staticmethod
     def _strip_mentions(text: str, mentions: list) -> str:
         """从消息文本中剥离所有 @提及 占位符（如 @_user_1）"""
         for mention in mentions:
@@ -116,6 +155,11 @@ class FeishuBot(ABC):
             logger.warning("消息内容解析失败: message_id=%s, error=%s", message_id, type(e).__name__)
             return
 
+        logger.info(
+            "收到原始消息: user=%s, chat_type=%s, msg_type=%s, message_id=%s, content=%s",
+            sender_id, chat_type, msg_type, message_id, message.content,
+        )
+
         if msg_type == "file":
             file_key = content_dict.get("file_key", "")
             file_name = content_dict.get("file_name", "")
@@ -123,10 +167,15 @@ class FeishuBot(ABC):
                        sender_id, chat_type, message_id, file_name)
             self.on_file_message(sender_id, chat_id, message_id, file_key, file_name)
         else:
-            text = content_dict.get("text", "").strip()
+            text = self._extract_text(msg_type, content_dict)
             # 群聊消息剥离 @提及 占位符
             if chat_type == "group" and mentions:
                 text = self._strip_mentions(text, mentions)
+            if not text:
+                logger.info("忽略空文本消息: user=%s, msg_type=%s, message_id=%s",
+                           sender_id, msg_type, message_id)
+                self.reply(chat_id, "当前仅支持文本消息，请直接输入文字。")
+                return
             logger.info("收到消息: user=%s, chat_type=%s, message_id=%s, text=%s",
                        sender_id, chat_type, message_id, text)
             self.on_message(sender_id, chat_id, text)
