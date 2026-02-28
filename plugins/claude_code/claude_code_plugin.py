@@ -43,6 +43,7 @@ _DEFAULT_MAX_OUTPUT = 28000     # 飞书卡片 markdown 最大字符数
 _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
 _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
+_ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
 _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
 
 # 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
@@ -570,10 +571,51 @@ class ClaudeCodePlugin(Plugin):
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
         )
 
-        # bypass 模式：直接放行所有请求
-        if perm_mode == "bypass":
+        # bypass 模式：直接放行所有权限请求（AskUserQuestion 除外，它是用户输入而非权限确认）
+        if perm_mode == "bypass" and tool_name != "AskUserQuestion":
             if self._perm_server:
                 self._perm_server.resolve_request(request_id, "allow")
+            return
+
+        # AskUserQuestion 特殊处理：将问题转发到飞书，用户通过卡片按钮回答
+        if tool_name == "AskUserQuestion":
+            questions = tool_input.get("questions", [])
+            if not questions:
+                if self._perm_server:
+                    self._perm_server.resolve_request(
+                        request_id, "deny", reason="AskUserQuestion 未包含有效问题。"
+                    )
+                return
+            card = self._build_ask_user_card(request_id, questions)
+            # 超时按问题数量缩放
+            timeout = _ASK_USER_TIMEOUT * len(questions)
+            if self._perm_server:
+                self._perm_server.set_request_timeout(request_id, timeout)
+            # 使用 send_message_get_id 检测发送是否成功
+            msg_id = self.bot.send_message_get_id(chat_id, "interactive", card)
+            if msg_id:
+                # 保存表单元数据：飞书表单提交时 button.value 丢失，需从此恢复
+                state = self._get_state(user_id)
+                state["_pending_ask_user"] = {
+                    "request_id": request_id,
+                    "questions": questions,
+                    "answers": {},
+                    "total": len(questions),
+                }
+                logger.info(
+                    "[CC] 已发送用户问题卡片: user=%s, request=%s, 问题数=%d",
+                    user_id, request_id[:8], len(questions),
+                )
+            else:
+                # 卡片发送失败（如含不支持的元素类型），立即拒绝请求避免挂起
+                logger.error(
+                    "[CC] 用户问题卡片发送失败: user=%s, request=%s", user_id, request_id[:8],
+                )
+                if self._perm_server:
+                    self._perm_server.resolve_request(
+                        request_id, "deny",
+                        reason="无法向用户发送问题卡片，请根据上下文自行做出最合理的判断。",
+                    )
             return
 
         # accept_edits 模式：文件修改类工具在工作目录内自动放行
@@ -751,6 +793,246 @@ class ClaudeCodePlugin(Plugin):
             ],
         }
         return json.dumps(card)
+
+    @staticmethod
+    def _build_ask_user_card(
+        request_id: str,
+        questions: list[dict],
+        answers: dict[int, str] | None = None,
+    ) -> str:
+        """构造 AskUserQuestion 飞书问题卡片（逐题展示）
+
+        多问题场景下按顺序逐题展示：已回答的灰色展示，当前题目交互式展示，
+        后续题目仅显示标题作为预览，用户答完当前题后刷新卡片展示下一题。
+
+        Args:
+            request_id: 权限请求 ID（用于回调匹配）
+            questions: 问题列表，每项含 question, header, options 字段
+            answers: 已回答的问题索引 → 答案，用于部分回答后刷新卡片
+        """
+        if answers is None:
+            answers = {}
+
+        elements: list[dict] = []
+        total = len(questions)
+        # 找到当前待回答的题目索引（第一个未回答的）
+        current_qi = next((i for i in range(total) if i not in answers), total)
+
+        for qi, question in enumerate(questions):
+            q_text = question.get("question", "")
+            header_text = question.get("header", "")
+            options = question.get("options", [])
+
+            # 多问题时添加序号前缀
+            prefix = f"**问题 {qi + 1}/{total}**  " if total > 1 else ""
+
+            if qi in answers:
+                # 已回答的问题：灰色文本展示
+                q_label = f"**{header_text}**" if header_text else q_text[:60]
+                elements.append({
+                    "tag": "markdown",
+                    "content": f"{prefix}{q_label}\n~~已选择: {answers[qi]}~~",
+                })
+                if qi < total - 1:
+                    elements.append({"tag": "hr"})
+                continue
+
+            if qi > current_qi:
+                # 后续未到达的问题：仅显示标题，不渲染交互元素
+                q_label = f"**{header_text}**" if header_text else q_text[:60]
+                elements.append({
+                    "tag": "markdown",
+                    "content": f"{prefix}{q_label}\n*待回答*",
+                })
+                if qi < total - 1:
+                    elements.append({"tag": "hr"})
+                continue
+
+            # 当前题目：交互式区块
+            content_md = f"{prefix}**{header_text}**\n\n{q_text}" if header_text else f"{prefix}{q_text}"
+            elements.append({"tag": "markdown", "content": content_md})
+
+            # 各选项的描述说明
+            if options:
+                option_lines = []
+                for i, opt in enumerate(options, 1):
+                    label = opt.get("label", f"选项{i}")
+                    desc = opt.get("description", "")
+                    option_lines.append(f"**{label}**: {desc}" if desc else f"**{label}**")
+                elements.append({"tag": "markdown", "content": "\n".join(option_lines)})
+
+            elements.append({"tag": "hr"})
+
+            # 每个选项一个按钮
+            actions = []
+            for i, opt in enumerate(options):
+                label = opt.get("label", f"选项{i+1}")
+                desc = opt.get("description", "")
+                answer_display = f"{label} - {desc}" if desc else label
+                actions.append({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": label},
+                    "type": "primary" if i == 0 else "default",
+                    "value": {
+                        "action": "ask_user_answer",
+                        "plugin": PLUGIN_KEYWORD,
+                        "request_id": request_id,
+                        "question_index": qi,
+                        "answer_label": answer_display,
+                        "question_text": q_text[:100],
+                    },
+                })
+            elements.append({"tag": "action", "actions": actions})
+
+            # "其他" 自定义输入：输入框 + 提交按钮放在 form 容器内
+            elements.append({
+                "tag": "form",
+                "name": f"custom_answer_form_{qi}",
+                "elements": [
+                    {
+                        "tag": "input",
+                        "name": f"custom_answer_{qi}",
+                        "placeholder": {
+                            "tag": "plain_text",
+                            "content": "输入自定义回答…",
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "name": f"submit_custom_{qi}",
+                        "text": {"tag": "plain_text", "content": "其他"},
+                        "type": "default",
+                        "form_action_type": "submit",
+                        "value": {
+                            "action": "ask_user_custom",
+                            "plugin": PLUGIN_KEYWORD,
+                            "request_id": request_id,
+                            "question_index": qi,
+                            "question_text": q_text[:100],
+                        },
+                    },
+                ],
+            })
+
+            if qi < total - 1:
+                elements.append({"tag": "hr"})
+
+        # 卡片标题：多问题时显示进度
+        answered_count = len(answers)
+        if total > 1:
+            title = f"Claude Code 需要你的输入（{answered_count + 1}/{total}）"
+        else:
+            title = "Claude Code 需要你的输入"
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        return json.dumps(card)
+
+    @staticmethod
+    def _build_ask_user_answered_card(
+        questions: list[dict], answers: dict[int, str],
+    ) -> str:
+        """构造 AskUserQuestion 已回答的卡片（灰色，无按钮）
+
+        Args:
+            questions: 完整问题列表
+            answers: 问题索引 → 用户答案
+        """
+        total = len(questions)
+        lines = []
+        for qi, question in enumerate(questions):
+            q_text = question.get("question", "")[:100]
+            answer = answers.get(qi, "（未回答）")
+            if total > 1:
+                lines.append(f"**问题 {qi + 1}**: {q_text}\n**选择**: {answer}")
+            else:
+                lines.append(f"**问题**: {q_text}\n**你的选择**: {answer}")
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude Code 用户输入 - 已回答"},
+                "template": "grey",
+            },
+            "elements": [
+                {"tag": "markdown", "content": "\n\n".join(lines)},
+            ],
+        }
+        return json.dumps(card)
+
+    def _handle_ask_user_response(
+        self, user_id: str, request_id: str, question_index: int, answer: str,
+    ):
+        """处理用户对 AskUserQuestion 某道题的回答，返回卡片响应
+
+        记录答案后判断：若所有问题已回答则 resolve 请求并返回灰色已回答卡片，
+        否则返回更新后的部分回答卡片。
+        """
+        state = self._get_state(user_id)
+        pending = state.get("_pending_ask_user")
+        if not pending or pending["request_id"] != request_id:
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        if not self._perm_server or not self._perm_server.has_pending_request(request_id):
+            state.pop("_pending_ask_user", None)
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        # 记录本题答案
+        answers = pending["answers"]
+        answers[question_index] = answer
+        questions = pending["questions"]
+        total = pending["total"]
+
+        if len(answers) < total:
+            # 尚有未回答的问题，刷新卡片
+            logger.info(
+                "[CC] 用户回答问题 %d/%d: user=%s, request=%s, answer=%s",
+                len(answers), total, user_id, request_id[:8], answer,
+            )
+            updated_card = self._build_ask_user_card(request_id, questions, answers)
+            return self.bot.make_card_response(
+                card=json.loads(updated_card),
+                toast=f"已回答 {len(answers)}/{total}",
+            )
+
+        # 所有问题已回答，resolve 请求
+        state.pop("_pending_ask_user", None)
+
+        if total == 1:
+            # 单问题：保持原有格式，向后兼容
+            reason = (
+                f"用户选择了「{answers[0]}」。"
+                f"请按照用户的选择继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
+            )
+        else:
+            lines = []
+            for qi in range(total):
+                q_text = questions[qi].get("question", "")[:80]
+                lines.append(f"{qi + 1}. {q_text} → 「{answers[qi]}」")
+            reason = (
+                "用户回答了以下问题：\n"
+                + "\n".join(lines)
+                + "\n请按照用户的回答继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
+            )
+
+        ok = self._perm_server.resolve_request(request_id, "deny", reason=reason)
+        if ok:
+            logger.info(
+                "[CC] 用户回答全部完成 (%d题): user=%s, request=%s",
+                total, user_id, request_id[:8],
+            )
+            answered_card = self._build_ask_user_answered_card(questions, answers)
+            return self.bot.make_card_response(
+                card=json.loads(answered_card),
+                toast="已完成全部回答",
+            )
+        return self.bot.make_card_response(toast="该请求已过期或已处理")
 
     # ---- 子进程管理 ----
 
@@ -968,6 +1250,7 @@ class ClaudeCodePlugin(Plugin):
                         current_streak.append({
                             "line": action["line"],
                             "tool_use_id": action["tool_use_id"],
+                            "tool_name": action.get("tool_name", ""),
                         })
                         if action["tool_use_id"]:
                             active_tool_ids[action["tool_use_id"]] = idx
@@ -976,8 +1259,11 @@ class ClaudeCodePlugin(Plugin):
                         tid = action["tool_use_id"]
                         if tid in active_tool_ids:
                             idx = active_tool_ids[tid]
+                            # AskUserQuestion 通过 hook "deny" 传回用户回答，
+                            # is_error=True 但实际上是成功收到回答，显示为 ✅
+                            is_ask_user = current_streak[idx].get("tool_name") == "AskUserQuestion"
                             suffix = (
-                                f" → ❌ {action['summary']}" if action["is_error"]
+                                f" → ❌ {action['summary']}" if action["is_error"] and not is_ask_user
                                 else " → ✅"
                             )
                             current_streak[idx]["line"] += suffix
@@ -1194,7 +1480,7 @@ class ClaudeCodePlugin(Plugin):
                     tool_input = block.get("input", {})
                     tool_use_id = block.get("id", "")
                     log_line = ClaudeCodePlugin._format_tool_call(tool_name, tool_input, working_dir)
-                    log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id})
+                    log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id, "tool_name": tool_name})
             if text_parts:
                 text_chunk = "\n\n".join(text_parts)
 
@@ -1261,14 +1547,22 @@ class ClaudeCodePlugin(Plugin):
         "Bash":         "💻",
         "Glob":         "🔍",
         "Grep":         "🔍",
-        "Task":         "🤖",
-        "WebFetch":     "🌐",
+        "Task":             "🤖",
+        "WebFetch":         "🌐",
+        "AskUserQuestion":  "❓",
     }
 
     @staticmethod
     def _format_tool_call(tool_name: str, tool_input: dict, working_dir: str = "") -> str:
         """将工具调用格式化为单行摘要，用于过程日志"""
         icon = ClaudeCodePlugin._TOOL_ICONS.get(tool_name, "🔧")
+        # AskUserQuestion 特殊处理：提取第一个问题文本作为摘要
+        if tool_name == "AskUserQuestion":
+            questions = tool_input.get("questions", [])
+            param = questions[0].get("question", "") if questions else ""
+            if len(param) > _TOOL_PARAM_MAX:
+                param = param[:_TOOL_PARAM_MAX - 3] + "..."
+            return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
         # 按优先级提取最有意义的参数作为摘要
         param: str = (
             tool_input.get("file_path")
@@ -1586,6 +1880,32 @@ class ClaudeCodePlugin(Plugin):
 
         action = action_value.get("action", "")
 
+        # 飞书表单提交时 button.value 丢失（action 为空），从 form_value 提取自定义回答
+        if not action and "_form_value" in action_value:
+            form_value = action_value["_form_value"]
+            # 表单 input 命名格式为 custom_answer_{qi}，按前缀匹配提取
+            custom_answer = ""
+            question_index = 0
+            for key, val in form_value.items():
+                if key.startswith("custom_answer_") and val:
+                    custom_answer = str(val).strip()
+                    try:
+                        question_index = int(key.rsplit("_", 1)[-1])
+                    except (ValueError, IndexError):
+                        pass
+                    break
+            if not custom_answer:
+                return self.bot.make_card_response(toast="请先在输入框中输入你的回答")
+
+            state = self._get_state(user_id)
+            pending = state.get("_pending_ask_user")
+            if not pending:
+                return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+            return self._handle_ask_user_response(
+                user_id, pending["request_id"], question_index, custom_answer,
+            )
+
         if action == "cancel":
             state = self._get_state(user_id)
             if state.get("running"):
@@ -1678,6 +1998,30 @@ class ClaudeCodePlugin(Plugin):
                     toast="已开启 bypass 模式，本会话后续请求自动放行",
                 )
             return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        if action == "ask_user_answer":
+            request_id = action_value.get("request_id", "")
+            answer_label = action_value.get("answer_label", "")
+            question_index = action_value.get("question_index", 0)
+            return self._handle_ask_user_response(
+                user_id, request_id, question_index, answer_label,
+            )
+
+        if action == "ask_user_custom":
+            # "其他" 按钮点击：从表单输入框读取自定义回答
+            request_id = action_value.get("request_id", "")
+            question_index = action_value.get("question_index", 0)
+
+            form_value = action_value.get("_form_value", {})
+            custom_answer = (
+                form_value.get(f"custom_answer_{question_index}") or ""
+            ).strip()
+            if not custom_answer:
+                return self.bot.make_card_response(toast="请先在输入框中输入你的回答")
+
+            return self._handle_ask_user_response(
+                user_id, request_id, question_index, custom_answer,
+            )
 
         if action == "resume_session":
             state = self._get_state(user_id)

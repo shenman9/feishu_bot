@@ -93,6 +93,7 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
         perm_server._pending_requests[request_id] = {
             "event": event,
             "decision": None,
+            "reason": "",
             "session_id": session_id,
             "user_id": user_id,
         }
@@ -118,8 +119,10 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
             self._respond_json(200, _make_hook_response("deny", "通知失败"))
             return
 
-        # 阻塞等待用户响应
-        timeout = perm_server._timeout
+        # 阻塞等待用户响应（支持回调中通过 set_request_timeout 覆盖默认超时）
+        pending_entry = perm_server._pending_requests.get(request_id)
+        custom_timeout = pending_entry.get("timeout") if pending_entry else None
+        timeout = custom_timeout if custom_timeout is not None else perm_server._timeout
         wait_start = time.monotonic()
         logger.info("[权限服务器] 等待用户响应: request_id=%s, timeout=%ds", request_id[:8], timeout)
         responded = event.wait(timeout=timeout)
@@ -149,11 +152,12 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
             return
 
         behavior = pending["decision"]
+        reason = pending.get("reason", "")
         logger.info(
             "[权限服务器] 等待结束: request_id=%s, decision=%s, 耗时=%.1fs",
             request_id[:8], behavior, elapsed,
         )
-        resp = _make_hook_response(behavior)
+        resp = _make_hook_response(behavior, reason)
         logger.debug("[权限服务器] 返回响应: %s", resp)
         self._respond_json(200, resp)
 
@@ -279,12 +283,13 @@ class PermissionServer:
 
     # ---- 请求响应 ----
 
-    def resolve_request(self, request_id: str, behavior: str) -> bool:
+    def resolve_request(self, request_id: str, behavior: str, reason: str = "") -> bool:
         """解决挂起的权限请求
 
         Args:
             request_id: 请求唯一 ID
             behavior: "allow" 或 "deny"
+            reason: 附带原因（可选），通过 hook 脚本 stderr 反馈给 Claude Code
 
         Returns:
             True 表示成功设置，False 表示请求不存在或已超时
@@ -296,8 +301,18 @@ class PermissionServer:
             )
             return False
         pending["decision"] = behavior
+        pending["reason"] = reason
         pending["event"].set()
         return True
+
+    def set_request_timeout(self, request_id: str, timeout: int) -> None:
+        """为指定请求设置自定义超时（覆盖全局默认值）
+
+        需在 on_permission_request 回调中调用（回调在 event.wait 之前执行）。
+        """
+        pending = self._pending_requests.get(request_id)
+        if pending:
+            pending["timeout"] = timeout
 
     def has_pending_request(self, request_id: str) -> bool:
         """检查是否有指定的挂起请求"""

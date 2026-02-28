@@ -137,6 +137,9 @@ class FeishuBot(ABC):
         chat_id = data.event.context.open_chat_id
         message_id = data.event.context.open_message_id
         action_value = data.event.action.value or {}
+        # 表单提交时携带输入框的值，注入 action_value 供插件读取
+        if data.event.action.form_value:
+            action_value["_form_value"] = data.event.action.form_value
         logger.info("卡片点击: user=%s, action=%s", user_id, action_value)
         return self.on_card_action(user_id, chat_id, message_id, action_value)
 

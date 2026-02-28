@@ -106,7 +106,11 @@ REASON=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin);
 _log "解析结果: decision=${DECISION}, reason=${REASON}"
 
 if [ "$DECISION" = "allow" ]; then
-    _log "决策: 允许"
+    _log "决策: 允许 (reason=${REASON})"
+    # 若有 reason（如 AskUserQuestion 的用户回答），输出到 stdout 供 Claude 读取
+    if [ -n "$REASON" ]; then
+        echo "$REASON"
+    fi
     exit 0
 else
     _log "决策: 拒绝 (reason=${REASON})"
