@@ -120,7 +120,6 @@ def plugin(mock_bot):
         "default_working_dir": "",
         "timeout": _DEFAULT_TIMEOUT,
         "max_output_chars": _DEFAULT_MAX_OUTPUT,
-        "permission_mode": "bypassPermissions",
         "default_perm_mode": "interactive",
         "max_turns": _DEFAULT_MAX_TURNS,
         "run_as_user": "",

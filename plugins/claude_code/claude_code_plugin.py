@@ -174,7 +174,6 @@ class ClaudeCodePlugin(Plugin):
                 "default_working_dir": cc_cfg.get("default_working_dir", ""),
                 "timeout": cc_cfg.get("timeout", _DEFAULT_TIMEOUT),
                 "max_output_chars": cc_cfg.get("max_output_chars", _DEFAULT_MAX_OUTPUT),
-                "permission_mode": cc_cfg.get("permission_mode", "bypassPermissions"),
                 "default_perm_mode": cc_cfg.get("default_perm_mode", "interactive"),
                 "max_turns": cc_cfg.get("max_turns", _DEFAULT_MAX_TURNS),
                 "run_as_user": cc_cfg.get("run_as_user", ""),
@@ -200,6 +199,7 @@ class ClaudeCodePlugin(Plugin):
                 "working_dir": _resolve_working_dir(cfg["default_working_dir"]),
                 "last_chat_id": "",
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
+                "perm_timeout_count": 0,  # 当前任务中权限确认超时次数
             }
         return self.user_states[user_id]
 
@@ -393,6 +393,7 @@ class ClaudeCodePlugin(Plugin):
                 port=port,
                 timeout=timeout,
                 on_permission_request=self._on_permission_request,
+                on_permission_timeout=self._on_permission_timeout,
             )
             try:
                 perm_server.start()
@@ -423,32 +424,43 @@ class ClaudeCodePlugin(Plugin):
         return os.path.expanduser("~")
 
     def _write_port_file(self, port: int) -> None:
-        """将端口号写入项目数据目录下的 .feishu_perm_port，供 Hook 脚本读取"""
+        """将端口号和超时值写入项目数据目录，供 Hook 脚本读取
+
+        写入两个文件：
+        - .feishu_perm_port: 权限服务器端口号
+        - .feishu_perm_timeout: 权限确认超时秒数（hook 用于设置 curl --max-time）
+        """
         port_file = _CC_DATA_DIR / ".feishu_perm_port"
+        timeout_file = _CC_DATA_DIR / ".feishu_perm_timeout"
         try:
             port_file.parent.mkdir(parents=True, exist_ok=True)
             port_file.write_text(str(port))
-            # 如果以 root 运行且有 run_as_user，修正文件归属让 hook 脚本可读
+            # 写入超时值，hook 脚本据此设置 curl --max-time
             cfg = self._load_plugin_config()
+            timeout_file.write_text(str(cfg["permission_timeout"]))
+            # 如果以 root 运行且有 run_as_user，修正文件归属让 hook 脚本可读
             run_as_user = cfg.get("run_as_user", "")
             if run_as_user and os.getuid() == 0:
                 try:
                     pw = pwd.getpwnam(run_as_user)
                     os.chown(port_file, pw.pw_uid, pw.pw_gid)
+                    os.chown(timeout_file, pw.pw_uid, pw.pw_gid)
                 except (KeyError, OSError) as e:
-                    logger.warning("[CC] 修正端口文件归属失败: %s", e)
+                    logger.warning("[CC] 修正端口/超时文件归属失败: %s", e)
             logger.info("[CC] 端口文件已写入: %s", port_file)
         except OSError as e:
             logger.error("[CC] 写入端口文件失败: %s", e)
 
     def _delete_port_file(self) -> None:
-        """删除端口文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
+        """删除端口文件和超时文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
         port_file = _CC_DATA_DIR / ".feishu_perm_port"
+        timeout_file = _CC_DATA_DIR / ".feishu_perm_timeout"
         try:
             port_file.unlink(missing_ok=True)
-            logger.info("[CC] 端口文件已删除: %s", port_file)
+            timeout_file.unlink(missing_ok=True)
+            logger.info("[CC] 端口/超时文件已删除: %s", port_file)
         except OSError as e:
-            logger.warning("[CC] 删除端口文件失败: %s", e)
+            logger.warning("[CC] 删除端口/超时文件失败: %s", e)
 
     def _setup_hook(self) -> None:
         """自动注册 PreToolUse Hook 到 Claude 用户设置
@@ -599,6 +611,22 @@ class ClaudeCodePlugin(Plugin):
         except Exception as e:
             logger.error("[CC] 发送权限确认卡片失败: %s", e, exc_info=True)
             raise
+
+    def _on_permission_timeout(
+        self,
+        user_id: str,
+        chat_id: str,
+        request_id: str,
+        tool_name: str,
+        timeout: int,
+    ) -> None:
+        """权限确认超时回调：记录超时事件到用户状态，供任务结束时在卡片中提示"""
+        state = self._get_state(user_id)
+        state["perm_timeout_count"] = state.get("perm_timeout_count", 0) + 1
+        logger.warning(
+            "[CC] 权限确认超时: user=%s, tool=%s, request=%s, timeout=%ds",
+            user_id, tool_name, request_id[:8], timeout,
+        )
 
     @staticmethod
     def _is_within_working_dir(file_path: str, working_dir: str) -> bool:
@@ -1058,6 +1086,15 @@ class ClaudeCodePlugin(Plugin):
             if cost_info:
                 card_text += f"\n\n---\n{cost_info}"
 
+            # 如果本次任务中发生过权限确认超时，追加警告
+            timeout_count = state.get("perm_timeout_count", 0)
+            if timeout_count > 0:
+                perm_timeout = self._load_plugin_config()["permission_timeout"]
+                card_text += (
+                    f"\n\n---\n⚠️ 本次任务中有 {timeout_count} 次权限确认超时"
+                    f"（{perm_timeout}s），操作已自动拒绝"
+                )
+
             if message_id:
                 self._patch_card(message_id, card_text, running=False)
 
@@ -1516,6 +1553,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 11. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
+        state["perm_timeout_count"] = 0
         state["last_chat_id"] = chat_id
         logger.info(
             "[CC] 开始执行 prompt: user=%s, session=%s, prompt长度=%d",

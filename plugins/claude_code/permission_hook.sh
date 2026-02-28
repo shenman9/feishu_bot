@@ -10,6 +10,7 @@
 #   2 = 拒绝工具调用（stderr 内容反馈给 Claude）
 #
 # 端口号从 <项目根目录>/data/claude_code/.feishu_perm_port 文件读取。
+# 超时值从 <项目根目录>/data/claude_code/.feishu_perm_timeout 文件读取。
 # 如果端口文件不存在（飞书 Bot 未运行），直接允许（exit 0）。
 # 执行过程记录到 <项目根目录>/data/claude_code/feishu_hook.log，方便调试。
 
@@ -52,6 +53,17 @@ fi
 PORT=$(cat "$PORT_FILE")
 _log "端口文件读取成功: port=${PORT}"
 
+# 读取超时值：由插件写入，与 permission_timeout 配置保持一致
+# curl --max-time 需设置为 超时值+10 秒，留余量给服务器返回响应
+TIMEOUT_FILE="${PROJ_ROOT}/data/claude_code/.feishu_perm_timeout"
+if [ -f "$TIMEOUT_FILE" ]; then
+    PERM_TIMEOUT=$(cat "$TIMEOUT_FILE")
+else
+    PERM_TIMEOUT=120  # 默认值与 config.yaml.example 一致
+fi
+CURL_MAX_TIME=$((PERM_TIMEOUT + 10))
+_log "超时配置: perm_timeout=${PERM_TIMEOUT}s, curl_max_time=${CURL_MAX_TIME}s"
+
 # curl 错误日志文件（超过 100KB 时自动截断，避免无限增长）
 CURL_ERR_FILE="${PROJ_ROOT}/data/claude_code/feishu_hook_curl_err.log"
 if [ -f "$CURL_ERR_FILE" ] && [ "$(stat -c%s "$CURL_ERR_FILE" 2>/dev/null || echo 0)" -gt 102400 ]; then
@@ -61,7 +73,7 @@ fi
 # 转发请求到权限确认服务器（阻塞等待响应）
 _log "发送请求到权限服务器 http://127.0.0.1:${PORT}/permission-request ..."
 CURL_EXIT=0
-RESPONSE=$(echo "$INPUT" | curl -sS --max-time 180 \
+RESPONSE=$(echo "$INPUT" | curl -sS --max-time "$CURL_MAX_TIME" \
     -X POST \
     -H "Content-Type: application/json" \
     -d @- \
@@ -72,9 +84,16 @@ if [ $CURL_EXIT -ne 0 ]; then
     _log "curl 失败: exit=${CURL_EXIT}, err=${CURL_ERR}"
 fi
 
-# curl 失败或空响应：服务器未运行（飞书 Bot 未启动或权限服务懒初始化尚未完成），直接放行
+# curl 失败处理：区分超时（服务器可达但等待过久）与连接失败（服务器未运行）
 if [ -z "$RESPONSE" ]; then
-    _log "响应为空（权限服务器未运行），直接放行"
+    if [ $CURL_EXIT -eq 28 ]; then
+        # exit 28 = 超时：服务器可达但在超时时间内未响应，拒绝操作以保证安全
+        _log "curl 超时 (exit=28)，权限确认等待超时，拒绝操作"
+        echo "权限确认等待超时（${PERM_TIMEOUT}s），操作已拒绝" >&2
+        exit 2
+    fi
+    # 其他失败（连接拒绝等）：服务器未运行，降级为自动放行
+    _log "响应为空（权限服务器未运行，exit=${CURL_EXIT}），直接放行"
     exit 0
 fi
 

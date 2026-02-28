@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -131,6 +131,18 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
                 "[权限服务器] 等待结束: request_id=%s, decision=timeout, 耗时=%.1fs",
                 request_id[:8], elapsed,
             )
+            # 通知插件发生了权限超时
+            if perm_server._on_permission_timeout:
+                try:
+                    perm_server._on_permission_timeout(
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        request_id=request_id,
+                        tool_name=tool_name,
+                        timeout=timeout,
+                    )
+                except Exception:
+                    logger.debug("[权限服务器] 超时回调执行失败", exc_info=True)
             self._respond_json(
                 200, _make_hook_response("deny", f"用户未在 {timeout}s 内响应，自动拒绝")
             )
@@ -159,8 +171,15 @@ class _PermissionRequestHandler(BaseHTTPRequestHandler):
         logger.debug("[权限服务器 HTTP] %s", format % args)
 
 
-class PermissionHTTPServer(HTTPServer):
-    """扩展 HTTPServer，持有 PermissionServer 引用"""
+class PermissionHTTPServer(ThreadingHTTPServer):
+    """多线程 HTTP 服务器，每个请求在独立线程处理
+
+    继承 ThreadingHTTPServer 确保一个请求的 event.wait() 阻塞不影响
+    后续请求的接入。HTTPServer（单线程）下，首个未响应的请求会阻塞
+    整个服务器，导致后续所有权限请求因连接超时被 hook 脚本绕过。
+    """
+
+    daemon_threads = True  # handler 线程随主线程退出
 
     def __init__(self, server_address, handler_class, perm_server: "PermissionServer"):
         self.perm_server = perm_server
@@ -177,6 +196,8 @@ class PermissionServer:
         timeout: 用户响应超时（秒）
         on_permission_request: 回调函数，签名:
             (user_id, chat_id, request_id, tool_name, tool_input) -> None
+        on_permission_timeout: 超时回调函数（可选），签名:
+            (user_id, chat_id, request_id, tool_name, timeout) -> None
     """
 
     def __init__(
@@ -184,10 +205,12 @@ class PermissionServer:
         port: int,
         timeout: int,
         on_permission_request: Callable,
+        on_permission_timeout: Optional[Callable] = None,
     ):
         self._port = port
         self._timeout = timeout
         self._on_permission_request = on_permission_request
+        self._on_permission_timeout = on_permission_timeout
 
         # session_id -> (user_id, chat_id)
         self._session_map: dict[str, tuple[str, str]] = {}
@@ -231,9 +254,24 @@ class PermissionServer:
         )
 
     def unregister_session(self, session_id: str) -> None:
-        """移除 session 映射"""
+        """移除 session 映射，并自动拒绝该会话所有未决请求
+
+        任务结束时调用。未决请求可能因 hook 端 curl 提前超时（放行/拒绝后
+        Claude Code 继续执行）而成为孤儿，若不清理会在服务器超时后触发迟到
+        的回调，干扰后续任务的 perm_timeout_count 统计。
+        """
         self._session_map.pop(session_id, None)
-        logger.debug("[权限服务器] 移除会话: session=%s", session_id[:8])
+        # 清理该会话所有未决请求：设置 deny 决策并唤醒阻塞的 handler 线程
+        orphaned = [
+            (rid, pending)
+            for rid, pending in self._pending_requests.items()
+            if pending.get("session_id") == session_id
+        ]
+        for rid, pending in orphaned:
+            pending["decision"] = "deny"
+            pending["event"].set()
+            logger.debug("[权限服务器] 清理遗留请求: request=%s, session=%s", rid[:8], session_id[:8])
+        logger.debug("[权限服务器] 移除会话: session=%s, 清理遗留请求=%d", session_id[:8], len(orphaned))
 
     def get_session_user(self, session_id: str) -> Optional[tuple[str, str]]:
         """查询 session 对应的 (user_id, chat_id)"""

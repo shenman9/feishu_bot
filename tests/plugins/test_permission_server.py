@@ -312,7 +312,7 @@ class TestPermissionCard:
         assert "example.com" in content
 
     def test_card_has_allow_deny_buttons(self):
-        """卡片包含允许和拒绝按钮"""
+        """卡片包含允许、拒绝和全部放行按钮"""
         card_json = ClaudeCodePlugin._build_permission_card(
             "req-5", "Bash", {"command": "ls"}
         )
@@ -320,7 +320,7 @@ class TestPermissionCard:
         actions = [e for e in card["elements"] if e.get("tag") == "action"]
         assert len(actions) == 1
         buttons = actions[0]["actions"]
-        assert len(buttons) == 2
+        assert len(buttons) == 3
 
         allow_btn = buttons[0]
         assert allow_btn["value"]["action"] == "perm_allow"
@@ -329,6 +329,10 @@ class TestPermissionCard:
         deny_btn = buttons[1]
         assert deny_btn["value"]["action"] == "perm_deny"
         assert deny_btn["value"]["request_id"] == "req-5"
+
+        bypass_btn = buttons[2]
+        assert bypass_btn["value"]["action"] == "perm_bypass"
+        assert bypass_btn["value"]["request_id"] == "req-5"
 
     def test_handled_card(self):
         """已处理卡片为灰色模板"""
@@ -354,7 +358,7 @@ class TestPluginPermissionIntegration:
             "default_working_dir": "",
             "timeout": _DEFAULT_TIMEOUT,
             "max_output_chars": _DEFAULT_MAX_OUTPUT,
-            "permission_mode": "default",
+            "default_perm_mode": "interactive",
             "max_turns": _DEFAULT_MAX_TURNS,
             "run_as_user": "",
             "permission_server_port": _DEFAULT_PERM_PORT,
@@ -372,7 +376,7 @@ class TestPluginPermissionIntegration:
             "default_working_dir": "",
             "timeout": _DEFAULT_TIMEOUT,
             "max_output_chars": _DEFAULT_MAX_OUTPUT,
-            "permission_mode": "bypassPermissions",
+            "default_perm_mode": "bypass",
             "max_turns": _DEFAULT_MAX_TURNS,
             "run_as_user": "",
             "permission_server_port": _DEFAULT_PERM_PORT,
@@ -441,7 +445,7 @@ class TestPluginPermissionIntegration:
         """会话免确认模式下权限请求自动放行，不发飞书卡片"""
         plugin._perm_server = MagicMock()
         plugin.handle_message("u1", "c1", "CC")
-        plugin._get_state("u1")["bypass_permission"] = True
+        plugin._get_state("u1")["session_perm_mode"] = "bypass"
 
         plugin._on_permission_request(
             user_id="u1",
@@ -459,7 +463,7 @@ class TestPluginPermissionIntegration:
         """交互确认模式下权限请求发送飞书卡片"""
         plugin._perm_server = MagicMock()
         plugin.handle_message("u1", "c1", "CC")
-        assert plugin._get_state("u1").get("bypass_permission", False) is False
+        assert plugin._get_state("u1").get("session_perm_mode") == "interactive"
 
         plugin._on_permission_request(
             user_id="u1",
