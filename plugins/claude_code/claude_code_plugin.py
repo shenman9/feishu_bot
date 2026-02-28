@@ -45,6 +45,9 @@ _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
 _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
+_SESSION_INITIAL_COUNT = 5      # /session 初始显示会话数
+_SESSION_PAGE_SIZE = 10         # "显示更多" 每次增加的会话数
+_BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
 _PLUGIN_DIR = pathlib.Path(__file__).parent      # plugins/claude_code/
@@ -271,7 +274,7 @@ class ClaudeCodePlugin(Plugin):
         self, user_id: str, session_id: str, working_dir: str, title: str
     ) -> None:
         """新增或更新一条历史会话记录，按最近活跃时间倒序保留最多 _MAX_SESSIONS_PER_USER 条"""
-        now = datetime.datetime.now().isoformat(timespec="seconds")
+        now = datetime.datetime.utcnow().isoformat(timespec="seconds")
         path = self._sessions_file_path()
 
         with self._sessions_lock:
@@ -311,8 +314,19 @@ class ClaudeCodePlugin(Plugin):
                 logger.error("[CC] 写入历史会话文件失败: %s", e)
 
     @staticmethod
-    def _build_sessions_card(sessions: list[dict], current_session_id: str) -> str:
-        """构造历史会话选择卡片"""
+    def _build_sessions_card(
+        sessions: list[dict],
+        current_session_id: str,
+        show_count: int = _SESSION_INITIAL_COUNT,
+    ) -> dict:
+        """构造历史会话选择卡片
+
+        Args:
+            sessions: 全部会话列表（已按 last_activity 倒序）
+            current_session_id: 当前会话 ID，用于高亮标记
+            show_count: 本次显示的会话数量
+        """
+        visible = sessions[:show_count]
         elements: list[dict] = [
             {
                 "tag": "markdown",
@@ -320,16 +334,17 @@ class ClaudeCodePlugin(Plugin):
             },
             {"tag": "hr"},
         ]
-        for session in sessions:
+        for session in visible:
             sid = session["session_id"]
             short_id = sid[:8]
             working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
             title = session.get("title", "（无标题）")
             last_activity = session.get("last_activity", "")
-            # 格式化时间（去掉秒）
+            # 格式化时间（UTC → 北京时间 UTC+8，去掉秒）
             try:
                 dt = datetime.datetime.fromisoformat(last_activity)
-                time_str = dt.strftime("%m-%d %H:%M")
+                dt_beijing = dt + _BEIJING_TZ.utcoffset(None)
+                time_str = dt_beijing.strftime("%m-%d %H:%M")
             except Exception:
                 time_str = last_activity[:16]
 
@@ -355,7 +370,25 @@ class ClaudeCodePlugin(Plugin):
             })
             elements.append({"tag": "hr"})
 
-        card = {
+        # 还有更多会话时，添加"显示更多"按钮
+        remaining = len(sessions) - show_count
+        if remaining > 0:
+            next_count = show_count + _SESSION_PAGE_SIZE
+            elements.append({
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": f"显示更多（还有 {remaining} 个）"},
+                    "type": "default",
+                    "value": {
+                        "action": "show_more_sessions",
+                        "plugin": PLUGIN_KEYWORD,
+                        "show_count": next_count,
+                    },
+                }],
+            })
+
+        return {
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": "Claude Code 历史会话"},
@@ -363,7 +396,6 @@ class ClaudeCodePlugin(Plugin):
             },
             "elements": elements,
         }
-        return json.dumps(card)
 
     # ---- 权限确认服务器 ----
 
@@ -1771,8 +1803,8 @@ class ClaudeCodePlugin(Plugin):
                     "暂无历史会话记录。完成第一次任务后将自动记录，可在此查看并恢复。",
                 )
                 return
-            card = self._build_sessions_card(sessions[:10], state["session_id"])
-            self.bot.send_message(chat_id, "interactive", card)
+            card = self._build_sessions_card(sessions, state["session_id"])
+            self.bot.send_message(chat_id, "interactive", json.dumps(card))
             return
 
         # 6. 特殊指令：切换目录（不带路径则重置为默认）
@@ -2045,6 +2077,15 @@ class ClaudeCodePlugin(Plugin):
             return self._handle_ask_user_response(
                 user_id, request_id, question_index, custom_answer,
             )
+
+        if action == "show_more_sessions":
+            state = self._get_state(user_id)
+            sessions = self._load_user_sessions(user_id)
+            if not sessions:
+                return self.bot.make_card_response(toast="暂无历史会话记录")
+            next_count = action_value.get("show_count", _SESSION_INITIAL_COUNT + _SESSION_PAGE_SIZE)
+            card = self._build_sessions_card(sessions, state["session_id"], show_count=next_count)
+            return self.bot.make_card_response(card=card)
 
         if action == "resume_session":
             state = self._get_state(user_id)
