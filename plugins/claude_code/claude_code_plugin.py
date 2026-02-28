@@ -1064,14 +1064,22 @@ class ClaudeCodePlugin(Plugin):
         cmd.extend(["--max-turns", str(max_turns)])
         return cmd
 
-    def _kill_process(self, user_id: str) -> None:
-        """安全终止用户的运行中进程"""
+    def _kill_process(self, user_id: str, wait: bool = True) -> None:
+        """安全终止用户的运行中进程
+
+        Args:
+            user_id: 用户 ID
+            wait: 是否等待进程退出。在飞书卡片回调中应设为 False，
+                  避免阻塞导致回调超时（飞书要求 3s 内响应）。
+                  后台线程会自行处理进程退出和资源清理。
+        """
         proc = self._running_processes.pop(user_id, None)
         if proc and proc.poll() is None:
-            logger.info("[CC] 终止进程: user=%s, pid=%d", user_id, proc.pid)
+            logger.info("[CC] 终止进程: user=%s, pid=%d, wait=%s", user_id, proc.pid, wait)
             try:
                 proc.terminate()
-                proc.wait(timeout=5)
+                if wait:
+                    proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
             except Exception as e:
@@ -1381,7 +1389,8 @@ class ClaudeCodePlugin(Plugin):
                 )
 
             if message_id:
-                self._patch_card(message_id, card_text, running=False)
+                cancelled = state.get("cancelled", False)
+                self._patch_card(message_id, card_text, running=False, cancelled=cancelled)
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI 未安装或路径错误，请检查配置。"
@@ -1642,7 +1651,7 @@ class ClaudeCodePlugin(Plugin):
     # ---- 飞书卡片 ----
 
     @staticmethod
-    def _build_card(text: str, running: bool = False, elapsed: int = 0) -> str:
+    def _build_card(text: str, running: bool = False, elapsed: int = 0, cancelled: bool = False) -> str:
         """构造飞书卡片 JSON"""
         if running:
             template = "turquoise"
@@ -1650,6 +1659,9 @@ class ClaudeCodePlugin(Plugin):
                 header_content = f"Claude Code (执行中...已用时 {elapsed}s)"
             else:
                 header_content = "Claude Code (执行中...)"
+        elif cancelled:
+            template = "grey"
+            header_content = "Claude Code（已停止）"
         else:
             template = "blue"
             header_content = "Claude Code"
@@ -1680,9 +1692,10 @@ class ClaudeCodePlugin(Plugin):
 
         return json.dumps(card)
 
-    def _patch_card(self, message_id: str, text: str, running: bool = True, elapsed: int = 0) -> None:
+    def _patch_card(self, message_id: str, text: str, running: bool = True,
+                    elapsed: int = 0, cancelled: bool = False) -> None:
         """更新飞书卡片消息"""
-        content = self._build_card(text, running=running, elapsed=elapsed)
+        content = self._build_card(text, running=running, elapsed=elapsed, cancelled=cancelled)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
             debug_log = _CC_DATA_DIR / "cc_card_debug.log"
@@ -1734,6 +1747,11 @@ class ClaudeCodePlugin(Plugin):
                 logger.info("[CC] 用户取消任务: user=%s", user_id)
                 self._kill_process(user_id)
                 state["running"] = False
+                state["cancelled"] = True
+                # 立即更新执行卡片，移除取消按钮
+                mid = state.get("current_message_id")
+                if mid:
+                    self._patch_card(mid, "**已取消执行**", cancelled=True)
                 self.bot.reply(chat_id, "已取消当前任务。")
             else:
                 self.bot.reply(chat_id, "当前没有运行中的任务。")
@@ -1846,6 +1864,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 11. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
+        state["cancelled"] = False
         state["perm_timeout_count"] = 0
         state["last_chat_id"] = chat_id
         logger.info(
@@ -1859,6 +1878,7 @@ class ClaudeCodePlugin(Plugin):
         # 发送占位卡片
         placeholder = self._build_card("正在启动 Claude Code...", running=True)
         message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
+        state["current_message_id"] = message_id
 
         # 启动后台线程
         t = threading.Thread(
@@ -1909,9 +1929,13 @@ class ClaudeCodePlugin(Plugin):
             state = self._get_state(user_id)
             if state.get("running"):
                 logger.info("[CC] 卡片取消按钮点击: user=%s", user_id)
-                self._kill_process(user_id)
+                # wait=False: 不等待进程退出，避免阻塞飞书卡片回调超时
+                self._kill_process(user_id, wait=False)
                 state["running"] = False
-                return self.bot.make_card_response(toast="已取消执行")
+                state["cancelled"] = True
+                # 立即返回更新后的卡片，移除取消按钮并更新标题
+                cancel_card = json.loads(self._build_card("**已取消执行**", cancelled=True))
+                return self.bot.make_card_response(card=cancel_card, toast="已取消执行")
             return self.bot.make_card_response(toast="当前没有运行中的任务")
 
         if action in ("perm_allow", "perm_deny"):
