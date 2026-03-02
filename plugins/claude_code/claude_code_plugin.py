@@ -114,8 +114,12 @@ class ClaudeCodePlugin(Plugin):
         {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
         {"usage": "/cd <路径>",    "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
         {"usage": "/cd",        "brief": None,                          "detail": "重置工作目录为默认并重置会话"},
+        {"usage": "/compact",   "brief": "压缩上下文",                   "detail": "压缩当前会话上下文（释放 token 空间）"},
         {"usage": "/help",      "brief": "查看帮助信息",                 "detail": "显示此帮助信息"},
     ]
+
+    # 透传指令：不在插件层拦截，直接作为 prompt 发送给 Claude Code
+    _PASSTHROUGH_COMMANDS: set[str] = {"/compact"}
 
     def __init__(self):
         super().__init__()
@@ -1509,6 +1513,12 @@ class ClaudeCodePlugin(Plugin):
             content_blocks = message.get("content", [])
             text_parts = []
             for block in content_blocks:
+                if isinstance(block, str):
+                    # /compact 等特殊指令的输出可能以纯字符串形式返回
+                    text_parts.append(block)
+                    continue
+                if not isinstance(block, dict):
+                    continue
                 btype = block.get("type", "")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
@@ -1529,6 +1539,8 @@ class ClaudeCodePlugin(Plugin):
             message = data.get("message", {})
             content_blocks = message.get("content", [])
             for block in content_blocks:
+                if not isinstance(block, dict):
+                    continue
                 if block.get("type") == "tool_result":
                     tool_use_id = block.get("tool_use_id", "")
                     is_error = bool(block.get("is_error", False))
@@ -1549,6 +1561,14 @@ class ClaudeCodePlugin(Plugin):
                         "is_error": is_error,
                         "summary": summary,
                     })
+
+        elif event_type == "system":
+            # system 事件：处理 compact 等子类型
+            subtype = data.get("subtype", "")
+            if subtype == "compact_boundary":
+                meta = data.get("compact_metadata", {})
+                pre = meta.get("pre_tokens", 0)
+                text_chunk = f"上下文已压缩（压缩前 {pre:,} tokens）" if pre else "上下文已压缩"
 
         elif event_type == "result":
             # result 事件：提取统计信息
@@ -1875,8 +1895,8 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, help_text)
             return
 
-        # 9. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令）
-        if text.startswith("/"):
+        # 9. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令；透传指令除外）
+        if text.startswith("/") and text.split()[0] not in self._PASSTHROUGH_COMMANDS:
             input_cmd = text.split()[0]
             # 从指令定义表中提取纯指令名（去掉参数部分，如 "/cd <路径>" → "/cd"）
             known_cmds = list({cmd["usage"].split()[0] for cmd in self._SPECIAL_COMMANDS})
