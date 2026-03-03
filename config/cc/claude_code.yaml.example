@@ -1,0 +1,26 @@
+# Claude Code 专属机器人插件配置（cc_agent 独立实例）
+# 注意：此文件配置的是 CC 专属机器人，通过 run_cc.sh 启动
+# Hub 机器人使用 config/claude_code.yaml，端口为 9877，与此文件互不干扰
+claude_path: "/usr/bin/claude"        # Claude Code CLI 路径
+default_working_dir: ""               # 默认工作目录（空=机器人进程当前目录）
+timeout: 600                          # 单次执行超时（秒）
+max_output_chars: 28000               # 飞书卡片最大字符数（安全上限）
+default_perm_mode: "interactive"      # 新会话默认权限模式，可选值：
+                                      #   interactive   - 所有操作通过飞书卡片确认（默认）
+                                      #   accept_edits  - 工作目录内文件修改自动放行，其余仍需确认
+                                      #   bypass        - 所有操作自动放行（危险，慎用）
+                                      #   manual_select - 新会话创建后弹出权限选择卡片，由用户手动选择
+max_turns: 50                         # Claude Code 最大轮次
+run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
+permission_server_port: 9876          # 权限确认 HTTP 服务器端口（hub_agent 用 9877，避免冲突）
+permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝
+
+# 模型选择配置
+# models:
+#   - alias: "sonnet"
+#     label: "Sonnet"
+#     desc: "速度与质量均衡，适合日常开发任务"
+#   - alias: "opus"
+#     label: "Opus"
+#     desc: "最强推理能力，适合复杂架构和疑难问题"
+# default_model: ""
