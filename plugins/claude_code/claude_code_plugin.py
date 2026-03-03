@@ -47,6 +47,13 @@ _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
 _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
 _SESSION_INITIAL_COUNT = 5      # /session 初始显示会话数
 _SESSION_PAGE_SIZE = 10         # "显示更多" 每次增加的会话数
+
+# /model 默认可选模型列表（配置文件未指定时使用）
+_DEFAULT_MODELS: list[dict] = [
+    {"alias": "sonnet", "label": "Sonnet", "desc": "速度与质量均衡，适合日常开发任务"},
+    {"alias": "opus", "label": "Opus", "desc": "最强推理能力，适合复杂架构和疑难问题"},
+    {"alias": "haiku", "label": "Haiku", "desc": "最快响应速度，适合简单问答和快速任务"},
+]
 _BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
@@ -115,6 +122,7 @@ class ClaudeCodePlugin(Plugin):
         {"usage": "/cd <路径>",    "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
         {"usage": "/cd",        "brief": None,                          "detail": "重置工作目录为默认并重置会话"},
         {"usage": "/compact",   "brief": "压缩上下文",                   "detail": "压缩当前会话上下文（释放 token 空间）"},
+        {"usage": "/model",     "brief": "切换模型",                     "detail": "弹出模型选择卡片，切换当前会话使用的 Claude 模型"},
         {"usage": "/help",      "brief": "查看帮助信息",                 "detail": "显示此帮助信息"},
     ]
 
@@ -186,6 +194,8 @@ class ClaudeCodePlugin(Plugin):
                 "run_as_user": cc.get("run_as_user", ""),
                 "permission_server_port": cc.get("permission_server_port", _DEFAULT_PERM_PORT),
                 "permission_timeout": cc.get("permission_timeout", _DEFAULT_PERM_TIMEOUT),
+                "models": cc.get("models", _DEFAULT_MODELS),
+                "default_model": cc.get("default_model", ""),
             }
         return self._config
 
@@ -206,6 +216,7 @@ class ClaudeCodePlugin(Plugin):
                 "working_dir": _resolve_working_dir(cfg["default_working_dir"]),
                 "last_chat_id": "",
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
+                "session_model": cfg["default_model"],  # 会话级模型: "" 表示 CLI 默认
                 "perm_timeout_count": 0,  # 当前任务中权限确认超时次数
             }
         return self.user_states[user_id]
@@ -229,6 +240,7 @@ class ClaudeCodePlugin(Plugin):
         default_perm = self._load_plugin_config()["default_perm_mode"]
         # manual_select 模式：暂用 interactive 作为安全默认，后续弹卡片由用户选择
         state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
+        state["session_model"] = self._load_plugin_config()["default_model"]
         return state["session_id"]
 
     def _send_perm_select_card_if_manual(self, chat_id: str, user_id: str) -> None:
@@ -250,12 +262,22 @@ class ClaudeCodePlugin(Plugin):
             working_dir_display = _display_path(working_dir)
         status = "运行中" if state["running"] else "空闲"
         perm_mode = state.get("session_perm_mode", "interactive")
+        model_alias = state.get("session_model", "")
+        model_display = self._get_model_label(model_alias) if model_alias else "CLI 默认"
         return (
             f"会话: {state['session_id'][:8]}...\n"
             f"工作目录: {working_dir_display}\n"
             f"状态: {status}\n"
-            f"权限模式: {perm_mode}"
+            f"权限模式: {perm_mode}\n"
+            f"模型: {model_display}"
         )
+
+    def _get_model_label(self, alias: str) -> str:
+        """根据模型 alias 获取展示用 label，未找到则返回 alias 原值"""
+        for m in self._load_plugin_config().get("models", []):
+            if m.get("alias") == alias:
+                return m.get("label", alias)
+        return alias
 
     # ---- 历史会话持久化 ----
 
@@ -759,6 +781,55 @@ class ClaudeCodePlugin(Plugin):
         }
         return json.dumps(card)
 
+    def _build_model_select_card(self, current_model: str) -> str:
+        """构造模型选择卡片，高亮当前模型
+
+        Args:
+            current_model: 当前会话模型的 alias，空字符串表示 CLI 默认
+        """
+        models_cfg = self._load_plugin_config()["models"]
+        # "CLI 默认" 始终作为第一个选项
+        options = [{"alias": "", "label": "CLI 默认", "desc": "不指定模型，由 Claude Code CLI 自行决定"}]
+        for m in models_cfg:
+            options.append({
+                "alias": m.get("alias", ""),
+                "label": m.get("label", m.get("alias", "未知")),
+                "desc": m.get("desc", ""),
+            })
+        # 查找当前模型的展示信息
+        current_label = "CLI 默认"
+        current_desc = options[0]["desc"]
+        for opt in options:
+            if opt["alias"] == current_model:
+                current_label = opt["label"]
+                current_desc = opt["desc"]
+                break
+        buttons = []
+        for opt in options:
+            is_current = opt["alias"] == current_model
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": f"{'✓ ' if is_current else ''}{opt['label']}"},
+                "type": "primary" if is_current else "default",
+                "value": {"action": "set_model", "plugin": PLUGIN_KEYWORD, "model": opt["alias"]},
+            })
+        elements = [
+            {"tag": "markdown", "content": f"当前模型：**{current_label}**\n{current_desc}"},
+            {"tag": "hr"},
+        ]
+        for opt in options:
+            elements.append({"tag": "markdown", "content": f"**{opt['label']}**\n{opt['desc']}"})
+        elements.append({"tag": "action", "actions": buttons})
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "Claude Code 模型选择"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+        return json.dumps(card)
+
     @staticmethod
     def _build_permission_card(
         request_id: str, tool_name: str, tool_input: dict,
@@ -1072,7 +1143,8 @@ class ClaudeCodePlugin(Plugin):
     # ---- 子进程管理 ----
 
     def _build_command(
-        self, prompt: str, session_id: str, *, resume: bool = False
+        self, prompt: str, session_id: str, *,
+        resume: bool = False, model: str = ""
     ) -> list[str]:
         """构造 Claude Code CLI 命令行参数
 
@@ -1080,6 +1152,7 @@ class ClaudeCodePlugin(Plugin):
             prompt: 用户提示词
             session_id: 会话 ID
             resume: 是否为恢复已有会话（第二次及后续调用）
+            model: 模型别名或完整名，空字符串表示不指定（使用 CLI 默认）
         """
         cfg = self._load_plugin_config()
         cmd = [
@@ -1098,6 +1171,8 @@ class ClaudeCodePlugin(Plugin):
         cmd.extend(["--permission-mode", "bypassPermissions"])
         max_turns = cfg.get("max_turns", _DEFAULT_MAX_TURNS)
         cmd.extend(["--max-turns", str(max_turns)])
+        if model:
+            cmd.extend(["--model", model])
         return cmd
 
     def _kill_process(self, user_id: str, wait: bool = True) -> None:
@@ -1182,6 +1257,7 @@ class ClaudeCodePlugin(Plugin):
             cmd = self._build_command(
                 prompt, state["session_id"],
                 resume=state.get("session_started", False),
+                model=state.get("session_model", ""),
             )
             cwd = state["working_dir"]  # 始终为有效绝对路径
 
@@ -1872,7 +1948,16 @@ class ClaudeCodePlugin(Plugin):
             self.bot.send_message(chat_id, "interactive", card)
             return
 
-        # 8. 特殊指令：帮助
+        # 8. 特殊指令：切换模型（弹出选择卡片）
+        if text == "/model":
+            if state["running"]:
+                self.bot.reply(chat_id, "任务运行中，请等待完成后再切换模型。")
+                return
+            card = self._build_model_select_card(state.get("session_model", ""))
+            self.bot.send_message(chat_id, "interactive", card)
+            return
+
+        # 9. 特殊指令：帮助
         if text == "/help":
             help_text = (
                 "**CC 插件使用帮助**\n\n"
@@ -1889,13 +1974,16 @@ class ClaudeCodePlugin(Plugin):
                 "• `interactive` — 所有操作均需确认（默认）\n"
                 "• `accept_edits` — 工作目录内文件修改自动放行，其余仍需确认\n"
                 "• `bypass` — 所有操作自动放行（危险，慎用）\n\n"
+                "**模型选择**（发送 `/model` 可切换）\n"
+                "• 默认使用 CLI 自带模型，无需手动选择\n"
+                "• 切换模型仅影响当前会话，新会话恢复默认\n\n"
                 "**退出插件**\n"
                 "发送「退出」或「返回」可退出 CC 插件，回到主菜单。"
             )
             self.bot.reply(chat_id, help_text)
             return
 
-        # 9. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令；透传指令除外）
+        # 10. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令；透传指令除外）
         if text.startswith("/") and text.split()[0] not in self._PASSTHROUGH_COMMANDS:
             input_cmd = text.split()[0]
             # 从指令定义表中提取纯指令名（去掉参数部分，如 "/cd <路径>" → "/cd"）
@@ -1905,7 +1993,7 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, f"未知指令 `{input_cmd}`，发送 `/help` 查看所有可用指令。{hint}")
             return
 
-        # 10. 并发控制：运行中拒绝新任务
+        # 11. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
@@ -1914,7 +2002,7 @@ class ClaudeCodePlugin(Plugin):
             )
             return
 
-        # 11. 正常执行：发送 prompt 到 Claude Code
+        # 12. 正常执行：发送 prompt 到 Claude Code
         state["running"] = True
         state["cancelled"] = False
         state["perm_timeout_count"] = 0
@@ -2028,6 +2116,24 @@ class ClaudeCodePlugin(Plugin):
                 toast=f"已切换为{mode_cn}模式",
             )
 
+        if action == "set_model":
+            model_alias = action_value.get("model", "")
+            # 验证合法性：空字符串（CLI 默认）始终合法；非空须在配置列表中
+            valid_aliases = {""} | {m.get("alias", "") for m in self._load_plugin_config()["models"]}
+            if model_alias not in valid_aliases:
+                return self.bot.make_card_response(toast="无效的模型选择")
+            state = self._get_state(user_id)
+            if state["running"]:
+                return self.bot.make_card_response(toast="任务运行中，无法切换模型")
+            state["session_model"] = model_alias
+            display = self._get_model_label(model_alias) if model_alias else "CLI 默认"
+            logger.info("[CC] 用户切换模型: user=%s, model=%s", user_id, model_alias or "(default)")
+            updated_card = self._build_model_select_card(model_alias)
+            return self.bot.make_card_response(
+                card=json.loads(updated_card),
+                toast=f"已切换为 {display}",
+            )
+
         if action == "perm_accept_edits":
             request_id = action_value.get("request_id", "")
 
@@ -2131,6 +2237,7 @@ class ClaudeCodePlugin(Plugin):
             state["running"] = False
             default_perm = self._load_plugin_config()["default_perm_mode"]
             state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
+            state["session_model"] = self._load_plugin_config()["default_model"]
             logger.info(
                 "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s",
                 user_id, target_sid[:8], target_dir,

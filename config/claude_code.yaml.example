@@ -14,6 +14,20 @@ run_as_user: ""                       # 以指定用户身份运行（机器人�
 permission_server_port: 9876          # 权限确认 HTTP 服务器端口
 permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝
 
+# 模型选择配置
+# models:                                # 可选模型列表（有序），用户通过 /model 指令选择
+#   - alias: "sonnet"                    # 别名或完整模型名，传给 claude --model
+#     label: "Sonnet"                    # 飞书卡片上显示的名称
+#     desc: "速度与质量均衡，适合日常开发任务"  # 卡片上显示的描述
+#   - alias: "opus"
+#     label: "Opus"
+#     desc: "最强推理能力，适合复杂架构和疑难问题"
+#   - alias: "haiku"
+#     label: "Haiku"
+#     desc: "最快响应速度，适合简单问答和快速任务"
+# default_model: ""                      # 新会话默认模型，留空使用 CLI 默认（不传 --model）
+                                         # 填写值应为上方 models 列表中的某个 alias
+
 # Docker 部署说明：
 # 1. 在容器中创建非 root 用户: useradd -m claudebot
 # 2. 设置 run_as_user: "claudebot"

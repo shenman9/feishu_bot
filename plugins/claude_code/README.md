@@ -20,6 +20,7 @@
 - **工作目录管理**：支持切换工作目录，切换后自动重置会话
 - **用户问题转发**：Claude Code 调用 `AskUserQuestion` 时，问题会以飞书交互卡片形式呈现（逐题展示、预设选项按钮 + 自定义输入），用户回答后实时传回 Claude；即使处于 bypass 模式，该工具仍需用户实际作答
 - **完成通知**：任务执行结束后自动发送飞书应用内加急通知，避免用户错过结果
+- **模型选择**：支持在会话内切换 Claude 模型（Sonnet / Opus / Haiku 等），通过 `/model` 指令弹出选择卡片；模型设置为会话级别，重置会话后恢复默认
 
 ## 特殊指令
 
@@ -35,6 +36,7 @@
 | `/cd <路径>` | 切换工作目录并重置会话 |
 | `/cd` | 重置工作目录为默认值并重置会话 |
 | `/compact` | 压缩当前会话上下文（释放 token 空间），透传给 Claude Code 执行 |
+| `/model` | 弹出模型选择卡片，切换当前会话使用的 Claude 模型 |
 | `/help` | 显示帮助信息 |
 
 > `/compact` 是**透传指令**：不在插件层处理，直接作为 prompt 发送给 Claude Code 的内置 `/compact` 命令。执行耗时较长（可能数分钟），完成后显示压缩前的 token 数。
@@ -140,6 +142,11 @@ max_turns: 50                       # Claude Code 最大对话轮数
 run_as_user: ""                     # 子进程切换到指定系统用户运行（解决 root 限制）
 permission_server_port: 9876        # 权限确认服务监听端口
 permission_timeout: 120             # 用户确认超时时间（秒），超时自动拒绝
+models:                             # 可选模型列表，通过 /model 指令选择（可选，有内置默认）
+  - alias: "sonnet"                 #   alias: 传给 claude --model 的值
+    label: "Sonnet"                 #   label: 飞书卡片显示名称
+    desc: "速度与质量均衡"            #   desc: 卡片上的描述
+default_model: ""                   # 新会话默认模型，留空使用 CLI 默认
 ```
 
 | 配置项 | 默认值 | 说明 |
@@ -153,6 +160,8 @@ permission_timeout: 120             # 用户确认超时时间（秒），超时
 | `run_as_user` | `""` | 以指定系统用户运行子进程，适用于 Docker root 环境 |
 | `permission_server_port` | `9876` | 权限服务 HTTP 监听端口，需确保未被占用 |
 | `permission_timeout` | `120` | 等待用户确认的超时时间（秒）|
+| `models` | 内置 Sonnet/Opus/Haiku | 可选模型列表，每项含 `alias`、`label`、`desc` |
+| `default_model` | `""` | 新会话默认模型，留空使用 CLI 默认，填写应为 `models` 中的某个 `alias` |
 
 ## 会话状态
 
@@ -167,6 +176,7 @@ permission_timeout: 120             # 用户确认超时时间（秒），超时
 | `working_dir` | 当前工作目录路径 |
 | `last_chat_id` | 最近一次交互的飞书 chat_id（用于权限卡片推送）|
 | `session_perm_mode` | 当前会话的权限模式 |
+| `session_model` | 当前会话使用的模型别名，空字符串表示 CLI 默认 |
 | `perm_timeout_count` | 当前任务中权限确认超时次数，任务结束时用于卡片警告提示 |
 
 ## 注意事项
