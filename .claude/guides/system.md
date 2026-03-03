@@ -71,7 +71,7 @@
 
 ## CC 插件权限服务器机制
 
-CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权限确认服务器，并将端口号写入 `~/.claude/.feishu_perm_port`，供 `permission_hook.sh` 读取。
+CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权限确认服务器，并将端口号写入 `data/claude_code/.feishu_perm_port`（即 `self._data_dir`，可在构造时注入自定义路径以支持多实例隔离）。同时通过环境变量 `FEISHU_CC_DATA_DIR` 将数据目录传递给子进程，`permission_hook.sh` 优先读取该变量，回落到默认路径 `<项目根>/data/claude_code`。
 
 **降级机制**：若权限服务器启动失败（如端口被占用），插件会立即删除端口文件。hook 脚本检测不到端口文件时直接 `exit 0` 自动放行，避免因 curl 超时（默认 180s）卡住每次工具调用。
 

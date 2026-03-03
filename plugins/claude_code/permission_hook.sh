@@ -9,10 +9,10 @@
 #   0 = 允许工具调用继续
 #   2 = 拒绝工具调用（stderr 内容反馈给 Claude）
 #
-# 端口号从 <项目根目录>/data/claude_code/.feishu_perm_port 文件读取。
-# 超时值从 <项目根目录>/data/claude_code/.feishu_perm_timeout 文件读取。
+# 端口号从 ${FEISHU_CC_DATA_DIR}/.feishu_perm_port 文件读取（未设置则用脚本所在项目的默认路径）。
+# 超时值从 ${FEISHU_CC_DATA_DIR}/.feishu_perm_timeout 文件读取。
 # 如果端口文件不存在（飞书 Bot 未运行），直接允许（exit 0）。
-# 执行过程记录到 <项目根目录>/data/claude_code/feishu_hook.log，方便调试。
+# 执行过程记录到 ${FEISHU_CC_DATA_DIR}/feishu_hook.log，方便调试。
 
 set -euo pipefail
 
@@ -20,8 +20,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# 数据目录：优先读取环境变量（支持 hub_agent 等多 bot 实例共用此 hook），
+# 回落到脚本所在项目（cc_agent）的默认目录
+DATA_DIR="${FEISHU_CC_DATA_DIR:-${PROJ_ROOT}/data/claude_code}"
+
 # 日志文件
-LOG_FILE="${PROJ_ROOT}/data/claude_code/feishu_hook.log"
+LOG_FILE="${DATA_DIR}/feishu_hook.log"
 
 _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
@@ -45,7 +49,7 @@ case "$TOOL_NAME" in
 esac
 
 # 读取端口号：文件不存在说明飞书 Bot 未运行，直接允许
-PORT_FILE="${PROJ_ROOT}/data/claude_code/.feishu_perm_port"
+PORT_FILE="${DATA_DIR}/.feishu_perm_port"
 if [ ! -f "$PORT_FILE" ]; then
     _log "端口文件不存在 (${PORT_FILE})，直接允许"
     exit 0
@@ -55,7 +59,7 @@ _log "端口文件读取成功: port=${PORT}"
 
 # 读取超时值：由插件写入，与 permission_timeout 配置保持一致
 # curl --max-time 需设置为 超时值+10 秒，留余量给服务器返回响应
-TIMEOUT_FILE="${PROJ_ROOT}/data/claude_code/.feishu_perm_timeout"
+TIMEOUT_FILE="${DATA_DIR}/.feishu_perm_timeout"
 if [ -f "$TIMEOUT_FILE" ]; then
     PERM_TIMEOUT=$(cat "$TIMEOUT_FILE")
 else
@@ -65,7 +69,7 @@ CURL_MAX_TIME=$((PERM_TIMEOUT + 10))
 _log "超时配置: perm_timeout=${PERM_TIMEOUT}s, curl_max_time=${CURL_MAX_TIME}s"
 
 # curl 错误日志文件（超过 100KB 时自动截断，避免无限增长）
-CURL_ERR_FILE="${PROJ_ROOT}/data/claude_code/feishu_hook_curl_err.log"
+CURL_ERR_FILE="${DATA_DIR}/feishu_hook_curl_err.log"
 if [ -f "$CURL_ERR_FILE" ] && [ "$(stat -c%s "$CURL_ERR_FILE" 2>/dev/null || echo 0)" -gt 102400 ]; then
     tail -100 "$CURL_ERR_FILE" > "${CURL_ERR_FILE}.trim" && mv "${CURL_ERR_FILE}.trim" "$CURL_ERR_FILE"
 fi

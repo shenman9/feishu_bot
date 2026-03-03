@@ -131,8 +131,16 @@ class ClaudeCodePlugin(Plugin):
     # 透传指令：不在插件层拦截，直接作为 prompt 发送给 Claude Code
     _PASSTHROUGH_COMMANDS: set[str] = {"/compact"}
 
-    def __init__(self):
+    def __init__(
+        self,
+        data_dir: Optional[pathlib.Path] = None,
+        config_dir: Optional[pathlib.Path] = None,
+    ):
         super().__init__()
+        # 运行时数据目录（子类可注入，实现多实例隔离）
+        self._data_dir: pathlib.Path = data_dir if data_dir is not None else _CC_DATA_DIR
+        # 配置目录（None 表示使用默认的 config/claude_code.yaml）
+        self._config_dir: Optional[pathlib.Path] = config_dir
         # user_id -> 用户状态
         self.user_states: dict[str, dict] = {}
         # user_id -> 运行中的子进程
@@ -183,9 +191,17 @@ class ClaudeCodePlugin(Plugin):
     # ---- 配置 ----
 
     def _load_plugin_config(self) -> dict:
-        """懒加载插件配置，从 config/claude_code.yaml 读取"""
+        """懒加载插件配置，从 config/claude_code.yaml 读取
+
+        若构造时传入了 config_dir，则从该目录加载；否则使用默认路径。
+        """
         if self._config is None:
-            cc = load_plugin_config("claude_code")
+            if self._config_dir is not None:
+                import yaml
+                path = self._config_dir / "claude_code.yaml"
+                cc = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+            else:
+                cc = load_plugin_config("claude_code")
             self._config = {
                 "claude_path": cc.get("claude_path", "/usr/bin/claude"),
                 "default_working_dir": cc.get("default_working_dir", ""),
@@ -285,7 +301,7 @@ class ClaudeCodePlugin(Plugin):
 
     def _sessions_file_path(self) -> pathlib.Path:
         """返回历史会话存储文件路径"""
-        return _CC_DATA_DIR / "feishu_sessions.json"
+        return self._data_dir / "feishu_sessions.json"
 
     def _load_user_sessions(self, user_id: str) -> list[dict]:
         """读取指定用户的历史会话列表（文件不存在则返回空列表）"""
@@ -597,8 +613,8 @@ class ClaudeCodePlugin(Plugin):
         - .feishu_perm_port: 权限服务器端口号
         - .feishu_perm_timeout: 权限确认超时秒数（hook 用于设置 curl --max-time）
         """
-        port_file = _CC_DATA_DIR / ".feishu_perm_port"
-        timeout_file = _CC_DATA_DIR / ".feishu_perm_timeout"
+        port_file = self._data_dir / ".feishu_perm_port"
+        timeout_file = self._data_dir / ".feishu_perm_timeout"
         try:
             port_file.parent.mkdir(parents=True, exist_ok=True)
             port_file.write_text(str(port))
@@ -620,8 +636,8 @@ class ClaudeCodePlugin(Plugin):
 
     def _delete_port_file(self) -> None:
         """删除端口文件和超时文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
-        port_file = _CC_DATA_DIR / ".feishu_perm_port"
-        timeout_file = _CC_DATA_DIR / ".feishu_perm_timeout"
+        port_file = self._data_dir / ".feishu_perm_port"
+        timeout_file = self._data_dir / ".feishu_perm_timeout"
         try:
             port_file.unlink(missing_ok=True)
             timeout_file.unlink(missing_ok=True)
@@ -1320,6 +1336,9 @@ class ClaudeCodePlugin(Plugin):
         cfg = self._load_plugin_config()
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        # 将数据目录路径传递给子进程，hook 脚本据此找到正确的端口文件
+        # 支持多 bot 实例（hub_agent / cc_agent）共用同一 hook 脚本但数据目录隔离
+        env["FEISHU_CC_DATA_DIR"] = str(self._data_dir)
 
         run_as_user = cfg.get("run_as_user", "")
         preexec_fn = None
@@ -1935,7 +1954,7 @@ class ClaudeCodePlugin(Plugin):
         content = self._build_card(text, running=running, elapsed=elapsed, cancelled=cancelled)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
-            debug_log = _CC_DATA_DIR / "cc_card_debug.log"
+            debug_log = self._data_dir / "cc_card_debug.log"
             debug_log.parent.mkdir(parents=True, exist_ok=True)
             with debug_log.open("a", encoding="utf-8") as _f:
                 _f.write(f"\n{'='*60}\n[{datetime.datetime.now().isoformat()}] message_id={message_id} running={running}\n")
