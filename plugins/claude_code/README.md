@@ -12,7 +12,7 @@
 
 - **远程执行**：在飞书中直接向本地 Claude Code 发送任务，无需打开终端
 - **会话持久化**：同一用户的多次请求共享同一 Claude Code 会话（UUID 标识），保留上下文
-- **历史会话恢复**：历史会话自动记录到磁盘（`data/claude_code/feishu_sessions.json`），发送 `/session` 可查看并一键恢复任意历史会话，重启服务不丢失；恢复后自动展示该会话最近 3 轮对话预览（绿色卡片），帮助用户快速回忆上下文
+- **历史会话恢复**：历史会话自动记录到磁盘（Hub 模式：`data/claude_code/feishu_sessions.json`；CC 专属机器人：`data/cc_agent/feishu_sessions.json`），发送 `/session` 可查看并一键恢复任意历史会话，重启服务不丢失；恢复后自动展示该会话最近 3 轮对话预览（绿色卡片），帮助用户快速回忆上下文
 - **流式输出**：Claude Code 的输出实时推送到飞书卡片，节流更新（0.5 秒/50 字符）
 - **过程可视化**：工具调用日志（含调用结果状态）与 Claude 文字回复按实际执行顺序交错展示，与原生 Claude Code 终端输出顺序一致；连续大量工具调用时自动折叠（保留最近 15 条）；卡片标题显示任务总用时（`执行中...已用时 Xs`），日志区域显示当前阶段用时（`💭 思考中...` 表示等待模型推理，`⏳ 正在处理...` 表示工具执行中），思考完成后标注思考耗时（`💭 思考完成 (用时 Xs)`）
 - **权限确认**：危险操作（写文件、执行命令等）通过飞书卡片弹出确认，用户可逐一审批；若确认超时，任务完成卡片会追加警告提示（如 `⚠️ 本次任务中有 N 次权限确认超时（120s），操作已自动拒绝`），帮助用户定位失败原因
@@ -129,7 +129,16 @@ claude_code/
 
 ## 配置
 
-在 `config/claude_code.yaml` 中配置（参考 `config/claude_code.yaml.example`）：
+插件支持两种运行模式，配置路径不同：
+
+| 模式 | 配置文件 | 飞书凭证 | 数据目录 |
+|------|---------|---------|---------|
+| Hub 模式（默认）| `config/claude_code.yaml` | `config/system.yaml` | `data/claude_code/` |
+| CC 专属机器人 | `config/cc/claude_code.yaml` | `config/cc/system.yaml` | `data/cc_agent/` |
+
+CC 专属机器人通过 `run_cc.sh` 启动，脚本自动设置 `CC_CONFIG_DIR`（`config/cc/`）和 `CC_DATA_DIR`（`data/cc_agent/`）环境变量，插件据此加载独立的配置和数据目录，与 Hub 模式完全隔离。
+
+在对应的 `claude_code.yaml` 中配置（参考 `config/claude_code.yaml.example` 或 `config/cc/claude_code.yaml.example`）：
 
 ```yaml
 claude_path: "/usr/bin/claude"      # claude CLI 可执行文件路径

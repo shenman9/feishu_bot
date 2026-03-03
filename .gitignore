@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 config/*.yaml
 !config/*.yaml.example
+config/cc/*.yaml
+!config/cc/*.yaml.example
 # .claude 目录：忽略本地配置，但跟踪开发指南
 .claude/*
 !.claude/guides/
@@ -15,3 +17,5 @@ data/
 # 启动脚本运行时产物
 .bot.pid
 .bot.log
+.cc_bot.pid
+.cc_bot.log

@@ -10,6 +10,10 @@ LOG_FILE="$PROJECT_DIR/.cc_bot.log"
 PYTHON="${PYTHON:-python3}"
 PROC_NAME="cc_agent"       # 进程名，用于 ps/pgrep/pkill 精准识别
 
+# CC 专属机器人配置目录和数据目录，与 hub_agent 隔离
+export CC_CONFIG_DIR="$PROJECT_DIR/config/cc"
+export CC_DATA_DIR="$PROJECT_DIR/data/cc_agent"
+
 _is_running() {
     if [ ! -f "$PID_FILE" ]; then
         return 1
@@ -28,12 +32,12 @@ _is_running() {
     fi
 }
 
-# 从 config/claude_code.yaml 读取权限服务器端口，缺省 9876
+# 从 config/cc/claude_code.yaml 读取权限服务器端口，缺省 9876
 _get_perm_port() {
     local port=""
-    if [ -f "$PROJECT_DIR/config/claude_code.yaml" ]; then
+    if [ -f "$CC_CONFIG_DIR/claude_code.yaml" ]; then
         port=$(awk '/^[[:space:]]*permission_server_port:[[:space:]]*/{ print $2; exit }' \
-            "$PROJECT_DIR/config/claude_code.yaml" 2>/dev/null || true)
+            "$CC_CONFIG_DIR/claude_code.yaml" 2>/dev/null || true)
     fi
     echo "${port:-9876}"
 }
@@ -49,8 +53,8 @@ _preflight_check() {
     fi
 
     # 2. 配置文件
-    if [ ! -f "$PROJECT_DIR/config/system.yaml" ]; then
-        echo "  [错误] 系统配置文件不存在，请参考 config/system.yaml.example 创建"
+    if [ ! -f "$CC_CONFIG_DIR/system.yaml" ]; then
+        echo "  [错误] CC 系统配置文件不存在，请参考 config/cc/system.yaml.example 创建"
         failed=true
     fi
 
@@ -85,7 +89,7 @@ _preflight_check() {
         echo "  [错误] 权限服务器端口 $port 已被占用" \
             "${holder_pid:+(PID: $holder_pid${holder_cmd:+, $holder_cmd})}"
         echo "         若为未正常退出的机器人进程，请先执行: ./run_cc.sh stop"
-        echo "         若为其他进程，请修改 config/claude_code.yaml 中的 permission_server_port"
+        echo "         若为其他进程，请修改 config/cc/claude_code.yaml 中的 permission_server_port"
         failed=true
     fi
 

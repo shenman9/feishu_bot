@@ -9,6 +9,8 @@ Claude Code 独立机器人适配层
 """
 
 import logging
+import os
+from pathlib import Path
 
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
 
@@ -28,7 +30,10 @@ class ClaudeCodeBot(FeishuBot):
 
     def __init__(self, app_id: str, app_secret: str):
         super().__init__(app_id, app_secret)
-        self._plugin = ClaudeCodePlugin()
+        # CC 专属机器人通过环境变量注入独立的配置目录和数据目录，实现与 hub_agent 的隔离
+        config_dir = Path(os.environ["CC_CONFIG_DIR"]) if "CC_CONFIG_DIR" in os.environ else None
+        data_dir = Path(os.environ["CC_DATA_DIR"]) if "CC_DATA_DIR" in os.environ else None
+        self._plugin = ClaudeCodePlugin(data_dir=data_dir, config_dir=config_dir)
         # 将自身注入为插件的 bot 引用（FeishuBot 提供了插件所需的全部方法）
         self._plugin.on_register(self)
 
