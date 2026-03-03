@@ -125,6 +125,7 @@ def plugin(mock_bot):
         "run_as_user": "",
         "permission_server_port": _DEFAULT_PERM_PORT,
         "permission_timeout": _DEFAULT_PERM_TIMEOUT,
+        "default_model": "",
     }
     # 跳过真实 HTTP 服务器启动，避免端口冲突和测试副作用
     p._perm_server_started = True

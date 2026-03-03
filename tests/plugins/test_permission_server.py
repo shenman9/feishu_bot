@@ -363,6 +363,7 @@ class TestPluginPermissionIntegration:
             "run_as_user": "",
             "permission_server_port": _DEFAULT_PERM_PORT,
             "permission_timeout": _DEFAULT_PERM_TIMEOUT,
+            "default_model": "",
         }
         return p
 
@@ -381,6 +382,7 @@ class TestPluginPermissionIntegration:
             "run_as_user": "",
             "permission_server_port": _DEFAULT_PERM_PORT,
             "permission_timeout": _DEFAULT_PERM_TIMEOUT,
+            "default_model": "",
         }
         return p
 

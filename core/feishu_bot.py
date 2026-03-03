@@ -172,9 +172,13 @@ class FeishuBot(ABC):
             if chat_type == "group" and mentions:
                 text = self._strip_mentions(text, mentions)
             if not text:
-                logger.info("忽略空文本消息: user=%s, msg_type=%s, message_id=%s",
-                           sender_id, msg_type, message_id)
-                self.reply(chat_id, "当前仅支持文本消息，请直接输入文字。")
+                if chat_type == "group" and mentions:
+                    # 群聊中纯 @机器人无附加文本，视为无指令，触发默认菜单
+                    self.on_message(sender_id, chat_id, "")
+                else:
+                    logger.info("忽略空文本消息: user=%s, msg_type=%s, message_id=%s",
+                               sender_id, msg_type, message_id)
+                    self.reply(chat_id, "当前仅支持文本消息，请直接输入文字。")
                 return
             logger.info("收到消息: user=%s, chat_type=%s, message_id=%s, text=%s",
                        sender_id, chat_type, message_id, text)
