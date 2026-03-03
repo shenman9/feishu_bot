@@ -47,6 +47,8 @@ _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
 _MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
 _SESSION_INITIAL_COUNT = 5      # /session 初始显示会话数
 _SESSION_PAGE_SIZE = 10         # "显示更多" 每次增加的会话数
+_HISTORY_PREVIEW_ROUNDS = 3     # 切换会话后展示的历史对话轮数
+_HISTORY_TEXT_MAX = 300         # 历史预览单条消息最大展示字符数
 
 # /model 默认可选模型列表（配置文件未指定时使用）
 _DEFAULT_MODELS: list[dict] = [
@@ -419,6 +421,113 @@ class ClaudeCodePlugin(Plugin):
             "header": {
                 "title": {"tag": "plain_text", "content": "Claude Code 历史会话"},
                 "template": "blue",
+            },
+            "elements": elements,
+        }
+
+    # ---- 历史对话预览 ----
+
+    @staticmethod
+    def _find_session_jsonl(session_id: str, working_dir: str) -> Optional[pathlib.Path]:
+        """定位 Claude Code 会话的 JSONL 文件
+
+        优先按 working_dir 编码路径查找，找不到则全局搜索。
+        """
+        claude_projects = pathlib.Path.home() / ".claude" / "projects"
+        if not claude_projects.exists():
+            return None
+        # 优先：按 working_dir 构造路径（将 / 全替换为 -）
+        if working_dir:
+            encoded = working_dir.replace("/", "-")
+            candidate = claude_projects / encoded / f"{session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        # 回退：全局搜索（working_dir 可能已变更或编码规则有差异）
+        for path in claude_projects.glob(f"*/{session_id}.jsonl"):
+            return path
+        return None
+
+    @staticmethod
+    def _parse_session_rounds(
+        jsonl_path: pathlib.Path, n: int
+    ) -> list[tuple[str, str]]:
+        """解析 JSONL，返回最后 n 轮 (user_text, assistant_text) 对
+
+        跳过 progress、tool_use、thinking 等非文本条目。
+        """
+        rounds: list[tuple[str, str]] = []
+        pending_user: Optional[str] = None
+
+        try:
+            with open(jsonl_path, encoding="utf-8") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = entry.get("type")
+                    if msg_type == "user":
+                        content = entry.get("message", {}).get("content", "")
+                        if isinstance(content, str):
+                            text = content.strip()
+                            if text:
+                                pending_user = text
+                        elif isinstance(content, list):
+                            parts = [
+                                c.get("text", "") for c in content
+                                if c.get("type") == "text"
+                            ]
+                            text = "\n".join(parts).strip()
+                            # 过滤工具调用结果（tool_result 类型的 user 消息无文本内容）
+                            if text:
+                                pending_user = text
+                    elif msg_type == "assistant" and pending_user is not None:
+                        content = entry.get("message", {}).get("content", [])
+                        if isinstance(content, list):
+                            parts = [
+                                c.get("text", "") for c in content
+                                if c.get("type") == "text"
+                            ]
+                            assistant_text = "\n".join(parts).strip()
+                            if assistant_text:
+                                rounds.append((pending_user, assistant_text))
+                                pending_user = None
+        except Exception as e:
+            logger.warning("[CC] 读取会话历史失败: %s", e)
+
+        return rounds[-n:]
+
+    @staticmethod
+    def _build_history_preview_card(
+        session_id: str, rounds: list[tuple[str, str]]
+    ) -> dict:
+        """构造会话历史预览卡片，展示最近几轮用户/CC 对话"""
+        elements: list[dict] = []
+        for user_text, assistant_text in rounds:
+            if len(assistant_text) > _HISTORY_TEXT_MAX:
+                assistant_text = assistant_text[:_HISTORY_TEXT_MAX] + "…（省略）"
+            elements.append({
+                "tag": "markdown",
+                "content": f"👤 **你**\n{user_text}",
+            })
+            elements.append({
+                "tag": "markdown",
+                "content": f"🤖 **CC**\n{assistant_text}",
+            })
+            elements.append({"tag": "hr"})
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"会话 {session_id[:8]}… 最近对话",
+                },
+                "template": "green",
             },
             "elements": elements,
         }
@@ -2242,6 +2351,13 @@ class ClaudeCodePlugin(Plugin):
                 "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s",
                 user_id, target_sid[:8], target_dir,
             )
+            # 发送历史对话预览卡片
+            jsonl_path = self._find_session_jsonl(target_sid, target_dir)
+            if jsonl_path:
+                rounds = self._parse_session_rounds(jsonl_path, _HISTORY_PREVIEW_ROUNDS)
+                if rounds:
+                    card = self._build_history_preview_card(target_sid, rounds)
+                    self.bot.reply_card(chat_id, card)
             self._send_perm_select_card_if_manual(chat_id, user_id)
             return self.bot.make_card_response(
                 toast=f"已切换到会话 {target_sid[:8]}…，发送消息继续"
