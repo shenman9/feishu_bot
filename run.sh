@@ -8,7 +8,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_FILE="$PROJECT_DIR/.bot.pid"
 LOG_FILE="$PROJECT_DIR/.bot.log"
 PYTHON="${PYTHON:-python3}"
-PROC_NAME="feishu_bot"     # 进程名，用于 ps/pgrep/pkill 精准识别
+PROC_NAME="hub_agent"      # 进程名，用于 ps/pgrep/pkill 精准识别
 
 _is_running() {
     if [ ! -f "$PID_FILE" ]; then

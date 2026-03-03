@@ -1,11 +1,11 @@
-# Feishu Bot
+# Hub Agent
 
 基于飞书开放平台的插件化机器人框架。通过统一入口管理多个独立功能，用户发送关键词即可切换不同功能。
 
 ## 项目结构
 
 ```
-feishu_bot/
+hub_agent/
 ├── main.py                  # 启动入口
 ├── config.py                # 配置加载
 ├── config.yaml              # 实际配置（不提交）

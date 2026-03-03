@@ -58,7 +58,7 @@ _BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
 _PLUGIN_DIR = pathlib.Path(__file__).parent      # plugins/claude_code/
-_PROJECT_ROOT = _PLUGIN_DIR.parent.parent        # feishu_bot/
+_PROJECT_ROOT = _PLUGIN_DIR.parent.parent        # hub_agent/
 _CC_DATA_DIR = _PROJECT_ROOT / "data" / "claude_code"
 
 PLUGIN_KEYWORD = "CC"
