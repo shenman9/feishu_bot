@@ -1,16 +1,23 @@
 # 论文日报插件配置
-topics:
-  - "Attention机制"
-  - "Memory机制"
-  - "KV cache压缩"
-  - "Retrieval(检索)"
-  - "长序列"
+# 使用 Gemini API（/v1beta/ 端点，无客户端检测限制）
+
+# 用自然语言描述你的研究兴趣，LLM 会据此判断论文相关性。
+# 可以描述：关注的方向、具体技术、不感兴趣的方向等。
+research_interest: |
+  我的研究方向是大语言模型的高效推理和部署。
+  具体关注：长上下文场景下的 KV Cache 压缩与管理、
+  稀疏注意力/线性注意力机制、模型推理加速。
+  同时关注 AI Agent 的记忆系统设计（尤其是长期记忆的
+  存储与检索机制）、多 Agent 协作架构。
+  不太关注：纯理论证明、传统 NLP 任务（NER/文本分类等）、
+  语音/图像等非文本模态。
+
 categories:
   - "cs.CL"
   - "cs.AI"
   - "cs.LG"
-max_papers: 50             # LLM 处理的最大论文数
+max_papers: 500              # LLM 处理的最大论文数
 llm_base_url: "https://api.lingyaai.cn"
-llm_api_key: "your_llm_api_key_here"
-llm_model: "claude-opus-4-6"
-schedule_time: "10:00"     # 每日定时推送时间（北京时间）
+llm_api_key: "your_gemini_api_key_here"
+llm_model: "gemini-3.1-pro-preview-thinking"
+schedule_time: "09:00"       # 每日定时推送时间（北京时间 HH:MM）

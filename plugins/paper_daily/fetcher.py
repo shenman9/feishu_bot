@@ -12,20 +12,24 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_papers(config: AppConfig, target_date: datetime | None = None) -> list[Paper]:
-    """获取指定日期、指定分类的 ArXiv 论文，按 arxiv_id 去重。
+    """获取指定日期的 ArXiv 论文（默认昨天），按分类过滤并去重。
 
-    当 target_date 为 None 时默认取昨天。
+    Args:
+        config: 插件配置，使用 categories 字段。
+        target_date: 目标日期，None 时取昨天（UTC）。
+
+    Returns:
+        去重后的 Paper 列表，按发布时间倒序。
     """
     if target_date is None:
         target_date = datetime.now(timezone.utc) - timedelta(days=1)
 
-    query = _build_query(config.categories)
-    return _fetch_for_date(query, target_date)
+    date_str = target_date.strftime("%Y-%m-%d")
+    query = " OR ".join(f"cat:{c}" for c in config.categories)
+    logger.info(f"ArXiv 查询: query={query!r}, 目标日期={date_str}")
 
-
-def _fetch_for_date(query: str, target_date: datetime) -> list[Paper]:
-    """获取指定日期的论文。"""
-    logger.info(f"查询 ArXiv: {query}, 筛选日期: {target_date.strftime('%Y-%m-%d')}")
+    date_min = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    date_max = date_min + timedelta(days=1)
 
     search = arxiv.Search(
         query=query,
@@ -36,40 +40,31 @@ def _fetch_for_date(query: str, target_date: datetime) -> list[Paper]:
 
     seen: set[str] = set()
     papers: list[Paper] = []
-    date_min = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    date_max = date_min + timedelta(days=1)
 
     client = arxiv.Client()
     for result in client.results(search):
         if result.published < date_min:
+            # 结果按时间倒序，遇到更早的日期即可停止
             break
         if result.published >= date_max:
             continue
-        paper = _to_paper(result)
-        if paper.arxiv_id in seen:
+
+        arxiv_id = result.entry_id.split("/abs/")[-1]
+        if arxiv_id in seen:
             continue
-        seen.add(paper.arxiv_id)
-        papers.append(paper)
+        seen.add(arxiv_id)
 
-    logger.info(f"获取到 {len(papers)} 篇论文（{date_min.strftime('%Y-%m-%d')} published，去重后）")
+        papers.append(Paper(
+            arxiv_id=arxiv_id,
+            title=result.title.replace("\n", " ").strip(),
+            authors=[a.name for a in result.authors],
+            abstract=result.summary.replace("\n", " ").strip(),
+            categories=result.categories,
+            primary_category=result.primary_category,
+            published=result.published,
+            pdf_url=result.pdf_url or "",
+            entry_url=result.entry_id,
+        ))
+
+    logger.info(f"ArXiv 获取完成: 共 {len(papers)} 篇（{date_str}，去重后）")
     return papers
-
-
-def _build_query(categories: list[str]) -> str:
-    """构建 ArXiv 查询字符串，如 'cat:cs.CL OR cat:cs.AI'。"""
-    return " OR ".join(f"cat:{cat}" for cat in categories)
-
-
-def _to_paper(result: arxiv.Result) -> Paper:
-    """将 arxiv.Result 转换为 Paper 数据类。"""
-    return Paper(
-        arxiv_id=result.entry_id.split("/abs/")[-1],
-        title=result.title.replace("\n", " ").strip(),
-        authors=[a.name for a in result.authors],
-        abstract=result.summary.replace("\n", " ").strip(),
-        categories=result.categories,
-        primary_category=result.primary_category,
-        published=result.published,
-        pdf_url=result.pdf_url,
-        entry_url=result.entry_id,
-    )

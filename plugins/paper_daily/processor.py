@@ -1,294 +1,345 @@
-"""业务逻辑层：论文筛选与摘要生成，支持增量缓存。"""
+"""论文筛选与摘要处理模块。
+
+包含：
+- 批量论文筛选（每次 10 篇，减少 API 调用次数约 10 倍）
+- 相关论文摘要生成（逐篇）
+- 按日期缓存（只在成功时写缓存，避免失败结果污染缓存）
+- 自动清理过期缓存（保留最近 7 天）
+"""
 
 import json
 import logging
-import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
 from .config import AppConfig
-from .llm_client import LLMClient, LLMError
+from .gemini_client import call_gemini, GeminiError
 from .models import Paper
 
 logger = logging.getLogger(__name__)
 
 _PLUGIN_DIR = Path(__file__).parent
 
-FILTER_SYSTEM = """你是一个学术论文筛选助手。判断论文是否与用户关注的研究主题相关。
 
-用户关注的主题：
-{topics}
+# ---------- Prompt 模板 ----------
 
-回复要求：
-- 仅输出一行合法 JSON，不要用 markdown code block 包裹，不要输出任何其他文字。
-- JSON 中的字符串值不得包含换行符。
-- 格式：{{"relevant": true/false, "score": 1-5, "matched_topics": ["匹配的主题1"], "reason": "一句话中文理由"}}
+BATCH_SIZE = 10  # 每批筛选的论文数
+
+_BATCH_FILTER_PROMPT = """\
+你是论文推荐助手。根据研究者的兴趣描述，判断以下 {count} 篇论文是否值得推荐给该研究者阅读。
+
+研究者的兴趣：
+{research_interest}
+
+待筛选论文：
+{papers_block}
+
+请输出一个 JSON 数组（不要 markdown 代码块），每个元素对应一篇论文，按编号顺序排列。
+推荐的论文（score >= 3）需要给出 aspect 和 reason，不推荐的只需 id 和 score：
+[
+  {{"id": 1, "recommend": true, "score": 4, "aspect": "关联方向", "reason": "推荐理由"}},
+  {{"id": 2, "recommend": false, "score": 1}},
+  ...
+]
 
 字段说明：
-- score：1=几乎无关, 2=略有关联, 3=一般相关, 4=比较相关, 5=高度相关。仅当 score >= 3 时 relevant 应为 true。
-- matched_topics：从上述主题列表中选取与论文相关的主题，无关则为空列表。"""
+- score：1=无关, 2=略沾边, 3=值得一读, 4=推荐阅读, 5=强烈推荐
+- aspect：用简短中文概括关联方向（如"KV Cache动态淘汰"、"Agent记忆检索"）
+- reason：一句话推荐理由
+- score >= 3 时 recommend 应为 true
+- 数组长度必须等于 {count}\
+"""
 
-FILTER_USER = """论文标题：{title}
-分类：{categories}
-摘要：{abstract}"""
+_SUMMARY_PROMPT = """\
+请为以下论文生成 150 字以内的中文摘要，涵盖研究动机、方法和主要发现。
+直接输出摘要纯文本，不要 JSON、markdown 或任何格式包裹。
 
-SUMMARY_SYSTEM = """你是一个学术论文摘要助手。请用中文为论文生成简明摘要。
-
-回复要求：
-- 直接输出中文摘要纯文本，不要输出 JSON、markdown 或任何格式包裹。
-- 摘要控制在150字以内，涵盖研究动机、方法和主要发现。"""
-
-SUMMARY_USER = """论文标题：{title}
+标题：{title}
 作者：{authors}
 分类：{categories}
-原文摘要：{abstract}"""
+原文摘要：{abstract}\
+"""
 
 
-def process_papers(
-    papers: list[Paper],
-    config: AppConfig,
-    llm: LLMClient,
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> list[Paper]:
-    """主流程：逐篇筛选，通过后立即生成摘要并更新报告。支持断点续跑。"""
-    cache = _load_cache()
-    relevant: list[Paper] = []
+# ---------- 缓存工具 ----------
 
-    # 先恢复缓存中已完成的论文（筛选+摘要都有的）
-    for paper in papers:
-        cached = cache.get(paper.arxiv_id, {})
-        if "filter" in cached and "summary" in cached:
-            _restore_filter(paper, cached["filter"])
-            _restore_summary(paper, cached["summary"])
-            if paper.is_relevant:
-                relevant.append(paper)
-
-    if relevant:
-        logger.info(f"从缓存恢复 {len(relevant)} 篇已完成的相关论文")
-
-    for i, paper in enumerate(papers):
-        cached = cache.get(paper.arxiv_id, {})
-
-        # 筛选阶段
-        if "filter" in cached:
-            _restore_filter(paper, cached["filter"])
-            logger.info(f"筛选 [{i+1}/{len(papers)}]: {paper.title[:60]} (缓存)")
-        else:
-            logger.info(f"筛选 [{i+1}/{len(papers)}]: {paper.title[:60]}")
-            _filter_paper(paper, config, llm)
-            _save_to_cache(cache, paper, "filter")
-
-        if not paper.is_relevant:
-            # 每 10 篇汇报一次进度
-            if progress_callback and (i + 1) % 10 == 0:
-                progress_callback(
-                    f"筛选进度: {i+1}/{len(papers)}\n"
-                    f"已发现 {len(relevant)} 篇相关论文"
-                )
-            continue
-
-        # 摘要阶段：筛选通过后立即生成
-        if "summary" in cached:
-            _restore_summary(paper, cached["summary"])
-            logger.info(f"摘要: {paper.title[:60]} (缓存)")
-        else:
-            logger.info(f"摘要: {paper.title[:60]}")
-            _summarize_paper(paper, config, llm)
-            _save_to_cache(cache, paper, "summary")
-            if paper.arxiv_id not in {p.arxiv_id for p in relevant}:
-                relevant.append(paper)
-
-            # 每完成一篇就更新报告
-            _update_reports(relevant, config.topics)
-
-        # 发现新相关论文时汇报进度
-        if progress_callback:
-            progress_callback(
-                f"筛选进度: {i+1}/{len(papers)}\n"
-                f"已发现 {len(relevant)} 篇相关论文"
-            )
-
-    relevant.sort(key=lambda p: p.relevance_score, reverse=True)
-    return relevant
+CACHE_RETENTION_DAYS = 7  # 缓存保留天数
 
 
-def _update_reports(relevant: list[Paper], topics: list[str] | None = None) -> None:
-    """增量更新报告文件。"""
-    try:
-        from .reporter import generate_reports
-        sorted_papers = sorted(relevant, key=lambda p: p.relevance_score, reverse=True)
-        today = datetime.now(timezone.utc)
-        generate_reports(
-            sorted_papers, today, topics=topics,
-            template_dir=str(_PLUGIN_DIR / "templates"),
-            output_base=str(_PLUGIN_DIR / "reports"),
-        )
-    except Exception as e:
-        logger.warning(f"增量更新报告失败: {e}")
-
-
-def _cache_path() -> str:
-    """当天缓存文件路径（使用插件目录下的 cache 子目录）。"""
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _cache_path(date_str: str | None = None) -> Path:
+    """返回当天缓存文件路径（插件目录下 cache/YYYY-MM-DD/papers.json）。"""
+    if date_str is None:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_dir = _PLUGIN_DIR / "cache" / date_str
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return str(cache_dir / "papers.json")
+    return cache_dir / "papers.json"
 
 
 def _load_cache() -> dict:
-    """加载缓存，返回 {arxiv_id: {...}} 字典。"""
     path = _cache_path()
-    if not os.path.exists(path):
+    if not path.exists():
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"缓存读取失败，忽略: {e}")
         return {}
 
 
-def _save_to_cache(cache: dict, paper: Paper, stage: str) -> None:
-    """将单篇论文的处理结果写入缓存。"""
-    if paper.arxiv_id not in cache:
-        cache[paper.arxiv_id] = {}
-    if stage == "filter":
-        cache[paper.arxiv_id]["filter"] = {
-            "is_relevant": paper.is_relevant,
-            "relevance_score": paper.relevance_score,
-            "matched_topics": paper.matched_topics,
-            "relevance_reason": paper.relevance_reason,
-        }
-    elif stage == "summary":
-        cache[paper.arxiv_id]["summary"] = {
-            "summary_zh": paper.summary_zh,
-        }
+def _save_cache(cache: dict) -> None:
     try:
-        with open(_cache_path(), "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
+        _cache_path().write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     except OSError as e:
         logger.warning(f"缓存写入失败: {e}")
 
 
-def _restore_filter(paper: Paper, data: dict) -> None:
-    """从缓存恢复筛选结果。"""
-    paper.is_relevant = data.get("is_relevant", False)
-    paper.relevance_score = data.get("relevance_score", 0)
-    paper.matched_topics = data.get("matched_topics", [])
-    paper.relevance_reason = data.get("relevance_reason", "")
+def _cleanup_old_cache() -> None:
+    """清理过期缓存（保留最近 CACHE_RETENTION_DAYS 天）。"""
+    cache_root = _PLUGIN_DIR / "cache"
+    if not cache_root.exists():
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=CACHE_RETENTION_DAYS)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    deleted_count = 0
+    for date_dir in cache_root.iterdir():
+        if not date_dir.is_dir():
+            continue
+        # 目录名格式：YYYY-MM-DD
+        if date_dir.name < cutoff_str:
+            try:
+                for file in date_dir.iterdir():
+                    file.unlink()
+                date_dir.rmdir()
+                deleted_count += 1
+                logger.debug(f"清理过期缓存: {date_dir.name}")
+            except OSError as e:
+                logger.warning(f"清理缓存失败 [{date_dir.name}]: {e}")
+
+    if deleted_count > 0:
+        logger.info(f"缓存清理完成: 删除 {deleted_count} 个过期目录（保留最近 {CACHE_RETENTION_DAYS} 天）")
 
 
-def _restore_summary(paper: Paper, data: dict) -> None:
-    """从缓存恢复摘要结果。"""
-    paper.summary_zh = data.get("summary_zh", "")
+# ---------- JSON 解析工具 ----------
 
-
-def _filter_paper(paper: Paper, config: AppConfig, llm: LLMClient) -> None:
-    """调用 LLM 判断单篇论文相关性。"""
-    system = FILTER_SYSTEM.format(
-        topics="\n".join(f"- {t}" for t in config.topics),
-    )
-    user_msg = FILTER_USER.format(
-        title=paper.title,
-        categories=", ".join(paper.categories),
-        abstract=paper.abstract,
-    )
-    resp = ""
-    try:
-        resp = llm.chat(system, user_msg, max_tokens=200)
-        data = _parse_json(resp)
-        paper.is_relevant = data.get("relevant", False)
-        paper.relevance_score = int(data.get("score", 0))
-        paper.matched_topics = data.get("matched_topics", [])
-        paper.relevance_reason = data.get("reason", "")
-    except (LLMError, ValueError) as e:
-        logger.warning(f"筛选失败，跳过 [{paper.arxiv_id}]: {e}")
-        logger.debug(f"筛选 LLM 原始返回 [{paper.arxiv_id}]:\n{resp}")
-
-
-def _summarize_paper(paper: Paper, config: AppConfig, llm: LLMClient) -> None:
-    """调用 LLM 生成中文摘要。"""
-    user_msg = SUMMARY_USER.format(
-        title=paper.title,
-        authors=", ".join(paper.authors[:5]),
-        categories=", ".join(paper.categories),
-        abstract=paper.abstract,
-    )
-    try:
-        resp = llm.chat(SUMMARY_SYSTEM, user_msg, max_tokens=1000)
-        paper.summary_zh = resp.strip()
-    except LLMError as e:
-        logger.warning(f"摘要失败 [{paper.arxiv_id}]: {e}")
-
-
-def _parse_json(text: str) -> dict:
-    """解析 JSON，支持从 markdown code block 中提取，并容错处理。"""
-    # 尝试直接解析
+def _parse_json(text: str) -> dict | list:
+    """从 LLM 响应中提取 JSON（对象或数组），容错处理 markdown 包裹和换行符。"""
+    # 直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # 尝试从 code block 中提取
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if match:
+    # 从 markdown code block 提取
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
         try:
-            return json.loads(match.group(1))
+            return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # 尝试提取第一个 {...} 块
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
+    # 提取第一个 [...] 块（数组）
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
         try:
-            return json.loads(match.group(0))
+            return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-    # 清理换行符后再试
+    # 提取第一个 {...} 块（对象）
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    # 清理换行后再试
     cleaned = re.sub(r"\n\s*", " ", text)
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
+    m = re.search(r"\[.*\]", cleaned)
+    if m:
         try:
-            return json.loads(match.group(0))
+            return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-    # 最后尝试：修复值内未转义的双引号
-    try:
-        return json.loads(_fix_unescaped_quotes(text))
-    except json.JSONDecodeError:
-        pass
-    raise ValueError(f"无法解析 JSON: {text[:100]}")
+    raise ValueError(f"无法解析 JSON: {text[:150]}")
 
 
-def _fix_unescaped_quotes(text: str) -> str:
-    """修复 JSON 字符串值内部未转义的双引号。
+# ---------- 主处理流程 ----------
 
-    逐字符扫描，区分 JSON 结构性引号和值内的裸引号，
-    将后者替换为转义形式。
+def process_papers(
+    papers: list[Paper],
+    config: AppConfig,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> list[Paper]:
+    """批量筛选论文（每批 10 篇），相关的逐篇生成中文摘要。支持断点续跑。
+
+    Args:
+        papers: 待处理的论文列表。
+        config: 插件配置（含 LLM 设置和关注主题）。
+        progress_callback: 进度汇报回调，每批完成后触发。
+
+    Returns:
+        筛选出的相关论文列表，按相关性分数倒序排列。
     """
-    result = []
-    i = 0
-    in_string = False
-    while i < len(text):
-        ch = text[i]
-        if ch == '\\' and in_string:
-            # 转义序列，原样保留
-            result.append(text[i:i+2])
-            i += 2
-            continue
-        if ch == '"':
-            if not in_string:
-                in_string = True
-                result.append(ch)
-            else:
-                # 判断这个引号是结构性的（关闭字符串）还是值内的裸引号
-                # 结构性引号后面应该是 : , } ] 或空白
-                rest = text[i+1:].lstrip()
-                if not rest or rest[0] in ':,}]':
-                    in_string = False
-                    result.append(ch)
-                else:
-                    result.append('\\"')
+    # 清理过期缓存
+    _cleanup_old_cache()
+
+    cache = _load_cache()
+    total = len(papers)
+
+    # ---- 阶段 1：分离已缓存和未缓存的论文 ----
+    uncached: list[Paper] = []
+    cached_relevant_count = 0
+    for paper in papers:
+        c = cache.get(paper.arxiv_id, {})
+        if "filter" in c:
+            _restore_from_cache(paper, c)
+            if paper.is_recommended:
+                cached_relevant_count += 1
         else:
-            result.append(ch)
-        i += 1
-    return ''.join(result)
+            uncached.append(paper)
+
+    if cached_relevant_count:
+        logger.info(f"从缓存恢复 {cached_relevant_count} 篇推荐论文，"
+                    f"还有 {len(uncached)} 篇待筛选")
+
+    # ---- 阶段 2：批量筛选未缓存的论文 ----
+    total_batches = (len(uncached) + BATCH_SIZE - 1) // BATCH_SIZE if uncached else 0
+
+    for batch_idx in range(total_batches):
+        start = batch_idx * BATCH_SIZE
+        batch = uncached[start:start + BATCH_SIZE]
+
+        logger.info(f"批量筛选 [{batch_idx+1}/{total_batches}]: "
+                    f"第 {start+1}-{start+len(batch)} 篇（共 {len(uncached)} 篇待筛选）")
+
+        # 构造论文列表文本
+        papers_block = ""
+        for j, paper in enumerate(batch):
+            papers_block += (
+                f"\n[{j+1}] 标题：{paper.title}\n"
+                f"    分类：{', '.join(paper.categories)}\n"
+                f"    摘要：{paper.abstract}\n"
+            )
+
+        prompt = _BATCH_FILTER_PROMPT.format(
+            count=len(batch),
+            research_interest=config.research_interest,
+            papers_block=papers_block,
+        )
+
+        try:
+            resp = call_gemini(
+                config.llm_api_key, config.llm_model, prompt,
+                base_url=config.llm_base_url,
+            )
+            results = _parse_json(resp)
+            if not isinstance(results, list):
+                raise ValueError(f"期望 JSON 数组，实际: {type(results).__name__}")
+
+            # 按 id 字段建索引（兼容 id 从 1 开始或从 0 开始）
+            results_by_id = {}
+            for r in results:
+                rid = r.get("id", 0)
+                results_by_id[rid] = r
+
+            for j, paper in enumerate(batch):
+                # 尝试匹配 id（1-based 优先，0-based 兜底，顺序兜底）
+                result = results_by_id.get(j + 1) or results_by_id.get(j)
+                if result is None and j < len(results):
+                    result = results[j]
+                if result is None:
+                    logger.warning(f"批量筛选结果缺少第 {j+1} 篇: {paper.arxiv_id}")
+                    continue
+
+                paper.is_recommended = bool(result.get("recommend", False))
+                paper.relevance_score = int(result.get("score", 0))
+                paper.aspect = result.get("aspect", "")
+                paper.relevance_reason = result.get("reason", "")
+
+                cache.setdefault(paper.arxiv_id, {})["filter"] = {
+                    "is_recommended": paper.is_recommended,
+                    "relevance_score": paper.relevance_score,
+                    "aspect": paper.aspect,
+                    "relevance_reason": paper.relevance_reason,
+                }
+
+                if paper.is_recommended:
+                    logger.info(f"  [{j+1}/{len(batch)}] ★推荐 score={paper.relevance_score}"
+                                f" {paper.title[:45]} | {paper.relevance_reason[:30]}")
+                else:
+                    logger.info(f"  [{j+1}/{len(batch)}] 跳过 score={paper.relevance_score}"
+                                f" {paper.title[:50]}")
+
+            _save_cache(cache)
+
+        except (GeminiError, ValueError) as e:
+            logger.warning(f"批量筛选失败（第 {batch_idx+1} 批），跳过: {e}")
+
+        # 汇报进度
+        if progress_callback:
+            done = start + len(batch)
+            relevant_so_far = sum(1 for p in papers if p.is_recommended)
+            progress_callback(
+                f"筛选进度: {total - len(uncached) + done}/{total}\n"
+                f"已发现 {relevant_so_far} 篇推荐论文"
+            )
+
+    # ---- 阶段 3：对推荐论文逐篇生成摘要 ----
+    need_summary = [p for p in papers if p.is_recommended
+                    and not cache.get(p.arxiv_id, {}).get("summary")]
+
+    if need_summary:
+        logger.info(f"开始生成摘要: {len(need_summary)} 篇")
+
+    for i, paper in enumerate(need_summary):
+        logger.info(f"生成摘要 [{i+1}/{len(need_summary)}]: {paper.title[:55]}")
+        prompt = _SUMMARY_PROMPT.format(
+            title=paper.title,
+            authors=", ".join(paper.authors[:5]),
+            categories=", ".join(paper.categories),
+            abstract=paper.abstract,
+        )
+        try:
+            paper.summary_zh = _call_gemini(
+                config.llm_api_key, config.llm_model, prompt,
+                base_url=config.llm_base_url,
+            )
+            cache.setdefault(paper.arxiv_id, {})["summary"] = paper.summary_zh
+            _save_cache(cache)
+        except GeminiError as e:
+            logger.warning(f"摘要生成失败 [{paper.arxiv_id}]: {e}")
+            paper.summary_zh = "（摘要生成失败）"
+
+        if progress_callback:
+            progress_callback(
+                f"摘要生成: {i+1}/{len(need_summary)}\n"
+                f"共 {sum(1 for p in papers if p.is_recommended)} 篇推荐论文"
+            )
+
+    # 恢复有缓存摘要的论文
+    for paper in papers:
+        if paper.is_recommended and not paper.summary_zh:
+            c = cache.get(paper.arxiv_id, {})
+            if "summary" in c:
+                paper.summary_zh = c["summary"]
+
+    # 收集并排序
+    relevant = [p for p in papers if p.is_recommended]
+    relevant.sort(key=lambda p: p.relevance_score, reverse=True)
+    logger.info(f"处理完成: {total} 篇中推荐 {len(relevant)} 篇")
+    return relevant
+
+
+def _restore_from_cache(paper: Paper, c: dict) -> None:
+    """从缓存字典中恢复 Paper 的筛选和摘要字段。"""
+    if "filter" in c:
+        f = c["filter"]
+        paper.is_recommended = f.get("is_recommended", False)
+        paper.relevance_score = f.get("relevance_score", 0)
+        paper.aspect = f.get("aspect", "")
+        paper.relevance_reason = f.get("relevance_reason", "")
+    if "summary" in c:
+        paper.summary_zh = c["summary"]

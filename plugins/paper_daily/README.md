@@ -2,98 +2,291 @@
 
 ## 简介
 
-自动抓取 ArXiv 最新论文，使用大语言模型（LLM）按用户配置的研究方向进行筛选，并生成中文摘要，定时推送到飞书。用户也可手动触发即时获取。
+自动从 ArXiv 获取最新论文，使用 Gemini AI 根据用户配置的研究兴趣进行智能筛选，生成中文摘要，并以飞书卡片形式推送。支持手动触发和每日定时推送。
+
+## 核心特性
+
+- **智能筛选**：使用 Gemini AI 根据自然语言描述的研究兴趣判断论文相关性
+- **批量处理**：每批 10 篇论文同时筛选，大幅减少 API 调用次数（约 10 倍优化）
+- **中文摘要**：对推荐论文自动生成 150 字以内的中文摘要
+- **方向分组**：LLM 自动归纳论文的关联方向（如"KV Cache 压缩"、"Agent 记忆检索"），结果按方向分组展示
+- **断点续跑**：按日期缓存筛选和摘要结果，重复运行时自动跳过已处理的论文
+- **定时推送**：支持每日定时向订阅用户推送论文日报
+- **进度反馈**：实时更新飞书卡片，展示获取、筛选、摘要生成进度
 
 ## 触发方式
 
-在飞书聊天中发送关键词 `论文日报` 即可手动触发当日论文推送。
+### 手动触发
 
-## 功能特性
+在飞书聊天中发送关键词 `论文日报` 进入插件菜单，可选择：
+- **获取今日日报**：立即执行完整流水线（获取 → 筛选 → 摘要 → 推送）
+- **订阅每日推送**：订阅后每天定时自动推送
+- **取消订阅**：取消定时推送
 
-- **定时推送**：在配置的北京时间每天自动向已订阅用户推送当日论文
-- **智能筛选**：使用 LLM 根据配置的研究方向过滤无关论文，精准匹配关注领域
-- **中文摘要**：LLM 对筛选后的论文生成简明中文摘要，降低阅读门槛
-- **即时查询**：发送关键词可立即触发一次论文抓取与推送
-- **订阅管理**：每位用户独立订阅，插件激活即视为订阅，退出即取消
-- **进度反馈**：抓取和处理过程中实时更新卡片状态，避免长时间无响应
+也可直接发送文本指令：
+- `获取日报` / `获取论文` / `日报`：立即获取
+- `订阅` / `订阅推送` / `订阅每日推送`：订阅定时推送
+- `取消订阅`：取消订阅
+- `退出`：返回主菜单
 
-## 使用流程
+### 定时推送
 
+在 `config/paper_daily.yaml` 中配置 `schedule_time`（北京时间），插件会在每天指定时间自动向所有订阅用户推送论文日报。
+
+## 配置说明
+
+配置文件：`config/paper_daily.yaml`（参考 `config/paper_daily.yaml.example`）
+
+```yaml
+# 用自然语言描述你的研究兴趣，LLM 会据此判断论文相关性
+research_interest: |
+  我的研究方向是大语言模型的高效推理和部署。
+  具体关注：长上下文场景下的 KV Cache 压缩与管理、
+  稀疏注意力/线性注意力机制、模型推理加速。
+  同时关注 AI Agent 的记忆系统设计（尤其是长期记忆的
+  存储与检索机制）、多 Agent 协作架构。
+  不太关注：纯理论证明、传统 NLP 任务（NER/文本分类等）、
+  语音/图像等非文本模态。
+
+# ArXiv 分类过滤（获取论文时的初筛）
+categories:
+  - "cs.CL"  # Computation and Language
+  - "cs.AI"  # Artificial Intelligence
+  - "cs.LG"  # Machine Learning
+
+# LLM 处理的最大论文数（从 ArXiv 获取后截取前 N 篇）
+max_papers: 500
+
+# Gemini API 配置（使用 /v1beta/ 端点，无客户端检测限制）
+llm_base_url: "https://api.lingyaai.cn"
+llm_api_key: "your_gemini_api_key_here"
+llm_model: "gemini-3.1-pro-preview-thinking"
+
+# 每日定时推送时间（北京时间 HH:MM 格式）
+schedule_time: "09:00"
 ```
-用户: 论文日报
-机器人: [开始抓取，显示进度卡片...]
-机器人: [推送今日论文列表，含标题、作者、中文摘要及 ArXiv 链接]
 
-（每日定时自动推送给已订阅用户）
+### 配置字段说明
 
-用户: 退出
-机器人: 已退出论文日报，取消定时推送订阅。
-```
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `research_interest` | 字符串 | 用自然语言描述研究兴趣，可包含：关注的方向、具体技术、不感兴趣的方向等。LLM 会根据此描述判断论文相关性并给出推荐理由。 |
+| `categories` | 列表 | ArXiv 分类代码，用于初筛论文。常用分类：`cs.CL`（计算与语言）、`cs.AI`（人工智能）、`cs.LG`（机器学习）、`cs.CV`（计算机视觉）等。 |
+| `max_papers` | 整数 | 从 ArXiv 获取的论文数量上限。建议 200-500，过大会增加处理时间和 API 成本。 |
+| `llm_base_url` | 字符串 | Gemini API 基础 URL（需支持 `/v1beta/models/{model}:generateContent` 端点）。 |
+| `llm_api_key` | 字符串 | Gemini API Key。 |
+| `llm_model` | 字符串 | Gemini 模型名称，推荐 `gemini-3.1-pro-preview-thinking`（带思考链的版本，筛选更准确）。 |
+| `schedule_time` | 字符串 | 每日定时推送时间，格式 `HH:MM`（24 小时制，北京时间）。 |
 
-## 文件结构
+## 工作流程
+
+1. **获取论文**：从 ArXiv 获取昨天发布的论文，按配置的 `categories` 过滤
+2. **批量筛选**：每 10 篇论文为一批，调用 Gemini API 判断相关性，返回推荐度（1-5 分）、关联方向和推荐理由
+3. **生成摘要**：对推荐的论文（score ≥ 3）逐篇生成 150 字以内的中文摘要
+4. **结果推送**：按 LLM 归纳的关联方向分组，以飞书卡片形式展示推荐论文
+
+## 技术实现
+
+### 架构设计
 
 ```
 paper_daily/
-├── __init__.py              # 导出 PaperDailyPlugin
-├── paper_daily_plugin.py    # 插件主体，负责调度与消息路由（485 行）
-├── config.py                # AppConfig 数据类，加载插件配置
-├── fetcher.py               # 从 ArXiv API 抓取论文
-├── llm_client.py            # 调用 LLM 进行筛选与摘要生成
-├── processor.py             # 论文过滤与处理逻辑
-├── notifier.py              # 构建飞书卡片格式
-├── reporter.py              # 生成摘要报告
-├── models.py                # 数据模型（Paper 等）
-└── templates/
-    └── report.html.j2       # HTML 报告 Jinja2 模板
+├── __init__.py              # 插件入口
+├── paper_daily_plugin.py    # 主插件类（生命周期、消息处理、卡片构建）
+├── config.py                # 配置数据类
+├── models.py                # Paper 数据模型
+├── fetcher.py               # ArXiv 论文获取
+├── gemini_client.py         # Gemini API 客户端（独立模块）
+├── processor.py             # 批量筛选 + 摘要生成 + 缓存管理
+├── cache/                   # 按日期缓存筛选和摘要结果
+│   └── YYYY-MM-DD/
+│       └── papers.json
+└── subscribers.json         # 订阅用户列表
 ```
 
-## 模块职责
+### 核心模块
 
-| 模块 | 职责 |
-|------|------|
-| `paper_daily_plugin.py` | 插件入口，管理定时任务与用户订阅 |
-| `fetcher.py` | 调用 ArXiv API，获取最新论文列表 |
-| `processor.py` | 调用 LLM 筛选与摘要，协调处理流程 |
-| `llm_client.py` | 封装 LLM API 调用（筛选 + 摘要两阶段）|
-| `notifier.py` | 将论文数据转换为飞书消息卡片 |
-| `reporter.py` | 生成 HTML 或文本格式的报告内容 |
-| `models.py` | `Paper` 等数据结构定义 |
-| `config.py` | `AppConfig` 数据类定义 |
+#### `models.py`
+- **Paper 数据类**：定义论文的基础字段（标题、作者、摘要等）和筛选/摘要字段
 
-## 配置
+#### `fetcher.py`
+- **fetch_papers()**：使用 `arxiv` 库获取指定日期的论文，按分类过滤并去重
 
-在 `config/paper_daily.yaml` 中配置（参考 `config/paper_daily.yaml.example`）：
+#### `gemini_client.py`
+- **call_gemini()**：Gemini API 客户端，使用 `/v1beta/models/{model}:generateContent` 端点（无客户端检测限制），支持重试和超时控制
+- **GeminiError**：API 调用异常类
 
-```yaml
-topics:                          # 关注的研究方向（LLM 筛选依据）
-  - "Attention机制"
-  - "Memory机制"
-  - "KV cache压缩"
-  - "Retrieval(检索)"
-  - "长序列"
-categories:                      # ArXiv 分类（cs.CL / cs.AI / cs.LG 等）
-  - "cs.CL"
-  - "cs.AI"
-  - "cs.LG"
-max_papers: 50                   # 每次最多处理的论文数量
-llm_base_url: "https://api.anthropic.com"  # LLM API 地址
-llm_api_key: "your_llm_api_key_here"       # LLM API Key
-llm_model: "claude-opus-4-6"               # 用于筛选和摘要的模型
-schedule_time: "10:00"           # 每日定时推送时间（北京时间 HH:MM）
+#### `processor.py`
+- **批量筛选**：每批 10 篇论文，LLM 返回 JSON 数组，包含推荐度、关联方向、推荐理由
+- **摘要生成**：对推荐论文逐篇生成中文摘要
+- **缓存机制**：按日期缓存筛选和摘要结果（`cache/YYYY-MM-DD/papers.json`），支持断点续跑
+- **自动清理**：每次运行时自动清理 7 天前的过期缓存
+
+#### `paper_daily_plugin.py`
+- **生命周期管理**：注册时启动定时调度器（守护线程）
+- **消息处理**：处理用户文本指令和卡片按钮点击
+- **流水线编排**：后台线程执行完整流程（获取 → 筛选 → 摘要 → 推送），实时更新进度卡片
+- **订阅管理**：持久化订阅用户列表（`subscribers.json`），定时推送时遍历所有订阅者
+- **时区处理**：自动将北京时间转换为 UTC 时间进行调度
+
+### Gemini API 集成
+
+使用 Google Gemini API 的 `/v1beta/` 端点（而非 OpenAI 兼容格式），原因：
+- `/v1beta/` 端点无客户端检测限制，可在 Claude Code 环境中正常调用
+- 支持 `gemini-3.1-pro-preview-thinking` 等带思考链的模型，筛选准确度更高
+- API Key 通过 query parameter 传递（`?key=xxx`），无需 Authorization header
+
+请求格式：
+```json
+POST /v1beta/models/{model}:generateContent?key={api_key}
+{
+  "contents": [
+    {"parts": [{"text": "prompt"}]}
+  ]
+}
 ```
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `topics` | 必填 | 感兴趣的研究方向列表，LLM 据此筛选论文 |
-| `categories` | 必填 | ArXiv 分类代码列表 |
-| `max_papers` | `50` | 单次最多处理的论文数，过多会增加 LLM 费用 |
-| `llm_base_url` | 必填 | LLM API 服务地址 |
-| `llm_api_key` | 必填 | LLM API 密钥 |
-| `llm_model` | 必填 | 执行筛选和摘要的模型名称 |
-| `schedule_time` | `"10:00"` | 每日自动推送时间（北京时间）|
+响应格式：
+```json
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {"thought": "思考过程（自动跳过）"},
+          {"text": "模型输出文本"}
+        ]
+      }
+    }
+  ]
+}
+```
+
+### 批量筛选优化
+
+**问题**：逐篇调用 LLM 筛选 500 篇论文需要 500 次 API 调用，耗时长且成本高。
+
+**解决方案**：每批 10 篇论文，LLM 一次性返回所有论文的筛选结果（JSON 数组），API 调用次数减少约 10 倍。
+
+Prompt 示例：
+```
+你是论文推荐助手。根据研究者的兴趣描述，判断以下 10 篇论文是否值得推荐。
+
+研究者的兴趣：
+{research_interest}
+
+待筛选论文：
+[1] 标题：...
+    分类：...
+    摘要：...
+[2] ...
+
+请输出一个 JSON 数组，每个元素对应一篇论文：
+[
+  {"id": 1, "recommend": true, "score": 4, "aspect": "KV Cache压缩", "reason": "提出新的动态淘汰策略"},
+  {"id": 2, "recommend": false, "score": 1},
+  ...
+]
+```
+
+### 缓存机制
+
+按日期缓存筛选和摘要结果（`cache/YYYY-MM-DD/papers.json`），格式：
+```json
+{
+  "2406.12345": {
+    "filter": {
+      "is_recommended": true,
+      "relevance_score": 4,
+      "aspect": "KV Cache压缩",
+      "relevance_reason": "提出新的动态淘汰策略"
+    },
+    "summary": "本文提出了一种基于注意力分数的 KV Cache 动态淘汰策略..."
+  }
+}
+```
+
+**优势**：
+- 重复运行时自动跳过已处理的论文，节省 API 调用
+- 支持断点续跑：筛选失败时不影响已缓存的结果
+- 只在成功时写缓存，避免失败结果污染缓存
+
+## 使用示例
+
+### 1. 配置插件
+
+复制配置模板并填写 API Key：
+```bash
+cp config/paper_daily.yaml.example config/paper_daily.yaml
+vim config/paper_daily.yaml  # 填写 llm_api_key 和 research_interest
+```
+
+### 2. 手动获取日报
+
+在飞书中发送 `论文日报`，点击「获取今日日报」按钮，插件会：
+1. 从 ArXiv 获取昨天发布的论文（按配置的分类过滤）
+2. 使用 Gemini AI 批量筛选（每批 10 篇）
+3. 对推荐论文生成中文摘要
+4. 以飞书卡片形式展示结果（按关联方向分组）
+
+### 3. 订阅定时推送
+
+在飞书中发送 `论文日报`，点击「订阅每日推送」按钮，插件会在每天配置的时间（如 09:00）自动推送论文日报。
+
+### 4. 查看结果
+
+推送的飞书卡片包含：
+- **标题行**：日期、筛选总数、推荐数、方向数
+- **分组展示**：按 LLM 归纳的关联方向分组（如"KV Cache 压缩"、"Agent 记忆检索"）
+- **论文详情**：标题（链接到 ArXiv）、作者、推荐度（★★★★☆）、推荐理由、中文摘要
+
+## 常见问题
+
+### Q1: 为什么使用 Gemini 而不是 Claude？
+
+A: Gemini API 的 `/v1beta/` 端点无客户端检测限制，可在 Claude Code 环境中正常调用。Claude API 在某些环境下可能被 Anthropic 的客户端检测拦截（302 → app-unavailable-in-region）。
+
+### Q2: 如何调整筛选严格度？
+
+A: 在 `research_interest` 中明确描述"不感兴趣的方向"，LLM 会据此过滤无关论文。也可以修改 `processor.py` 中的 `_BATCH_FILTER_PROMPT`，调整 score 阈值（默认 ≥ 3 推荐）。
+
+### Q3: 缓存会无限累积吗？
+
+A: 不会。插件已实现自动清理机制，每次运行 `process_papers()` 时会自动删除 7 天前的过期缓存。可通过修改 `processor.py` 中的 `CACHE_RETENTION_DAYS` 常量调整保留天数。
+
+### Q4: 定时推送的时区如何处理？
+
+A: 配置文件中的 `schedule_time` 为北京时间（UTC+8）。插件会自动将北京时间转换为 UTC 时间进行调度，无需手动配置服务器时区。例如，配置 `09:00` 表示北京时间早上 9 点推送，插件会自动转换为 UTC 01:00 进行调度。
+
+### Q5: 如何支持其他 LLM（如 Claude）？
+
+A: 插件已将 Gemini 客户端独立为 `gemini_client.py` 模块。若需支持其他 LLM：
+1. 创建对应的客户端模块（如 `claude_client.py`）
+2. 实现统一的接口（接收 api_key、model、prompt，返回文本）
+3. 在 `processor.py` 中根据配置动态选择客户端实现
+
+## 依赖项
+
+- `arxiv`：ArXiv API 客户端
+- `httpx`：HTTP 客户端（用于调用 Gemini API）
+- `schedule`：定时任务调度
+
+安装依赖：
+```bash
+pip install arxiv httpx schedule
+```
 
 ## 注意事项
 
-- 每次运行都会调用 LLM API，处理大量论文时会产生一定费用，建议合理设置 `max_papers`
-- ArXiv 数据源为 UTC 时区，插件内部已做时区换算
-- 定时任务在 `on_register` 生命周期中启动，以后台线程运行
+1. **API 成本**：`max_papers` 设置过大会增加 API 调用次数和成本。建议根据实际需求调整（200-500 篇较合理）。
+2. **处理时间**：批量筛选 500 篇论文约需 5-10 分钟（取决于 API 响应速度），用户需耐心等待。
+3. **缓存管理**：缓存按日期分目录，自动清理 7 天前的过期缓存，无需手动维护。
+4. **时区配置**：定时推送自动处理时区转换，配置文件中使用北京时间即可。
+5. **错误处理**：插件已实现重试机制（5xx/429 错误），但网络异常或 API 配额耗尽时仍可能失败。
+
+## 未来优化方向
+
+1. **LLM 抽象**：支持多种 LLM（Claude、GPT、Gemini 等），根据配置动态选择
+2. **增量更新**：支持查询"最近 N 天"的论文，而非仅限昨天
+3. **用户偏好**：支持用户自定义 `research_interest`（而非全局配置）
+4. **结果导出**：支持导出为 Markdown/PDF 格式
