@@ -44,7 +44,7 @@ _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
 _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
-_MAX_SESSIONS_PER_USER = 20     # 每用户历史会话最大保留条数
+_SESSION_EXPIRE_DAYS = 7        # 未收藏会话过期天数（超过此天数未活跃则自动清理）
 _SESSION_INITIAL_COUNT = 5      # /session 初始显示会话数
 _SESSION_PAGE_SIZE = 10         # "显示更多" 每次增加的会话数
 _HISTORY_PREVIEW_ROUNDS = 3     # 切换会话后展示的历史对话轮数
@@ -118,6 +118,8 @@ class ClaudeCodePlugin(Plugin):
     _SPECIAL_COMMANDS: list[dict] = [
         {"usage": "/new",       "brief": "重置会话",                    "detail": "重置当前会话（清除上下文，开启新对话）"},
         {"usage": "/session",   "brief": "查看并恢复历史会话",             "detail": "列出最近历史会话，可点击选择恢复"},
+        {"usage": "/star",      "brief": "收藏/取消收藏当前会话",          "detail": "收藏或取消收藏当前会话（收藏后不会被自动清理）"},
+        {"usage": "/rename <标题>", "brief": "重命名当前会话",            "detail": "修改当前会话的标题，方便后续查找"},
         {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
         {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
         {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
@@ -317,7 +319,7 @@ class ClaudeCodePlugin(Plugin):
     def _upsert_session(
         self, user_id: str, session_id: str, working_dir: str, title: str
     ) -> None:
-        """新增或更新一条历史会话记录，按最近活跃时间倒序保留最多 _MAX_SESSIONS_PER_USER 条"""
+        """新增或更新一条历史会话记录，清理过期会话（超过 _SESSION_EXPIRE_DAYS 天未活跃且未收藏）"""
         now = datetime.datetime.utcnow().isoformat(timespec="seconds")
         path = self._sessions_file_path()
 
@@ -342,20 +344,132 @@ class ClaudeCodePlugin(Plugin):
                     "title": title,
                     "created_at": now,
                     "last_activity": now,
+                    "starred": False,
                 })
 
-            # 按最近活跃时间倒序，截断
+            # 按最近活跃时间倒序，清理过期会话（超过指定天数未活跃且未收藏）
             sessions.sort(key=lambda s: s["last_activity"], reverse=True)
-            data[user_id] = sessions[:_MAX_SESSIONS_PER_USER]
+            cutoff = (
+                datetime.datetime.utcnow()
+                - datetime.timedelta(days=_SESSION_EXPIRE_DAYS)
+            ).isoformat(timespec="seconds")
+            data[user_id] = [
+                s for s in sessions
+                if s.get("starred") or s.get("last_activity", "") >= cutoff
+            ]
 
             # 写回文件（原子操作：先写临时文件，再 rename 替换）
+            self._write_sessions_file(path, data)
+
+    def _write_sessions_file(self, path: pathlib.Path, data: dict) -> None:
+        """原子写入会话文件（先写临时文件，再 rename 替换）"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(str(tmp_path), str(path))
+        except Exception as e:
+            logger.error("[CC] 写入历史会话文件失败: %s", e)
+
+    def _toggle_session_star(self, user_id: str, session_id: str) -> bool | None:
+        """切换会话收藏状态，返回新状态；会话不存在时返回 None"""
+        path = self._sessions_file_path()
+        with self._sessions_lock:
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = path.with_suffix(".json.tmp")
-                tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                os.replace(str(tmp_path), str(path))
-            except Exception as e:
-                logger.error("[CC] 写入历史会话文件失败: %s", e)
+                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception:
+                return None
+            sessions: list[dict] = data.get(user_id, [])
+            target = next((s for s in sessions if s["session_id"] == session_id), None)
+            if not target:
+                return None
+            new_starred = not target.get("starred", False)
+            target["starred"] = new_starred
+            data[user_id] = sessions
+            self._write_sessions_file(path, data)
+            return new_starred
+
+    def _rename_session(self, user_id: str, session_id: str, new_title: str) -> bool:
+        """重命名会话标题，返回是否成功"""
+        path = self._sessions_file_path()
+        with self._sessions_lock:
+            try:
+                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except Exception:
+                return False
+            sessions: list[dict] = data.get(user_id, [])
+            target = next((s for s in sessions if s["session_id"] == session_id), None)
+            if not target:
+                return False
+            target["title"] = new_title
+            data[user_id] = sessions
+            self._write_sessions_file(path, data)
+            return True
+
+    @staticmethod
+    def _build_session_row(session: dict, current_session_id: str) -> list[dict]:
+        """构造单个会话行的卡片元素（信息 + 按钮行 + 分割线）"""
+        sid = session["session_id"]
+        short_id = sid[:8]
+        working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
+        title = session.get("title", "（无标题）")
+        starred = session.get("starred", False)
+        last_activity = session.get("last_activity", "")
+        # 格式化时间（UTC → 北京时间 UTC+8，去掉秒）
+        try:
+            dt = datetime.datetime.fromisoformat(last_activity)
+            dt_beijing = dt + _BEIJING_TZ.utcoffset(None)
+            time_str = dt_beijing.strftime("%m-%d %H:%M")
+        except Exception:
+            time_str = last_activity[:16]
+
+        is_current = sid == current_session_id
+        resume_label = f"{'✓ 当前  ' if is_current else ''}{short_id}…"
+        star_label = "取消收藏" if starred else "收藏"
+
+        return [
+            {
+                "tag": "markdown",
+                "content": f"**{short_id}…** | `{working_dir}` | {time_str}\n{title}",
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": resume_label},
+                        "type": "primary" if is_current else "default",
+                        "value": {
+                            "action": "resume_session",
+                            "plugin": PLUGIN_KEYWORD,
+                            "session_id": sid,
+                            "working_dir": session.get("working_dir", ""),
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": star_label},
+                        "type": "default",
+                        "value": {
+                            "action": "toggle_star_session",
+                            "plugin": PLUGIN_KEYWORD,
+                            "session_id": sid,
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "重命名"},
+                        "type": "default",
+                        "value": {
+                            "action": "show_rename_form",
+                            "plugin": PLUGIN_KEYWORD,
+                            "session_id": sid,
+                        },
+                    },
+                ],
+            },
+            {"tag": "hr"},
+        ]
 
     @staticmethod
     def _build_sessions_card(
@@ -368,9 +482,11 @@ class ClaudeCodePlugin(Plugin):
         Args:
             sessions: 全部会话列表（已按 last_activity 倒序）
             current_session_id: 当前会话 ID，用于高亮标记
-            show_count: 本次显示的会话数量
+            show_count: 本次显示的未收藏会话数量（收藏会话始终全部显示）
         """
-        visible = sessions[:show_count]
+        starred = [s for s in sessions if s.get("starred")]
+        unstarred = [s for s in sessions if not s.get("starred")]
+
         elements: list[dict] = [
             {
                 "tag": "markdown",
@@ -378,44 +494,33 @@ class ClaudeCodePlugin(Plugin):
             },
             {"tag": "hr"},
         ]
-        for session in visible:
-            sid = session["session_id"]
-            short_id = sid[:8]
-            working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
-            title = session.get("title", "（无标题）")
-            last_activity = session.get("last_activity", "")
-            # 格式化时间（UTC → 北京时间 UTC+8，去掉秒）
-            try:
-                dt = datetime.datetime.fromisoformat(last_activity)
-                dt_beijing = dt + _BEIJING_TZ.utcoffset(None)
-                time_str = dt_beijing.strftime("%m-%d %H:%M")
-            except Exception:
-                time_str = last_activity[:16]
 
-            is_current = sid == current_session_id
-            label = f"{'✓ 当前  ' if is_current else ''}{short_id}…"
+        # 收藏会话分区（全部显示，不分页）
+        if starred:
             elements.append({
                 "tag": "markdown",
-                "content": f"**{short_id}…** | `{working_dir}` | {time_str}\n{title}",
+                "content": "**⭐ 收藏会话**",
             })
-            elements.append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "primary" if is_current else "default",
-                    "value": {
-                        "action": "resume_session",
-                        "plugin": PLUGIN_KEYWORD,
-                        "session_id": sid,
-                        "working_dir": session.get("working_dir", ""),
-                    },
-                }],
-            })
-            elements.append({"tag": "hr"})
+            for session in starred:
+                elements.extend(
+                    ClaudeCodePlugin._build_session_row(session, current_session_id)
+                )
+            # 有未收藏会话时，显示分区标题
+            if unstarred:
+                elements.append({
+                    "tag": "markdown",
+                    "content": "**📋 全部会话**",
+                })
 
-        # 还有更多会话时，添加"显示更多"按钮
-        remaining = len(sessions) - show_count
+        # 未收藏会话分区（分页显示）
+        visible_unstarred = unstarred[:show_count]
+        for session in visible_unstarred:
+            elements.extend(
+                ClaudeCodePlugin._build_session_row(session, current_session_id)
+            )
+
+        # 还有更多未收藏会话时，添加"显示更多"按钮
+        remaining = len(unstarred) - show_count
         if remaining > 0:
             next_count = show_count + _SESSION_PAGE_SIZE
             elements.append({
@@ -442,6 +547,68 @@ class ClaudeCodePlugin(Plugin):
         }
 
     # ---- 历史对话预览 ----
+
+    @staticmethod
+    def _build_rename_card(session: dict) -> dict:
+        """构造会话重命名卡片（输入框 + 提交/取消按钮）"""
+        sid = session["session_id"]
+        short_id = sid[:8]
+        working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
+        current_title = session.get("title", "")
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "重命名会话"},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**{short_id}…** | `{working_dir}`\n当前标题：{current_title}",
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "form",
+                    "name": "rename_form",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "rename_title",
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "输入新标题…",
+                            },
+                            "default_value": current_title,
+                        },
+                        {
+                            "tag": "button",
+                            "name": "submit_rename",
+                            "text": {"tag": "plain_text", "content": "确认"},
+                            "type": "primary",
+                            "form_action_type": "submit",
+                            "value": {
+                                "action": "rename_session",
+                                "plugin": PLUGIN_KEYWORD,
+                                "session_id": sid,
+                            },
+                        },
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [{
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "取消"},
+                        "type": "default",
+                        "value": {
+                            "action": "cancel_rename",
+                            "plugin": PLUGIN_KEYWORD,
+                        },
+                    }],
+                },
+            ],
+        }
 
     @staticmethod
     def _find_session_jsonl(session_id: str, working_dir: str) -> Optional[pathlib.Path]:
@@ -2031,6 +2198,39 @@ class ClaudeCodePlugin(Plugin):
             self.bot.send_message(chat_id, "interactive", json.dumps(card))
             return
 
+        # 5a. 特殊指令：收藏/取消收藏当前会话
+        if text == "/star":
+            if not state["session_started"]:
+                self.bot.reply(chat_id, "当前会话尚未开始，无法收藏。请先发送一条消息。")
+                return
+            new_starred = self._toggle_session_star(user_id, state["session_id"])
+            if new_starred is None:
+                self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能收藏。")
+                return
+            tip = "已收藏当前会话 ⭐" if new_starred else "已取消收藏当前会话"
+            self.bot.reply(chat_id, tip)
+            return
+
+        # 5b. 特殊指令：重命名当前会话
+        if text == "/rename":
+            self.bot.reply(chat_id, "请输入新标题，格式：`/rename 新标题`")
+            return
+
+        if text.startswith("/rename "):
+            new_title = text[len("/rename "):].strip()
+            if not new_title:
+                self.bot.reply(chat_id, "请输入新标题，格式：`/rename 新标题`")
+                return
+            if not state["session_started"]:
+                self.bot.reply(chat_id, "当前会话尚未开始，无法重命名。请先发送一条消息。")
+                return
+            ok = self._rename_session(user_id, state["session_id"], new_title)
+            if not ok:
+                self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能重命名。")
+                return
+            self.bot.reply(chat_id, f"会话已重命名为：{new_title}")
+            return
+
         # 6. 特殊指令：切换目录（不带路径则重置为默认）
         if text == "/cd":
             old_session = state["session_id"]
@@ -2167,10 +2367,28 @@ class ClaudeCodePlugin(Plugin):
 
         action = action_value.get("action", "")
 
-        # 飞书表单提交时 button.value 丢失（action 为空），从 form_value 提取自定义回答
+        # 飞书表单提交时 button.value 丢失（action 为空），从 form_value 提取
         if not action and "_form_value" in action_value:
             form_value = action_value["_form_value"]
-            # 表单 input 命名格式为 custom_answer_{qi}，按前缀匹配提取
+
+            # 重命名表单：input name 为 rename_title
+            if "rename_title" in form_value:
+                new_title = (form_value.get("rename_title") or "").strip()
+                if not new_title:
+                    return self.bot.make_card_response(toast="请输入新标题")
+                state = self._get_state(user_id)
+                target_sid = state.get("_pending_rename", "")
+                if not target_sid:
+                    return self.bot.make_card_response(toast="无效的会话 ID")
+                ok = self._rename_session(user_id, target_sid, new_title)
+                if not ok:
+                    return self.bot.make_card_response(toast="重命名失败，会话可能已不存在")
+                state.pop("_pending_rename", None)
+                sessions = self._load_user_sessions(user_id)
+                card = self._build_sessions_card(sessions, state["session_id"])
+                return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
+
+            # 自定义回答表单：input name 格式为 custom_answer_{qi}
             custom_answer = ""
             question_index = 0
             for key, val in form_value.items():
@@ -2381,6 +2599,64 @@ class ClaudeCodePlugin(Plugin):
             return self.bot.make_card_response(
                 toast=f"已切换到会话 {target_sid[:8]}…，发送消息继续"
             )
+
+        if action == "toggle_star_session":
+            target_sid = action_value.get("session_id", "")
+            if not target_sid:
+                return self.bot.make_card_response(toast="无效的会话 ID")
+            new_starred = self._toggle_session_star(user_id, target_sid)
+            if new_starred is None:
+                return self.bot.make_card_response(toast="会话不存在")
+            # 刷新会话列表卡片
+            state = self._get_state(user_id)
+            sessions = self._load_user_sessions(user_id)
+            show_count = action_value.get("show_count", _SESSION_INITIAL_COUNT)
+            card = self._build_sessions_card(sessions, state["session_id"], show_count=show_count)
+            tip = "已收藏" if new_starred else "已取消收藏"
+            return self.bot.make_card_response(card=card, toast=f"{tip} {target_sid[:8]}…")
+
+        if action == "show_rename_form":
+            target_sid = action_value.get("session_id", "")
+            if not target_sid:
+                return self.bot.make_card_response(toast="无效的会话 ID")
+            sessions = self._load_user_sessions(user_id)
+            target = next((s for s in sessions if s["session_id"] == target_sid), None)
+            if not target:
+                return self.bot.make_card_response(toast="会话不存在")
+            # 暂存待重命名的 session_id，用于表单提交时读取
+            state = self._get_state(user_id)
+            state["_pending_rename"] = target_sid
+            card = self._build_rename_card(target)
+            return self.bot.make_card_response(card=card)
+
+        if action == "rename_session":
+            form_value = action_value.get("_form_value", {})
+            new_title = (form_value.get("rename_title") or "").strip()
+            if not new_title:
+                return self.bot.make_card_response(toast="请输入新标题")
+            target_sid = action_value.get("session_id", "")
+            if not target_sid:
+                # 飞书表单提交可能丢失 button.value，从 state 回退
+                state = self._get_state(user_id)
+                target_sid = state.get("_pending_rename", "")
+            if not target_sid:
+                return self.bot.make_card_response(toast="无效的会话 ID")
+            ok = self._rename_session(user_id, target_sid, new_title)
+            if not ok:
+                return self.bot.make_card_response(toast="重命名失败，会话可能已不存在")
+            # 清除暂存状态，刷新会话列表
+            state = self._get_state(user_id)
+            state.pop("_pending_rename", None)
+            sessions = self._load_user_sessions(user_id)
+            card = self._build_sessions_card(sessions, state["session_id"])
+            return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
+
+        if action == "cancel_rename":
+            state = self._get_state(user_id)
+            state.pop("_pending_rename", None)
+            sessions = self._load_user_sessions(user_id)
+            card = self._build_sessions_card(sessions, state["session_id"])
+            return self.bot.make_card_response(card=card)
 
         return P2CardActionTriggerResponse()
 
