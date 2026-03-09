@@ -357,14 +357,8 @@ class PaperDailyPlugin(Plugin):
     def _build_result_card(
         self, relevant: list, today: datetime, total_fetched: int
     ) -> dict:
-        """结果卡片：按 LLM 归纳的 aspect 分组展示推荐论文。"""
+        """结果卡片：按 score 倒序平铺展示推荐论文，每篇附带标签。"""
         date_str = today.strftime("%Y-%m-%d")
-
-        # 按 aspect 分组（空 aspect 归入"其他"）
-        groups: dict[str, list] = {}
-        for paper in relevant:
-            key = paper.aspect.strip() if paper.aspect else "其他"
-            groups.setdefault(key, []).append(paper)
 
         elements = []
 
@@ -374,24 +368,22 @@ class PaperDailyPlugin(Plugin):
             "content": (
                 f"**日期：** {date_str}　"
                 f"**共筛选：** {total_fetched} 篇　"
-                f"**推荐：** {len(relevant)} 篇　"
-                f"**方向：** {len(groups)} 个"
+                f"**推荐：** {len(relevant)} 篇"
             ),
         })
         elements.append({"tag": "hr"})
 
-        # 按 aspect 分组展示，每组按 score 倒序
-        for aspect, papers in groups.items():
-            papers.sort(key=lambda p: p.relevance_score, reverse=True)
-            elements.append({"tag": "markdown", "content": f"**【{aspect}】** ({len(papers)} 篇)"})
-            for paper in papers[:3]:  # 每个方向最多展示 3 篇
-                elements.extend(self._paper_elements(paper))
-            if len(papers) > 3:
-                elements.append({
-                    "tag": "markdown",
-                    "content": f"还有 {len(papers)-3} 篇推荐论文未展示。",
-                })
+        # 按 score 倒序平铺展示，最多 20 篇
+        display_papers = relevant[:20]
+        for paper in display_papers:
+            elements.extend(self._paper_elements(paper))
             elements.append({"tag": "hr"})
+
+        if len(relevant) > 20:
+            elements.append({
+                "tag": "markdown",
+                "content": f"还有 {len(relevant) - 20} 篇推荐论文未展示。",
+            })
 
         return {
             "config": {"wide_screen_mode": True},
@@ -409,11 +401,16 @@ class PaperDailyPlugin(Plugin):
         if len(paper.authors) > 3:
             authors_str += f" 等{len(paper.authors)}人"
 
+        tags_str = ""
+        if paper.tags:
+            tags_str = f"\n标签：{' | '.join(paper.tags)}"
+
         content = (
             f"**[{paper.title}]({paper.entry_url})**\n"
             f"{authors_str}\n"
             f"推荐度：{'★' * paper.relevance_score}{'☆' * (5 - paper.relevance_score)}"
-            f"　{paper.relevance_reason}\n\n"
+            f"　{paper.relevance_reason}"
+            f"{tags_str}\n\n"
             f"{paper.summary_zh or '（无摘要）'}"
         )
         return [{"tag": "markdown", "content": content}]

@@ -1,8 +1,10 @@
-"""论文筛选与摘要处理模块。
+"""论文筛选、摘要与标签处理模块。
 
 包含：
 - 批量论文筛选（每次 10 篇，减少 API 调用次数约 10 倍）
 - 相关论文摘要生成（逐篇）
+- 标签归类（摘要生成后，一次 LLM 调用统一打标签）
+- 标签词表管理（跨天复用已有标签）
 - 按日期缓存（只在成功时写缓存，避免失败结果污染缓存）
 - 自动清理过期缓存（保留最近 7 天）
 """
@@ -37,16 +39,15 @@ _BATCH_FILTER_PROMPT = """\
 {papers_block}
 
 请输出一个 JSON 数组（不要 markdown 代码块），每个元素对应一篇论文，按编号顺序排列。
-推荐的论文（score >= 3）需要给出 aspect 和 reason，不推荐的只需 id 和 score：
+推荐的论文（score >= 3）需要给出 reason，不推荐的只需 id 和 score：
 [
-  {{"id": 1, "recommend": true, "score": 4, "aspect": "关联方向", "reason": "推荐理由"}},
+  {{"id": 1, "recommend": true, "score": 4, "reason": "推荐理由"}},
   {{"id": 2, "recommend": false, "score": 1}},
   ...
 ]
 
 字段说明：
 - score：1=无关, 2=略沾边, 3=值得一读, 4=推荐阅读, 5=强烈推荐
-- aspect：用简短中文概括关联方向（如"KV Cache动态淘汰"、"Agent记忆检索"）
 - reason：一句话推荐理由
 - score >= 3 时 recommend 应为 true
 - 数组长度必须等于 {count}\
@@ -60,6 +61,41 @@ _SUMMARY_PROMPT = """\
 作者：{authors}
 分类：{categories}
 原文摘要：{abstract}\
+"""
+
+_TAG_PROMPT = """\
+你是论文标签助手。请为以下推荐论文分配研究方向标签。
+
+## 标签定义规范
+
+1. **简洁命名**：每个标签 2-8 个中文字符（如"KV Cache 优化"、"Agent 记忆"、"推理加速"）。
+2. **代表性**：标签应概括一类研究的核心方向，而非描述某一篇具体论文的内容。
+3. **区分度**：标签之间语义不得重叠。若两个标签含义相近，必须合并为一个。
+4. **粒度适中**：
+   - 太粗 ✗：「深度学习」「人工智能」→ 无区分价值
+   - 太细 ✗：「基于注意力分数的 KV Cache 动态淘汰策略」→ 只能匹配单篇论文
+   - 合适 ✓：「KV Cache 优化」「稀疏注意力」「Agent 架构」
+5. **参考已有标签**：下方提供了常用标签词表供参考。若已有标签能准确描述论文方向，直接使用；若已有标签不够准确或粒度不合适，应创建更合适的新标签，不必迁就已有标签。
+6. **按需分配**：每篇论文可分配多个标签，涵盖其涉及的所有相关方向。仅分配确实相关的标签，不必凑数，也不要遗漏。
+
+## 已有标签词表
+{existing_tags}
+
+## 研究者关注方向（供参考）
+{research_interest}
+
+## 待分类论文
+{papers}
+
+## 输出要求
+请严格输出以下 JSON 格式，不要包含其他内容：
+{{
+  "mapping": {{
+    "论文arxiv_id": ["标签1", "标签2"],
+    "论文arxiv_id": ["标签1"],
+    ...
+  }}
+}}\
 """
 
 
@@ -125,6 +161,51 @@ def _cleanup_old_cache() -> None:
         logger.info(f"缓存清理完成: 删除 {deleted_count} 个过期目录（保留最近 {CACHE_RETENTION_DAYS} 天）")
 
 
+# ---------- 标签词表管理 ----------
+
+MAX_TAGS_IN_PROMPT = 30  # 传给 LLM 的最大标签数（按使用频率取 top N）
+
+
+def _tags_path() -> Path:
+    """返回标签词表文件路径（插件目录下 tags.json）。"""
+    return _PLUGIN_DIR / "tags.json"
+
+
+def _load_tags() -> dict[str, dict]:
+    """加载标签词表，返回 {标签名: {"count": N, "last_used": "YYYY-MM-DD"}}。"""
+    path = _tags_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("tags", {})
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"标签词表读取失败，忽略: {e}")
+        return {}
+
+
+def _save_tags(tags: dict[str, dict]) -> None:
+    """保存标签词表（按 count 降序）。"""
+    sorted_tags = dict(sorted(tags.items(), key=lambda x: x[1].get("count", 0), reverse=True))
+    try:
+        _tags_path().write_text(
+            json.dumps({"tags": sorted_tags}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        logger.warning(f"标签词表写入失败: {e}")
+
+
+def _top_tags_for_prompt(tags: dict[str, dict]) -> str:
+    """取使用频率最高的 top N 个标签，格式化为 prompt 文本。"""
+    if not tags:
+        return "（暂无，请自由创建）"
+    # 按 count 降序排列，取前 MAX_TAGS_IN_PROMPT 个
+    sorted_items = sorted(tags.items(), key=lambda x: x[1].get("count", 0), reverse=True)
+    top = [name for name, _ in sorted_items[:MAX_TAGS_IN_PROMPT]]
+    return "、".join(top)
+
+
 # ---------- JSON 解析工具 ----------
 
 def _parse_json(text: str) -> dict | list:
@@ -166,6 +247,98 @@ def _parse_json(text: str) -> dict | list:
     raise ValueError(f"无法解析 JSON: {text[:150]}")
 
 
+# ---------- 标签归类 ----------
+
+def _assign_tags(
+    papers: list[Paper],
+    config: AppConfig,
+    cache: dict,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> None:
+    """对推荐论文统一打标签（一次 LLM 调用），并更新标签词表和缓存。
+
+    基于 title + reason + summary_zh 进行归类，放在摘要生成之后执行。
+    """
+    # 筛选需要打标签的论文（推荐且缓存中无 tags）
+    need_tags = [p for p in papers if p.is_recommended
+                 and "tags" not in cache.get(p.arxiv_id, {})]
+
+    if not need_tags:
+        logger.info("标签归类: 所有推荐论文已有缓存标签，跳过")
+        return
+
+    if progress_callback:
+        progress_callback(
+            f"正在为 {len(need_tags)} 篇推荐论文打标签..."
+        )
+
+    # 构造论文列表文本
+    papers_text = ""
+    for paper in need_tags:
+        papers_text += (
+            f"\n- arxiv_id: {paper.arxiv_id}\n"
+            f"  标题: {paper.title}\n"
+            f"  推荐理由: {paper.relevance_reason}\n"
+            f"  摘要: {paper.summary_zh or '（无摘要）'}\n"
+        )
+
+    existing_tags = _load_tags()
+    existing_tags_str = _top_tags_for_prompt(existing_tags)
+
+    prompt = _TAG_PROMPT.format(
+        existing_tags=existing_tags_str,
+        research_interest=config.research_interest,
+        papers=papers_text,
+    )
+
+    try:
+        resp = call_gemini(
+            config.llm_api_key, config.llm_model, prompt,
+            base_url=config.llm_base_url,
+        )
+        result = _parse_json(resp)
+        if not isinstance(result, dict):
+            raise ValueError(f"期望 JSON 对象，实际: {type(result).__name__}")
+
+        mapping = result.get("mapping", {})
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # 收集本次所有标签
+        all_tags_this_run: set[str] = set()
+
+        for paper in need_tags:
+            paper_tags = mapping.get(paper.arxiv_id, [])
+            if not isinstance(paper_tags, list):
+                paper_tags = []
+            paper.tags = paper_tags
+            all_tags_this_run.update(paper_tags)
+
+            cache.setdefault(paper.arxiv_id, {})["tags"] = paper_tags
+            logger.info(f"  标签: {paper.title[:40]} → {paper_tags}")
+
+        _save_cache(cache)
+
+        # 更新标签词表（更新计数和最后使用日期）
+        new_count = 0
+        for tag_name in all_tags_this_run:
+            if tag_name in existing_tags:
+                existing_tags[tag_name]["count"] = existing_tags[tag_name].get("count", 0) + 1
+                existing_tags[tag_name]["last_used"] = today_str
+            else:
+                existing_tags[tag_name] = {"count": 1, "last_used": today_str}
+                new_count += 1
+
+        _save_tags(existing_tags)
+        if new_count:
+            logger.info(f"标签词表更新: 新增 {new_count} 个标签，总计 {len(existing_tags)} 个")
+
+        logger.info(f"标签归类完成: {len(need_tags)} 篇论文")
+
+    except (GeminiError, ValueError) as e:
+        logger.warning(f"标签归类失败: {e}")
+        # 标签归类失败不影响日报推送，论文仍可无标签展示
+
+
 # ---------- 主处理流程 ----------
 
 def process_papers(
@@ -173,7 +346,7 @@ def process_papers(
     config: AppConfig,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> list[Paper]:
-    """批量筛选论文（每批 10 篇），相关的逐篇生成中文摘要。支持断点续跑。
+    """批量筛选论文 → 生成摘要 → 标签归类。支持断点续跑。
 
     Args:
         papers: 待处理的论文列表。
@@ -256,13 +429,11 @@ def process_papers(
 
                 paper.is_recommended = bool(result.get("recommend", False))
                 paper.relevance_score = int(result.get("score", 0))
-                paper.aspect = result.get("aspect", "")
                 paper.relevance_reason = result.get("reason", "")
 
                 cache.setdefault(paper.arxiv_id, {})["filter"] = {
                     "is_recommended": paper.is_recommended,
                     "relevance_score": paper.relevance_score,
-                    "aspect": paper.aspect,
                     "relevance_reason": paper.relevance_reason,
                 }
 
@@ -303,7 +474,7 @@ def process_papers(
             abstract=paper.abstract,
         )
         try:
-            paper.summary_zh = _call_gemini(
+            paper.summary_zh = call_gemini(
                 config.llm_api_key, config.llm_model, prompt,
                 base_url=config.llm_base_url,
             )
@@ -326,6 +497,19 @@ def process_papers(
             if "summary" in c:
                 paper.summary_zh = c["summary"]
 
+    # ---- 阶段 4：标签归类 ----
+    _assign_tags(
+        papers, config, cache,
+        progress_callback=progress_callback,
+    )
+
+    # 恢复有缓存标签的论文
+    for paper in papers:
+        if paper.is_recommended and not paper.tags:
+            c = cache.get(paper.arxiv_id, {})
+            if "tags" in c:
+                paper.tags = c["tags"]
+
     # 收集并排序
     relevant = [p for p in papers if p.is_recommended]
     relevant.sort(key=lambda p: p.relevance_score, reverse=True)
@@ -334,12 +518,13 @@ def process_papers(
 
 
 def _restore_from_cache(paper: Paper, c: dict) -> None:
-    """从缓存字典中恢复 Paper 的筛选和摘要字段。"""
+    """从缓存字典中恢复 Paper 的筛选、摘要和标签字段。"""
     if "filter" in c:
         f = c["filter"]
         paper.is_recommended = f.get("is_recommended", False)
         paper.relevance_score = f.get("relevance_score", 0)
-        paper.aspect = f.get("aspect", "")
         paper.relevance_reason = f.get("relevance_reason", "")
     if "summary" in c:
         paper.summary_zh = c["summary"]
+    if "tags" in c:
+        paper.tags = c["tags"]
