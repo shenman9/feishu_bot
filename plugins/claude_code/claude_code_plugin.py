@@ -4,7 +4,7 @@ Claude Code 桥接插件
 通过 subprocess 调用本地 Claude Code CLI，
 将飞书消息作为 prompt 发送，实时流式回显结果到飞书卡片。
 支持会话持续（--session-id）、取消运行、清空会话、切换工作目录等操作。
-支持交互式权限确认：通过 PermissionRequest Hook + HTTP 服务器，
+支持交互式权限确认：通过 PreToolUse Hook + HTTP 服务器，
 将 Claude Code 的权限请求转发给飞书用户确认。
 """
 
@@ -24,85 +24,46 @@ from typing import Optional
 
 from config import load_plugin_config
 from core.plugin import Plugin
-from plugins.claude_code.permission_server import PermissionServer
+
+from plugins.claude_code.constants import (
+    PLUGIN_KEYWORD,
+    CC_DATA_DIR,
+    DEFAULT_MODELS,
+    HISTORY_PREVIEW_ROUNDS,
+    display_path,
+    resolve_working_dir,
+)
+from plugins.claude_code.stream_parser import (
+    DEFAULT_MAX_OUTPUT,
+    format_tool_call,
+    parse_stream_line,
+    render_log,
+)
+from plugins.claude_code import cards
+from plugins.claude_code.cards import _SESSION_INITIAL_COUNT, _SESSION_PAGE_SIZE
+from plugins.claude_code.session_store import (
+    SessionStore,
+    find_session_jsonl,
+    parse_session_rounds,
+)
+from plugins.claude_code.permission_manager import (
+    PermissionManager,
+    _DEFAULT_PERM_PORT,
+    _DEFAULT_PERM_TIMEOUT,
+    is_within_working_dir,
+)
 
 logger = logging.getLogger(__name__)
 
-# 流式更新控制（与 claude_chat 一致）
+# 流式更新控制
 _PATCH_INTERVAL = 0.5       # 最小更新间隔（秒）
 _PATCH_MIN_CHARS = 50       # 最小新增字符数触发更新
 _IDLE_PATCH_INTERVAL = 2.0  # 无新数据时进度提示刷新间隔（秒）
 
-# 工具调用日志显示控制
-_MAX_STREAK_DISPLAY = 15    # 连续工具调用段最多显示条数（超出则折叠）
-_TOOL_PARAM_MAX = 60        # 工具参数摘要最大字符数
-
 # 默认配置
 _DEFAULT_TIMEOUT = 600          # 默认超时 10 分钟
-_DEFAULT_MAX_OUTPUT = 28000     # 飞书卡片 markdown 最大字符数
+_DEFAULT_MAX_OUTPUT = DEFAULT_MAX_OUTPUT
 _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
-_DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
-_DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
-_ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
-_SESSION_EXPIRE_DAYS = 7        # 未收藏会话过期天数（超过此天数未活跃则自动清理）
-_SESSION_INITIAL_COUNT = 5      # /session 初始显示会话数
-_SESSION_PAGE_SIZE = 10         # "显示更多" 每次增加的会话数
-_HISTORY_PREVIEW_ROUNDS = 3     # 切换会话后展示的历史对话轮数
-_HISTORY_TEXT_MAX = 300         # 历史预览单条消息最大展示字符数
-
-# /model 默认可选模型列表（配置文件未指定时使用）
-_DEFAULT_MODELS: list[dict] = [
-    {"alias": "sonnet", "label": "Sonnet", "desc": "速度与质量均衡，适合日常开发任务"},
-    {"alias": "opus", "label": "Opus", "desc": "最强推理能力，适合复杂架构和疑难问题"},
-    {"alias": "haiku", "label": "Haiku", "desc": "最快响应速度，适合简单问答和快速任务"},
-]
-_BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
-
-# 插件运行时数据目录：<项目根目录>/data/claude_code/（不提交 VCS）
-_PLUGIN_DIR = pathlib.Path(__file__).parent      # plugins/claude_code/
-_PROJECT_ROOT = _PLUGIN_DIR.parent.parent        # hub_agent/
-_CC_DATA_DIR = _PROJECT_ROOT / "data" / "claude_code"
-
-PLUGIN_KEYWORD = "CC"
-
-
-def _display_path(path: str, base: str = "") -> str:
-    """格式化路径用于展示：若相对路径更短则优先使用
-
-    Args:
-        path: 原始路径（若非绝对路径则原样返回）
-        base: 参考基准目录（通常为工作目录），用于计算相对路径
-
-    Returns:
-        原路径、相对于 base 的路径、以及 ~ 缩写中最短的一个
-    """
-    if not path or not os.path.isabs(path):
-        return path
-    candidates = [path]
-    # 尝试相对于 base 的路径
-    if base:
-        try:
-            rel = os.path.relpath(path, base)
-            candidates.append(rel)
-        except ValueError:
-            pass
-    # 尝试 ~ 缩写
-    home = os.path.expanduser("~")
-    if path == home:
-        candidates.append("~")
-    elif path.startswith(home + os.sep):
-        candidates.append("~" + path[len(home):])
-    return min(candidates, key=len)
-
-
-def _resolve_working_dir(raw: str = "") -> str:
-    """将 working_dir 配置值解析为有效绝对路径
-
-    使用 realpath 归一化，解析符号链接和 .. 等相对路径组件。
-    空字符串表示"使用默认目录"，回落到进程当前工作目录 os.getcwd()。
-    这样 state["working_dir"] 始终持有真实绝对路径，避免下游散落多处 fallback。
-    """
-    return os.path.realpath(raw) if raw else os.path.realpath(os.getcwd())
 
 
 class ClaudeCodePlugin(Plugin):
@@ -140,7 +101,7 @@ class ClaudeCodePlugin(Plugin):
     ):
         super().__init__()
         # 运行时数据目录（子类可注入，实现多实例隔离）
-        self._data_dir: pathlib.Path = data_dir if data_dir is not None else _CC_DATA_DIR
+        self._data_dir: pathlib.Path = data_dir if data_dir is not None else CC_DATA_DIR
         # 配置目录（None 表示使用默认的 config/claude_code.yaml）
         self._config_dir: Optional[pathlib.Path] = config_dir
         # user_id -> 用户状态
@@ -150,12 +111,22 @@ class ClaudeCodePlugin(Plugin):
         # user_id -> 运行中的线程
         self._running_threads: dict[str, threading.Thread] = {}
         self._config: Optional[dict] = None
-        # 权限确认服务器（懒初始化）
-        self._perm_server: Optional[PermissionServer] = None
-        self._perm_server_started = False
-        self._perm_server_lock = threading.Lock()
-        # 历史会话文件读写锁
-        self._sessions_lock = threading.Lock()
+        # 会话持久化
+        self._session_store = SessionStore(self._data_dir)
+        # 权限管理器（懒初始化 — ensure_server 在首次执行时调用）
+        self._perm_mgr: Optional[PermissionManager] = None
+
+    def _ensure_perm_manager(self) -> PermissionManager:
+        """确保权限管理器已创建（需要 bot 已注册）"""
+        if self._perm_mgr is None:
+            self._perm_mgr = PermissionManager(
+                data_dir=self._data_dir,
+                load_config=self._load_plugin_config,
+                get_state=self._get_state,
+                send_card=lambda chat_id, content: self.bot.send_message(chat_id, "interactive", content),
+                send_card_get_id=lambda chat_id, content: self.bot.send_message_get_id(chat_id, "interactive", content),
+            )
+        return self._perm_mgr
 
     # ---- 元信息 ----
 
@@ -214,7 +185,7 @@ class ClaudeCodePlugin(Plugin):
                 "run_as_user": cc.get("run_as_user", ""),
                 "permission_server_port": cc.get("permission_server_port", _DEFAULT_PERM_PORT),
                 "permission_timeout": cc.get("permission_timeout", _DEFAULT_PERM_TIMEOUT),
-                "models": cc.get("models", _DEFAULT_MODELS),
+                "models": cc.get("models", DEFAULT_MODELS),
                 "default_model": cc.get("default_model", ""),
             }
         return self._config
@@ -233,7 +204,7 @@ class ClaudeCodePlugin(Plugin):
                 "session_id": str(uuid.uuid4()),
                 "session_started": False,
                 "running": False,
-                "working_dir": _resolve_working_dir(cfg["default_working_dir"]),
+                "working_dir": resolve_working_dir(cfg["default_working_dir"]),
                 "last_chat_id": "",
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
                 "session_model": cfg["default_model"],  # 会话级模型: "" 表示 CLI 默认
@@ -267,19 +238,19 @@ class ClaudeCodePlugin(Plugin):
         """若 default_perm_mode 配置为 manual_select，向用户发送权限模式选择卡片"""
         if self._load_plugin_config()["default_perm_mode"] == "manual_select":
             state = self._get_state(user_id)
-            card = self._build_permission_mode_card(state["session_perm_mode"])
+            card = cards.build_permission_mode_card(state["session_perm_mode"])
             self.bot.send_message(chat_id, "interactive", card)
 
     def _format_status(self, user_id: str) -> str:
         """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
         state = self._get_state(user_id)
-        working_dir = state["working_dir"]  # 始终为有效绝对路径（由 _resolve_working_dir 保证）
+        working_dir = state["working_dir"]  # 始终为有效绝对路径（由 resolve_working_dir 保证）
         cfg = self._load_plugin_config()
-        default_dir = _resolve_working_dir(cfg.get("default_working_dir", ""))
+        default_dir = resolve_working_dir(cfg.get("default_working_dir", ""))
         if working_dir == default_dir:
-            working_dir_display = f"{_display_path(working_dir)} (默认)"
+            working_dir_display = f"{display_path(working_dir)} (默认)"
         else:
-            working_dir_display = _display_path(working_dir)
+            working_dir_display = display_path(working_dir)
         status = "运行中" if state["running"] else "空闲"
         perm_mode = state.get("session_perm_mode", "interactive")
         model_alias = state.get("session_model", "")
@@ -298,1139 +269,6 @@ class ClaudeCodePlugin(Plugin):
             if m.get("alias") == alias:
                 return m.get("label", alias)
         return alias
-
-    # ---- 历史会话持久化 ----
-
-    def _sessions_file_path(self) -> pathlib.Path:
-        """返回历史会话存储文件路径"""
-        return self._data_dir / "feishu_sessions.json"
-
-    def _load_user_sessions(self, user_id: str) -> list[dict]:
-        """读取指定用户的历史会话列表（文件不存在则返回空列表）"""
-        path = self._sessions_file_path()
-        try:
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data.get(user_id, [])
-        except Exception as e:
-            logger.warning("[CC] 读取历史会话文件失败: %s", e)
-        return []
-
-    def _upsert_session(
-        self, user_id: str, session_id: str, working_dir: str, title: str
-    ) -> None:
-        """新增或更新一条历史会话记录，清理过期会话（超过 _SESSION_EXPIRE_DAYS 天未活跃且未收藏）"""
-        now = datetime.datetime.utcnow().isoformat(timespec="seconds")
-        path = self._sessions_file_path()
-
-        with self._sessions_lock:
-            # 读取全量数据
-            try:
-                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            except Exception as e:
-                logger.warning("[CC] 读取历史会话文件失败，重置: %s", e)
-                data = {}
-
-            sessions: list[dict] = data.get(user_id, [])
-
-            # 查找是否已存在该 session_id
-            existing = next((s for s in sessions if s["session_id"] == session_id), None)
-            if existing:
-                existing["last_activity"] = now
-            else:
-                sessions.insert(0, {
-                    "session_id": session_id,
-                    "working_dir": working_dir,
-                    "title": title,
-                    "created_at": now,
-                    "last_activity": now,
-                    "starred": False,
-                })
-
-            # 按最近活跃时间倒序，清理过期会话（超过指定天数未活跃且未收藏）
-            sessions.sort(key=lambda s: s["last_activity"], reverse=True)
-            cutoff = (
-                datetime.datetime.utcnow()
-                - datetime.timedelta(days=_SESSION_EXPIRE_DAYS)
-            ).isoformat(timespec="seconds")
-            data[user_id] = [
-                s for s in sessions
-                if s.get("starred") or s.get("last_activity", "") >= cutoff
-            ]
-
-            # 写回文件（原子操作：先写临时文件，再 rename 替换）
-            self._write_sessions_file(path, data)
-
-    def _write_sessions_file(self, path: pathlib.Path, data: dict) -> None:
-        """原子写入会话文件（先写临时文件，再 rename 替换）"""
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = path.with_suffix(".json.tmp")
-            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(str(tmp_path), str(path))
-        except Exception as e:
-            logger.error("[CC] 写入历史会话文件失败: %s", e)
-
-    def _toggle_session_star(self, user_id: str, session_id: str) -> bool | None:
-        """切换会话收藏状态，返回新状态；会话不存在时返回 None"""
-        path = self._sessions_file_path()
-        with self._sessions_lock:
-            try:
-                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            except Exception:
-                return None
-            sessions: list[dict] = data.get(user_id, [])
-            target = next((s for s in sessions if s["session_id"] == session_id), None)
-            if not target:
-                return None
-            new_starred = not target.get("starred", False)
-            target["starred"] = new_starred
-            data[user_id] = sessions
-            self._write_sessions_file(path, data)
-            return new_starred
-
-    def _rename_session(self, user_id: str, session_id: str, new_title: str) -> bool:
-        """重命名会话标题，返回是否成功"""
-        path = self._sessions_file_path()
-        with self._sessions_lock:
-            try:
-                data: dict = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            except Exception:
-                return False
-            sessions: list[dict] = data.get(user_id, [])
-            target = next((s for s in sessions if s["session_id"] == session_id), None)
-            if not target:
-                return False
-            target["title"] = new_title
-            data[user_id] = sessions
-            self._write_sessions_file(path, data)
-            return True
-
-    @staticmethod
-    def _build_session_row(session: dict, current_session_id: str) -> list[dict]:
-        """构造单个会话行的卡片元素（信息 + 按钮行 + 分割线）"""
-        sid = session["session_id"]
-        short_id = sid[:8]
-        working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
-        title = session.get("title", "（无标题）")
-        starred = session.get("starred", False)
-        last_activity = session.get("last_activity", "")
-        # 格式化时间（UTC → 北京时间 UTC+8，去掉秒）
-        try:
-            dt = datetime.datetime.fromisoformat(last_activity)
-            dt_beijing = dt + _BEIJING_TZ.utcoffset(None)
-            time_str = dt_beijing.strftime("%m-%d %H:%M")
-        except Exception:
-            time_str = last_activity[:16]
-
-        is_current = sid == current_session_id
-        resume_label = f"{'✓ 当前  ' if is_current else ''}{short_id}…"
-        star_label = "取消收藏" if starred else "收藏"
-
-        return [
-            {
-                "tag": "markdown",
-                "content": f"**{short_id}…** | `{working_dir}` | {time_str}\n{title}",
-            },
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": resume_label},
-                        "type": "primary" if is_current else "default",
-                        "value": {
-                            "action": "resume_session",
-                            "plugin": PLUGIN_KEYWORD,
-                            "session_id": sid,
-                            "working_dir": session.get("working_dir", ""),
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": star_label},
-                        "type": "default",
-                        "value": {
-                            "action": "toggle_star_session",
-                            "plugin": PLUGIN_KEYWORD,
-                            "session_id": sid,
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "重命名"},
-                        "type": "default",
-                        "value": {
-                            "action": "show_rename_form",
-                            "plugin": PLUGIN_KEYWORD,
-                            "session_id": sid,
-                        },
-                    },
-                ],
-            },
-            {"tag": "hr"},
-        ]
-
-    @staticmethod
-    def _build_sessions_card(
-        sessions: list[dict],
-        current_session_id: str,
-        show_count: int = _SESSION_INITIAL_COUNT,
-    ) -> dict:
-        """构造历史会话选择卡片
-
-        Args:
-            sessions: 全部会话列表（已按 last_activity 倒序）
-            current_session_id: 当前会话 ID，用于高亮标记
-            show_count: 本次显示的未收藏会话数量（收藏会话始终全部显示）
-        """
-        starred = [s for s in sessions if s.get("starred")]
-        unstarred = [s for s in sessions if not s.get("starred")]
-
-        elements: list[dict] = [
-            {
-                "tag": "markdown",
-                "content": "点击选择要恢复的会话（将替换当前会话上下文）",
-            },
-            {"tag": "hr"},
-        ]
-
-        # 收藏会话分区（全部显示，不分页）
-        if starred:
-            elements.append({
-                "tag": "markdown",
-                "content": "**⭐ 收藏会话**",
-            })
-            for session in starred:
-                elements.extend(
-                    ClaudeCodePlugin._build_session_row(session, current_session_id)
-                )
-            # 有未收藏会话时，显示分区标题
-            if unstarred:
-                elements.append({
-                    "tag": "markdown",
-                    "content": "**📋 全部会话**",
-                })
-
-        # 未收藏会话分区（分页显示）
-        visible_unstarred = unstarred[:show_count]
-        for session in visible_unstarred:
-            elements.extend(
-                ClaudeCodePlugin._build_session_row(session, current_session_id)
-            )
-
-        # 还有更多未收藏会话时，添加"显示更多"按钮
-        remaining = len(unstarred) - show_count
-        if remaining > 0:
-            next_count = show_count + _SESSION_PAGE_SIZE
-            elements.append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"显示更多（还有 {remaining} 个）"},
-                    "type": "default",
-                    "value": {
-                        "action": "show_more_sessions",
-                        "plugin": PLUGIN_KEYWORD,
-                        "show_count": next_count,
-                    },
-                }],
-            })
-
-        return {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Claude Code 历史会话"},
-                "template": "blue",
-            },
-            "elements": elements,
-        }
-
-    # ---- 历史对话预览 ----
-
-    @staticmethod
-    def _build_rename_card(session: dict) -> dict:
-        """构造会话重命名卡片（输入框 + 提交/取消按钮）"""
-        sid = session["session_id"]
-        short_id = sid[:8]
-        working_dir = _display_path(session.get("working_dir") or "") or "默认目录"
-        current_title = session.get("title", "")
-
-        return {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "重命名会话"},
-                "template": "blue",
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"**{short_id}…** | `{working_dir}`\n当前标题：{current_title}",
-                },
-                {"tag": "hr"},
-                {
-                    "tag": "form",
-                    "name": "rename_form",
-                    "elements": [
-                        {
-                            "tag": "input",
-                            "name": "rename_title",
-                            "placeholder": {
-                                "tag": "plain_text",
-                                "content": "输入新标题…",
-                            },
-                            "default_value": current_title,
-                        },
-                        {
-                            "tag": "button",
-                            "name": "submit_rename",
-                            "text": {"tag": "plain_text", "content": "确认"},
-                            "type": "primary",
-                            "form_action_type": "submit",
-                            "value": {
-                                "action": "rename_session",
-                                "plugin": PLUGIN_KEYWORD,
-                                "session_id": sid,
-                            },
-                        },
-                    ],
-                },
-                {
-                    "tag": "action",
-                    "actions": [{
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "取消"},
-                        "type": "default",
-                        "value": {
-                            "action": "cancel_rename",
-                            "plugin": PLUGIN_KEYWORD,
-                        },
-                    }],
-                },
-            ],
-        }
-
-    @staticmethod
-    def _find_session_jsonl(session_id: str, working_dir: str) -> Optional[pathlib.Path]:
-        """定位 Claude Code 会话的 JSONL 文件
-
-        优先按 working_dir 编码路径查找，找不到则全局搜索。
-        """
-        claude_projects = pathlib.Path.home() / ".claude" / "projects"
-        if not claude_projects.exists():
-            return None
-        # 优先：按 working_dir 构造路径（将 / 全替换为 -）
-        if working_dir:
-            encoded = working_dir.replace("/", "-")
-            candidate = claude_projects / encoded / f"{session_id}.jsonl"
-            if candidate.exists():
-                return candidate
-        # 回退：全局搜索（working_dir 可能已变更或编码规则有差异）
-        for path in claude_projects.glob(f"*/{session_id}.jsonl"):
-            return path
-        return None
-
-    @staticmethod
-    def _parse_session_rounds(
-        jsonl_path: pathlib.Path, n: int
-    ) -> list[tuple[str, str]]:
-        """解析 JSONL，返回最后 n 轮 (user_text, assistant_text) 对
-
-        跳过 progress、tool_use、thinking 等非文本条目。
-        """
-        rounds: list[tuple[str, str]] = []
-        pending_user: Optional[str] = None
-
-        try:
-            with open(jsonl_path, encoding="utf-8") as f:
-                for raw in f:
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        entry = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg_type = entry.get("type")
-                    if msg_type == "user":
-                        content = entry.get("message", {}).get("content", "")
-                        if isinstance(content, str):
-                            text = content.strip()
-                            if text:
-                                pending_user = text
-                        elif isinstance(content, list):
-                            parts = [
-                                c.get("text", "") for c in content
-                                if c.get("type") == "text"
-                            ]
-                            text = "\n".join(parts).strip()
-                            # 过滤工具调用结果（tool_result 类型的 user 消息无文本内容）
-                            if text:
-                                pending_user = text
-                    elif msg_type == "assistant" and pending_user is not None:
-                        content = entry.get("message", {}).get("content", [])
-                        if isinstance(content, list):
-                            parts = [
-                                c.get("text", "") for c in content
-                                if c.get("type") == "text"
-                            ]
-                            assistant_text = "\n".join(parts).strip()
-                            if assistant_text:
-                                rounds.append((pending_user, assistant_text))
-                                pending_user = None
-        except Exception as e:
-            logger.warning("[CC] 读取会话历史失败: %s", e)
-
-        return rounds[-n:]
-
-    @staticmethod
-    def _build_history_preview_card(
-        session_id: str, rounds: list[tuple[str, str]]
-    ) -> dict:
-        """构造会话历史预览卡片，展示最近几轮用户/CC 对话"""
-        elements: list[dict] = []
-        for user_text, assistant_text in rounds:
-            if len(assistant_text) > _HISTORY_TEXT_MAX:
-                assistant_text = assistant_text[:_HISTORY_TEXT_MAX] + "…（省略）"
-            elements.append({
-                "tag": "markdown",
-                "content": f"👤 **你**\n{user_text}",
-            })
-            elements.append({
-                "tag": "markdown",
-                "content": f"🤖 **CC**\n{assistant_text}",
-            })
-            elements.append({"tag": "hr"})
-
-        return {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": f"会话 {session_id[:8]}… 最近对话",
-                },
-                "template": "green",
-            },
-            "elements": elements,
-        }
-
-    # ---- 权限确认服务器 ----
-
-    def _needs_permission_server(self) -> bool:
-        """判断是否需要启动权限确认服务器
-
-        默认始终启用交互式权限确认（用户可在会话内切换免确认模式），
-        因此权限服务器始终需要启动。
-        """
-        return True
-
-    def _ensure_permission_server(self) -> None:
-        """确保权限确认服务器已启动（懒初始化，线程安全）"""
-        if self._perm_server_started or not self._needs_permission_server():
-            return
-
-        with self._perm_server_lock:
-            # 双重检查：加锁后再次确认，防止并发重复初始化
-            if self._perm_server_started:
-                return
-
-            cfg = self._load_plugin_config()
-            port = cfg["permission_server_port"]
-            timeout = cfg["permission_timeout"]
-
-            perm_server = PermissionServer(
-                port=port,
-                timeout=timeout,
-                on_permission_request=self._on_permission_request,
-                on_permission_timeout=self._on_permission_timeout,
-            )
-            try:
-                perm_server.start()
-            except Exception as e:
-                # 仅 start()（端口绑定）失败时删除端口文件，让 hook 降级为自动放行
-                # 避免 hook 脚本向无效端口发请求后等待 curl 超时（每次工具调用卡 180s）
-                logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
-                self._delete_port_file()
-                return
-
-            # start() 成功后才更新状态——_setup_hook 等后续步骤的失败不应回滚端口文件
-            self._perm_server = perm_server
-            self._perm_server_started = True
-            self._write_port_file(port)
-            self._setup_hook()
-
-    def _get_target_home_dir(self, run_as_user: str) -> str | None:
-        """获取目标用户的 HOME 目录。
-
-        若 run_as_user 已设置且当前为 root，返回该用户主目录；
-        用户不存在时返回 None；其余情况返回当前用户主目录。
-        """
-        if run_as_user and os.getuid() == 0:
-            try:
-                return pwd.getpwnam(run_as_user).pw_dir
-            except KeyError:
-                return None
-        return os.path.expanduser("~")
-
-    def _write_port_file(self, port: int) -> None:
-        """将端口号和超时值写入项目数据目录，供 Hook 脚本读取
-
-        写入两个文件：
-        - .feishu_perm_port: 权限服务器端口号
-        - .feishu_perm_timeout: 权限确认超时秒数（hook 用于设置 curl --max-time）
-        """
-        port_file = self._data_dir / ".feishu_perm_port"
-        timeout_file = self._data_dir / ".feishu_perm_timeout"
-        try:
-            port_file.parent.mkdir(parents=True, exist_ok=True)
-            port_file.write_text(str(port))
-            # 写入超时值，hook 脚本据此设置 curl --max-time
-            cfg = self._load_plugin_config()
-            timeout_file.write_text(str(cfg["permission_timeout"]))
-            # 如果以 root 运行且有 run_as_user，修正文件归属让 hook 脚本可读
-            run_as_user = cfg.get("run_as_user", "")
-            if run_as_user and os.getuid() == 0:
-                try:
-                    pw = pwd.getpwnam(run_as_user)
-                    os.chown(port_file, pw.pw_uid, pw.pw_gid)
-                    os.chown(timeout_file, pw.pw_uid, pw.pw_gid)
-                except (KeyError, OSError) as e:
-                    logger.warning("[CC] 修正端口/超时文件归属失败: %s", e)
-            logger.info("[CC] 端口文件已写入: %s", port_file)
-        except OSError as e:
-            logger.error("[CC] 写入端口文件失败: %s", e)
-
-    def _delete_port_file(self) -> None:
-        """删除端口文件和超时文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
-        port_file = self._data_dir / ".feishu_perm_port"
-        timeout_file = self._data_dir / ".feishu_perm_timeout"
-        try:
-            port_file.unlink(missing_ok=True)
-            timeout_file.unlink(missing_ok=True)
-            logger.info("[CC] 端口/超时文件已删除: %s", port_file)
-        except OSError as e:
-            logger.warning("[CC] 删除端口/超时文件失败: %s", e)
-
-    def _setup_hook(self) -> None:
-        """自动注册 PreToolUse Hook 到 Claude 用户设置
-
-        将 Hook 脚本路径写入目标用户的 ~/.claude/settings.json。
-        """
-        cfg = self._load_plugin_config()
-        run_as_user = cfg.get("run_as_user", "")
-        home_dir = self._get_target_home_dir(run_as_user)
-        if home_dir is None:
-            logger.error("[CC] Hook 注册失败: 用户 %s 不存在", run_as_user)
-            return
-
-        settings_path = pathlib.Path(home_dir) / ".claude" / "settings.json"
-
-        # 读取现有设置
-        settings = {}
-        if settings_path.exists():
-            try:
-                settings = json.loads(settings_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                logger.warning("[CC] 读取 Claude 设置失败，将创建新文件")
-
-        # Hook 脚本绝对路径
-        hook_script = str(
-            pathlib.Path(__file__).parent / "permission_hook.sh"
-        )
-
-        # 检查是否已配置（PreToolUse）
-        hooks = settings.get("hooks", {})
-        pre_hooks = hooks.get("PreToolUse", [])
-
-        already_configured = False
-        for rule in pre_hooks:
-            for h in rule.get("hooks", []):
-                if h.get("command") == hook_script:
-                    already_configured = True
-                    break
-
-        if already_configured:
-            logger.info("[CC] PreToolUse Hook 已配置，跳过注册")
-            return
-
-        # 移除旧的 PermissionRequest hook（如有）
-        if "PermissionRequest" in hooks:
-            del hooks["PermissionRequest"]
-            logger.info("[CC] 已移除旧的 PermissionRequest Hook")
-
-        # 添加 PreToolUse Hook 配置
-        new_hook_rule = {
-            "matcher": "",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": hook_script,
-                }
-            ],
-        }
-        pre_hooks.append(new_hook_rule)
-        hooks["PreToolUse"] = pre_hooks
-        settings["hooks"] = hooks
-
-        try:
-            settings_path.parent.mkdir(parents=True, exist_ok=True)
-            settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
-            # 修正文件归属
-            if run_as_user and os.getuid() == 0:
-                try:
-                    pw = pwd.getpwnam(run_as_user)
-                    os.chown(settings_path, pw.pw_uid, pw.pw_gid)
-                except (KeyError, OSError) as e:
-                    logger.warning("[CC] 修正设置文件归属失败: %s", e)
-            logger.info("[CC] PreToolUse Hook 已注册: %s", hook_script)
-        except OSError as e:
-            logger.error("[CC] 写入 Claude 设置失败: %s", e)
-
-    def _on_permission_request(
-        self,
-        user_id: str,
-        chat_id: str,
-        request_id: str,
-        tool_name: str,
-        tool_input: dict,
-    ) -> None:
-        """权限请求回调：根据会话权限模式决定自动放行或发送飞书确认卡片
-
-        三种模式:
-        - interactive (默认): 所有请求均通过飞书卡片确认
-        - bypass: 所有请求自动放行
-        - accept_edits: Write/Edit/NotebookEdit 在工作目录内自动放行，其余仍需确认
-        """
-        # 格式化工具调用详情用于日志
-        if tool_name == "Bash" and "command" in tool_input:
-            input_summary = tool_input["command"]
-        elif tool_name in ("Edit", "Write"):
-            file_path = tool_input.get("file_path", tool_input.get("path", ""))
-            input_summary = f"file={file_path}"
-        else:
-            input_summary = json.dumps(tool_input, ensure_ascii=False)[:500]
-
-        # 读取当前会话权限模式
-        state = self._get_state(user_id)
-        perm_mode = state.get("session_perm_mode", "interactive")
-        effective_working_dir = state["working_dir"]  # 始终为有效绝对路径
-        logger.info(
-            "[CC] 权限请求: user=%s, tool=%s, perm_mode=%s, request=%s, input=%s",
-            user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
-        )
-
-        # bypass 模式：直接放行所有权限请求（AskUserQuestion 除外，它是用户输入而非权限确认）
-        if perm_mode == "bypass" and tool_name != "AskUserQuestion":
-            if self._perm_server:
-                self._perm_server.resolve_request(request_id, "allow")
-            return
-
-        # AskUserQuestion 特殊处理：将问题转发到飞书，用户通过卡片按钮回答
-        if tool_name == "AskUserQuestion":
-            questions = tool_input.get("questions", [])
-            if not questions:
-                if self._perm_server:
-                    self._perm_server.resolve_request(
-                        request_id, "deny", reason="AskUserQuestion 未包含有效问题。"
-                    )
-                return
-            card = self._build_ask_user_card(request_id, questions)
-            # 超时按问题数量缩放
-            timeout = _ASK_USER_TIMEOUT * len(questions)
-            if self._perm_server:
-                self._perm_server.set_request_timeout(request_id, timeout)
-            # 使用 send_message_get_id 检测发送是否成功
-            msg_id = self.bot.send_message_get_id(chat_id, "interactive", card)
-            if msg_id:
-                # 保存表单元数据：飞书表单提交时 button.value 丢失，需从此恢复
-                state = self._get_state(user_id)
-                state["_pending_ask_user"] = {
-                    "request_id": request_id,
-                    "questions": questions,
-                    "answers": {},
-                    "total": len(questions),
-                }
-                logger.info(
-                    "[CC] 已发送用户问题卡片: user=%s, request=%s, 问题数=%d",
-                    user_id, request_id[:8], len(questions),
-                )
-            else:
-                # 卡片发送失败（如含不支持的元素类型），立即拒绝请求避免挂起
-                logger.error(
-                    "[CC] 用户问题卡片发送失败: user=%s, request=%s", user_id, request_id[:8],
-                )
-                if self._perm_server:
-                    self._perm_server.resolve_request(
-                        request_id, "deny",
-                        reason="无法向用户发送问题卡片，请根据上下文自行做出最合理的判断。",
-                    )
-            return
-
-        # accept_edits 模式：文件修改类工具在工作目录内自动放行
-        if perm_mode == "accept_edits":
-            if tool_name in ("Write", "Edit", "NotebookEdit"):
-                fp = tool_input.get("file_path") or tool_input.get("notebook_path", "")
-                if fp and self._is_within_working_dir(fp, effective_working_dir):
-                    logger.info(
-                        "[CC] accept_edits 模式自动放行: tool=%s, file=%s", tool_name, fp,
-                    )
-                    if self._perm_server:
-                        self._perm_server.resolve_request(request_id, "allow")
-                    return
-            # 工作目录外的文件修改或其他工具（Bash 等）继续走卡片确认
-
-        # interactive 模式或 accept_edits 模式未匹配自动放行：发送飞书权限确认卡片
-        # 仅当请求本身属于 accept_edits 自动放行范围（工作目录内的文件修改）时，
-        # 才在卡片上显示「允许本次会话所有修改」按钮，否则该按钮语义上不合适
-        fp = tool_input.get("file_path") or tool_input.get("notebook_path", "")
-        show_accept_edits_option = (
-            perm_mode == "interactive"
-            and tool_name in ("Write", "Edit", "NotebookEdit")
-            and bool(fp)
-            and self._is_within_working_dir(fp, effective_working_dir)
-        )
-        card = self._build_permission_card(
-            request_id, tool_name, tool_input, show_accept_edits_option, effective_working_dir
-        )
-        try:
-            self.bot.send_message(chat_id, "interactive", card)
-            logger.info(
-                "[CC] 已发送权限确认卡片: user=%s, tool=%s, request=%s",
-                user_id, tool_name, request_id[:8],
-            )
-        except Exception as e:
-            logger.error("[CC] 发送权限确认卡片失败: %s", e, exc_info=True)
-            raise
-
-    def _on_permission_timeout(
-        self,
-        user_id: str,
-        chat_id: str,
-        request_id: str,
-        tool_name: str,
-        timeout: int,
-    ) -> None:
-        """权限确认超时回调：记录超时事件到用户状态，供任务结束时在卡片中提示"""
-        state = self._get_state(user_id)
-        state["perm_timeout_count"] = state.get("perm_timeout_count", 0) + 1
-        logger.warning(
-            "[CC] 权限确认超时: user=%s, tool=%s, request=%s, timeout=%ds",
-            user_id, tool_name, request_id[:8], timeout,
-        )
-
-    @staticmethod
-    def _is_within_working_dir(file_path: str, working_dir: str) -> bool:
-        """检查文件路径是否在工作目录内（含工作目录本身）
-
-        用于 accept_edits 模式判断是否可以自动放行文件修改请求。
-        """
-        if not working_dir:
-            working_dir = os.getcwd()
-        try:
-            abs_file = os.path.realpath(os.path.abspath(file_path))
-            abs_dir = os.path.realpath(os.path.abspath(working_dir))
-            return os.path.commonpath([abs_file, abs_dir]) == abs_dir
-        except (ValueError, OSError):
-            return False
-
-    @staticmethod
-    def _build_permission_mode_card(current_mode: str) -> str:
-        """构造权限模式选择卡片，高亮当前模式"""
-        mode_labels = {
-            "interactive": "交互确认（Interactive）",
-            "accept_edits": "自动接受编辑（Accept Edits）",
-            "bypass": "全部放行（Bypass）",
-        }
-        mode_descs = {
-            "interactive": "所有操作均通过飞书卡片确认，安全性最高",
-            "accept_edits": "工作目录内的文件修改自动放行，Bash 等操作仍需确认",
-            "bypass": "所有操作自动放行，无需任何确认（危险，慎用）",
-        }
-        buttons = []
-        for mode, label in mode_labels.items():
-            is_current = mode == current_mode
-            buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": f"{'✓ ' if is_current else ''}{label}"},
-                "type": "primary" if is_current else "default",
-                "value": {"action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": mode},
-            })
-        elements = [
-            {"tag": "markdown", "content": f"当前模式：**{mode_labels[current_mode]}**\n{mode_descs[current_mode]}"},
-            {"tag": "hr"},
-        ]
-        for mode, label in mode_labels.items():
-            elements.append({"tag": "markdown", "content": f"**{label}**\n{mode_descs[mode]}"})
-        elements.append({"tag": "action", "actions": buttons})
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Claude Code 权限模式"},
-                "template": "blue",
-            },
-            "elements": elements,
-        }
-        return json.dumps(card)
-
-    def _build_model_select_card(self, current_model: str) -> str:
-        """构造模型选择卡片，高亮当前模型
-
-        Args:
-            current_model: 当前会话模型的 alias，空字符串表示 CLI 默认
-        """
-        models_cfg = self._load_plugin_config()["models"]
-        # "CLI 默认" 始终作为第一个选项
-        options = [{"alias": "", "label": "CLI 默认", "desc": "不指定模型，由 Claude Code CLI 自行决定"}]
-        for m in models_cfg:
-            options.append({
-                "alias": m.get("alias", ""),
-                "label": m.get("label", m.get("alias", "未知")),
-                "desc": m.get("desc", ""),
-            })
-        # 查找当前模型的展示信息
-        current_label = "CLI 默认"
-        current_desc = options[0]["desc"]
-        for opt in options:
-            if opt["alias"] == current_model:
-                current_label = opt["label"]
-                current_desc = opt["desc"]
-                break
-        buttons = []
-        for opt in options:
-            is_current = opt["alias"] == current_model
-            buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": f"{'✓ ' if is_current else ''}{opt['label']}"},
-                "type": "primary" if is_current else "default",
-                "value": {"action": "set_model", "plugin": PLUGIN_KEYWORD, "model": opt["alias"]},
-            })
-        elements = [
-            {"tag": "markdown", "content": f"当前模型：**{current_label}**\n{current_desc}"},
-            {"tag": "hr"},
-        ]
-        for opt in options:
-            elements.append({"tag": "markdown", "content": f"**{opt['label']}**\n{opt['desc']}"})
-        elements.append({"tag": "action", "actions": buttons})
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Claude Code 模型选择"},
-                "template": "blue",
-            },
-            "elements": elements,
-        }
-        return json.dumps(card)
-
-    @staticmethod
-    def _build_permission_card(
-        request_id: str, tool_name: str, tool_input: dict,
-        show_accept_edits_option: bool = False, working_dir: str = ""
-    ) -> str:
-        """构造权限确认飞书卡片
-
-        快捷升级按钮根据当前请求类型动态显示：
-        - show_accept_edits_option=True（工作目录内的文件修改）:
-          同时显示「允许本次会话所有修改」和「允许本次会话所有请求」
-        - show_accept_edits_option=False（Bash 等其他操作，或工作目录外的文件修改）:
-          仅显示「允许本次会话所有请求」，因为 accept_edits 模式对当前请求无效
-        """
-        # 格式化工具输入的展示内容
-        if tool_name == "Bash" and "command" in tool_input:
-            input_display = f"```\n{tool_input['command']}\n```"
-        elif tool_name == "Edit" or tool_name == "Write":
-            file_path = tool_input.get("file_path", tool_input.get("path", ""))
-            input_display = f"文件: `{_display_path(file_path, working_dir)}`"
-        else:
-            # 通用展示：JSON 格式
-            input_display = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)[:1000]}\n```"
-
-        actions = [
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "允许"},
-                "type": "primary",
-                "value": {"action": "perm_allow", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
-            },
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "拒绝"},
-                "type": "danger",
-                "value": {"action": "perm_deny", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
-            },
-        ]
-        # 仅当请求属于 accept_edits 范围（工作目录内的文件修改）时显示该按钮
-        if show_accept_edits_option:
-            actions.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "允许本次会话所有修改"},
-                "type": "default",
-                "value": {"action": "perm_accept_edits", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
-            })
-        # interactive 和 accept_edits 模式均显示「允许本次会话所有请求」（升级到 bypass）
-        actions.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "允许本次会话所有请求"},
-            "type": "default",
-            "value": {"action": "perm_bypass", "plugin": PLUGIN_KEYWORD, "request_id": request_id},
-        })
-
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Claude Code 权限确认"},
-                "template": "orange",
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"**工具**: {tool_name}\n**操作**:\n{input_display}",
-                },
-                {"tag": "hr"},
-                {"tag": "action", "actions": actions},
-            ],
-        }
-        return json.dumps(card)
-
-    @staticmethod
-    def _build_ask_user_card(
-        request_id: str,
-        questions: list[dict],
-        answers: dict[int, str] | None = None,
-    ) -> str:
-        """构造 AskUserQuestion 飞书问题卡片（逐题展示）
-
-        多问题场景下按顺序逐题展示：已回答的灰色展示，当前题目交互式展示，
-        后续题目仅显示标题作为预览，用户答完当前题后刷新卡片展示下一题。
-
-        Args:
-            request_id: 权限请求 ID（用于回调匹配）
-            questions: 问题列表，每项含 question, header, options 字段
-            answers: 已回答的问题索引 → 答案，用于部分回答后刷新卡片
-        """
-        if answers is None:
-            answers = {}
-
-        elements: list[dict] = []
-        total = len(questions)
-        # 找到当前待回答的题目索引（第一个未回答的）
-        current_qi = next((i for i in range(total) if i not in answers), total)
-
-        for qi, question in enumerate(questions):
-            q_text = question.get("question", "")
-            header_text = question.get("header", "")
-            options = question.get("options", [])
-
-            # 多问题时添加序号前缀
-            prefix = f"**问题 {qi + 1}/{total}**  " if total > 1 else ""
-
-            if qi in answers:
-                # 已回答的问题：灰色文本展示
-                q_label = f"**{header_text}**" if header_text else q_text[:60]
-                elements.append({
-                    "tag": "markdown",
-                    "content": f"{prefix}{q_label}\n~~已选择: {answers[qi]}~~",
-                })
-                if qi < total - 1:
-                    elements.append({"tag": "hr"})
-                continue
-
-            if qi > current_qi:
-                # 后续未到达的问题：仅显示标题，不渲染交互元素
-                q_label = f"**{header_text}**" if header_text else q_text[:60]
-                elements.append({
-                    "tag": "markdown",
-                    "content": f"{prefix}{q_label}\n*待回答*",
-                })
-                if qi < total - 1:
-                    elements.append({"tag": "hr"})
-                continue
-
-            # 当前题目：交互式区块
-            content_md = f"{prefix}**{header_text}**\n\n{q_text}" if header_text else f"{prefix}{q_text}"
-            elements.append({"tag": "markdown", "content": content_md})
-
-            # 各选项的描述说明
-            if options:
-                option_lines = []
-                for i, opt in enumerate(options, 1):
-                    label = opt.get("label", f"选项{i}")
-                    desc = opt.get("description", "")
-                    option_lines.append(f"**{label}**: {desc}" if desc else f"**{label}**")
-                elements.append({"tag": "markdown", "content": "\n".join(option_lines)})
-
-            elements.append({"tag": "hr"})
-
-            # 每个选项一个按钮
-            actions = []
-            for i, opt in enumerate(options):
-                label = opt.get("label", f"选项{i+1}")
-                desc = opt.get("description", "")
-                answer_display = f"{label} - {desc}" if desc else label
-                actions.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": "primary" if i == 0 else "default",
-                    "value": {
-                        "action": "ask_user_answer",
-                        "plugin": PLUGIN_KEYWORD,
-                        "request_id": request_id,
-                        "question_index": qi,
-                        "answer_label": answer_display,
-                        "question_text": q_text[:100],
-                    },
-                })
-            elements.append({"tag": "action", "actions": actions})
-
-            # "其他" 自定义输入：输入框 + 提交按钮放在 form 容器内
-            elements.append({
-                "tag": "form",
-                "name": f"custom_answer_form_{qi}",
-                "elements": [
-                    {
-                        "tag": "input",
-                        "name": f"custom_answer_{qi}",
-                        "placeholder": {
-                            "tag": "plain_text",
-                            "content": "输入自定义回答…",
-                        },
-                    },
-                    {
-                        "tag": "button",
-                        "name": f"submit_custom_{qi}",
-                        "text": {"tag": "plain_text", "content": "其他"},
-                        "type": "default",
-                        "form_action_type": "submit",
-                        "value": {
-                            "action": "ask_user_custom",
-                            "plugin": PLUGIN_KEYWORD,
-                            "request_id": request_id,
-                            "question_index": qi,
-                            "question_text": q_text[:100],
-                        },
-                    },
-                ],
-            })
-
-            if qi < total - 1:
-                elements.append({"tag": "hr"})
-
-        # 卡片标题：多问题时显示进度
-        answered_count = len(answers)
-        if total > 1:
-            title = f"Claude Code 需要你的输入（{answered_count + 1}/{total}）"
-        else:
-            title = "Claude Code 需要你的输入"
-
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue",
-            },
-            "elements": elements,
-        }
-        return json.dumps(card)
-
-    @staticmethod
-    def _build_ask_user_answered_card(
-        questions: list[dict], answers: dict[int, str],
-    ) -> str:
-        """构造 AskUserQuestion 已回答的卡片（灰色，无按钮）
-
-        Args:
-            questions: 完整问题列表
-            answers: 问题索引 → 用户答案
-        """
-        total = len(questions)
-        lines = []
-        for qi, question in enumerate(questions):
-            q_text = question.get("question", "")[:100]
-            answer = answers.get(qi, "（未回答）")
-            if total > 1:
-                lines.append(f"**问题 {qi + 1}**: {q_text}\n**选择**: {answer}")
-            else:
-                lines.append(f"**问题**: {q_text}\n**你的选择**: {answer}")
-
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": "Claude Code 用户输入 - 已回答"},
-                "template": "grey",
-            },
-            "elements": [
-                {"tag": "markdown", "content": "\n\n".join(lines)},
-            ],
-        }
-        return json.dumps(card)
-
-    def _handle_ask_user_response(
-        self, user_id: str, request_id: str, question_index: int, answer: str,
-    ):
-        """处理用户对 AskUserQuestion 某道题的回答，返回卡片响应
-
-        记录答案后判断：若所有问题已回答则 resolve 请求并返回灰色已回答卡片，
-        否则返回更新后的部分回答卡片。
-        """
-        state = self._get_state(user_id)
-        pending = state.get("_pending_ask_user")
-        if not pending or pending["request_id"] != request_id:
-            return self.bot.make_card_response(toast="该请求已过期或已处理")
-
-        if not self._perm_server or not self._perm_server.has_pending_request(request_id):
-            state.pop("_pending_ask_user", None)
-            return self.bot.make_card_response(toast="该请求已过期或已处理")
-
-        # 记录本题答案
-        answers = pending["answers"]
-        answers[question_index] = answer
-        questions = pending["questions"]
-        total = pending["total"]
-
-        if len(answers) < total:
-            # 尚有未回答的问题，刷新卡片
-            logger.info(
-                "[CC] 用户回答问题 %d/%d: user=%s, request=%s, answer=%s",
-                len(answers), total, user_id, request_id[:8], answer,
-            )
-            updated_card = self._build_ask_user_card(request_id, questions, answers)
-            return self.bot.make_card_response(
-                card=json.loads(updated_card),
-                toast=f"已回答 {len(answers)}/{total}",
-            )
-
-        # 所有问题已回答，resolve 请求
-        state.pop("_pending_ask_user", None)
-
-        if total == 1:
-            # 单问题：保持原有格式，向后兼容
-            reason = (
-                f"用户选择了「{answers[0]}」。"
-                f"请按照用户的选择继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
-            )
-        else:
-            lines = []
-            for qi in range(total):
-                q_text = questions[qi].get("question", "")[:80]
-                lines.append(f"{qi + 1}. {q_text} → 「{answers[qi]}」")
-            reason = (
-                "用户回答了以下问题：\n"
-                + "\n".join(lines)
-                + "\n请按照用户的回答继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
-            )
-
-        ok = self._perm_server.resolve_request(request_id, "deny", reason=reason)
-        if ok:
-            logger.info(
-                "[CC] 用户回答全部完成 (%d题): user=%s, request=%s",
-                total, user_id, request_id[:8],
-            )
-            answered_card = self._build_ask_user_answered_card(questions, answers)
-            return self.bot.make_card_response(
-                card=json.loads(answered_card),
-                toast="已完成全部回答",
-            )
-        return self.bot.make_card_response(toast="该请求已过期或已处理")
 
     # ---- 子进程管理 ----
 
@@ -1545,8 +383,9 @@ class ClaudeCodePlugin(Plugin):
         session_id = state["session_id"]
 
         # 注册会话到权限服务器（如果已启动）
-        if self._perm_server and self._perm_server_started:
-            self._perm_server.register_session(session_id, user_id, chat_id)
+        perm_mgr = self._ensure_perm_manager()
+        if perm_mgr.server and perm_mgr.started:
+            perm_mgr.server.register_session(session_id, user_id, chat_id)
 
         try:
             cmd = self._build_command(
@@ -1613,7 +452,7 @@ class ClaudeCodePlugin(Plugin):
                     # 无新数据时刷新进度计时
                     if message_id:
                         elapsed = int(time.time() - phase_start_time)
-                        card_text = self._render_log(
+                        card_text = render_log(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
@@ -1630,7 +469,7 @@ class ClaudeCodePlugin(Plugin):
                     continue
                 line_count += 1
 
-                text_chunk, log_actions, meta = self._parse_stream_line(
+                text_chunk, log_actions, meta = parse_stream_line(
                     line, has_assistant_text, cwd
                 )
 
@@ -1728,7 +567,7 @@ class ClaudeCodePlugin(Plugin):
                     time_since = now - last_patch_time
                     if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
                         elapsed = int(now - phase_start_time)
-                        card_text = self._render_log(
+                        card_text = render_log(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
@@ -1762,7 +601,7 @@ class ClaudeCodePlugin(Plugin):
                 state["session_started"] = True
                 # 保存/更新历史会话记录
                 title = (prompt[:50] + "…") if len(prompt) > 50 else prompt
-                self._upsert_session(
+                self._session_store.upsert_session(
                     user_id, session_id,
                     state["working_dir"],
                     title,
@@ -1782,7 +621,7 @@ class ClaudeCodePlugin(Plugin):
                     "entries": [e["line"] for e in current_streak],
                 })
 
-            card_text = self._render_log(segments, [], running=False)
+            card_text = render_log(segments, [], running=False)
             if cost_info:
                 card_text += f"\n\n---\n{cost_info}"
 
@@ -1826,8 +665,8 @@ class ClaudeCodePlugin(Plugin):
             self._running_processes.pop(user_id, None)
             self._running_threads.pop(user_id, None)
             # 移除权限服务器中的会话映射
-            if self._perm_server and self._perm_server_started:
-                self._perm_server.unregister_session(session_id)
+            if perm_mgr.server and perm_mgr.started:
+                perm_mgr.server.unregister_session(session_id)
             # 任务结束后发送加急通知，让用户收到提醒
             if message_id:
                 try:
@@ -1847,278 +686,12 @@ class ClaudeCodePlugin(Plugin):
         timer.start()
         return timer
 
-    # ---- stream-json 解析 ----
-
-    @staticmethod
-    def _parse_stream_line(line: str, has_previous_text: bool, working_dir: str = "") -> tuple[str, list[dict], str]:
-        """解析 stream-json 单行
-
-        Args:
-            line: 一行 JSON 字符串
-            has_previous_text: 之前是否已提取到 assistant 文本
-
-        Returns:
-            (text_chunk, log_actions, meta_info) 三元组
-
-            text_chunk: 本行提取到的 assistant 文字内容（空字符串表示无）
-
-            log_actions: 工具调用日志动作列表，每项为：
-                {"action": "add",    "line": str, "tool_use_id": str|None}  新增日志行
-                {"action": "result", "tool_use_id": str, "is_error": bool, "summary": str}  更新结果
-
-            meta_info: 统计信息字符串（来自 result 事件）
-        """
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            return ("", [], "")
-
-        event_type = data.get("type", "")
-        text_chunk = ""
-        log_actions: list[dict] = []
-        meta_info = ""
-
-        if event_type == "assistant":
-            # 处理 assistant 消息中的各类内容块
-            message = data.get("message", {})
-            content_blocks = message.get("content", [])
-            text_parts = []
-            for block in content_blocks:
-                if isinstance(block, str):
-                    # /compact 等特殊指令的输出可能以纯字符串形式返回
-                    text_parts.append(block)
-                    continue
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type", "")
-                if btype == "text":
-                    text_parts.append(block.get("text", ""))
-                elif btype == "thinking":
-                    # 只显示图标，不展示原始思考内容；is_thinking 标记供主循环计算用时后更新
-                    log_actions.append({"action": "add", "line": "💭 思考...", "tool_use_id": None, "is_thinking": True})
-                elif btype == "tool_use":
-                    tool_name = block.get("name", "Unknown")
-                    tool_input = block.get("input", {})
-                    tool_use_id = block.get("id", "")
-                    log_line = ClaudeCodePlugin._format_tool_call(tool_name, tool_input, working_dir)
-                    log_actions.append({"action": "add", "line": log_line, "tool_use_id": tool_use_id, "tool_name": tool_name})
-            if text_parts:
-                text_chunk = "\n\n".join(text_parts)
-
-        elif event_type == "user":
-            # 工具执行结果：追加 ✅/❌ 到对应日志行
-            message = data.get("message", {})
-            content_blocks = message.get("content", [])
-            for block in content_blocks:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_result":
-                    tool_use_id = block.get("tool_use_id", "")
-                    is_error = bool(block.get("is_error", False))
-                    # content 可能是字符串或 content block 数组
-                    raw_content = block.get("content", "")
-                    if isinstance(raw_content, list):
-                        raw_content = "\n".join(
-                            b.get("text", "") for b in raw_content if b.get("type") == "text"
-                        )
-                    summary = ""
-                    if is_error and raw_content:
-                        # 错误时取首行，最多60字
-                        first_line = str(raw_content).split("\n")[0].strip()
-                        summary = first_line[:_TOOL_PARAM_MAX]
-                    log_actions.append({
-                        "action": "result",
-                        "tool_use_id": tool_use_id,
-                        "is_error": is_error,
-                        "summary": summary,
-                    })
-
-        elif event_type == "system":
-            # system 事件：处理 compact 等子类型
-            subtype = data.get("subtype", "")
-            if subtype == "compact_boundary":
-                meta = data.get("compact_metadata", {})
-                pre = meta.get("pre_tokens", 0)
-                text_chunk = f"上下文已压缩（压缩前 {pre:,} tokens）" if pre else "上下文已压缩"
-
-        elif event_type == "result":
-            # result 事件：提取统计信息
-            cost = data.get("cost_usd", 0)
-            duration = data.get("duration_ms", 0)
-            turns = data.get("num_turns", 0)
-            session_id = data.get("session_id", "")
-            meta_parts = []
-            if cost:
-                meta_parts.append(f"费用: ${cost:.4f}")
-            if duration:
-                meta_parts.append(f"耗时: {duration / 1000:.1f}s")
-            if turns:
-                meta_parts.append(f"轮次: {turns}")
-            if session_id:
-                meta_parts.append(f"会话: {session_id[:8]}...")
-            if meta_parts:
-                meta_info = " | ".join(meta_parts)
-
-            # 无 assistant 文本时用 result 的兜底文本
-            if not has_previous_text:
-                result_text = data.get("result", "")
-                if result_text:
-                    text_chunk = result_text
-
-        return (text_chunk, log_actions, meta_info)
-
-    # ---- 工具调用日志渲染 ----
-
-    # 工具名 → 展示图标
-    _TOOL_ICONS: dict[str, str] = {
-        "Read":         "📖",
-        "Write":        "✍️",
-        "Edit":         "📝",
-        "NotebookEdit": "📓",
-        "Bash":         "💻",
-        "Glob":         "🔍",
-        "Grep":         "🔍",
-        "Task":             "🤖",
-        "WebFetch":         "🌐",
-        "AskUserQuestion":  "❓",
-    }
-
-    @staticmethod
-    def _format_tool_call(tool_name: str, tool_input: dict, working_dir: str = "") -> str:
-        """将工具调用格式化为单行摘要，用于过程日志"""
-        icon = ClaudeCodePlugin._TOOL_ICONS.get(tool_name, "🔧")
-        # AskUserQuestion 特殊处理：提取第一个问题文本作为摘要
-        if tool_name == "AskUserQuestion":
-            questions = tool_input.get("questions", [])
-            param = questions[0].get("question", "") if questions else ""
-            if len(param) > _TOOL_PARAM_MAX:
-                param = param[:_TOOL_PARAM_MAX - 3] + "..."
-            return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
-        # 按优先级提取最有意义的参数作为摘要
-        param: str = (
-            tool_input.get("file_path")
-            or tool_input.get("notebook_path")
-            or tool_input.get("command")
-            or tool_input.get("pattern")
-            or tool_input.get("path")
-            or tool_input.get("description")
-            or tool_input.get("url")
-            or (str(next(iter(tool_input.values()))) if tool_input else "")
-        )
-        # 对路径类参数尝试缩短显示（非路径的 command/pattern 等调用后安全，因为非绝对路径时原样返回）
-        param = _display_path(param, working_dir)
-        if len(param) > _TOOL_PARAM_MAX:
-            param = param[:_TOOL_PARAM_MAX - 3] + "..."
-        return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
-
-    @staticmethod
-    def _render_log(
-        log_segments: list[dict],
-        current_streak: list[dict],
-        running: bool,
-        elapsed: int = 0,
-        thinking: bool = False,
-    ) -> str:
-        """将统一内容段列表和当前连续区间渲染为 markdown 文本
-
-        工具调用段与文字段按实际执行顺序交错渲染，保持与原始 CC 输出一致的顺序。
-
-        Args:
-            log_segments: 已完成的段列表，每段为以下之一：
-                {"type": "tools", "entries": list[str]}  工具调用段
-                {"type": "text",  "content": str}        文字段
-            current_streak: 当前正在进行的连续工具调用，每项 {"line": str, "tool_use_id": str|None}
-            running: 是否仍在执行中（控制末尾提示）
-            elapsed: 任务已运行秒数（>0 时在提示后附加计时）
-            thinking: 是否处于模型思考阶段（工具结果已返回、等待模型下一步响应）
-        """
-        lines: list[str] = []
-
-        for segment in log_segments:
-            if segment["type"] == "tools":
-                entries: list[str] = segment["entries"]
-                n = len(entries)
-                if n > _MAX_STREAK_DISPLAY:
-                    lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
-                    entries = entries[-_MAX_STREAK_DISPLAY:]
-                lines.extend(entries)
-                lines.append("")  # 段间空行
-            elif segment["type"] == "text":
-                lines.append(segment["content"])
-                lines.append("")  # 段间空行
-
-        if current_streak:
-            entries = [e["line"] for e in current_streak]
-            n = len(entries)
-            if n > _MAX_STREAK_DISPLAY:
-                lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
-                entries = entries[-_MAX_STREAK_DISPLAY:]
-            lines.extend(entries)
-
-        if running:
-            elapsed_text = f" (已等待 {elapsed}s)" if elapsed > 0 else ""
-            if thinking:
-                lines.append(f"💭 思考中...{elapsed_text}")
-            else:
-                lines.append(f"⏳ 正在处理...{elapsed_text}")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _assemble_card_text(log_text: str, reply_text: str) -> str:
-        """组装两段式卡片内容：过程日志（上）+ 文字回复（下）"""
-        if log_text and reply_text:
-            return log_text + "\n\n---\n\n" + reply_text
-        return log_text or reply_text
-
-    # ---- 飞书卡片 ----
-
-    @staticmethod
-    def _build_card(text: str, running: bool = False, elapsed: int = 0, cancelled: bool = False) -> str:
-        """构造飞书卡片 JSON"""
-        if running:
-            template = "turquoise"
-            if elapsed > 0:
-                header_content = f"Claude Code (执行中...已用时 {elapsed}s)"
-            else:
-                header_content = "Claude Code (执行中...)"
-        elif cancelled:
-            template = "grey"
-            header_content = "Claude Code（已停止）"
-        else:
-            template = "blue"
-            header_content = "Claude Code"
-
-        card: dict = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": header_content},
-                "template": template,
-            },
-            "elements": [
-                {"tag": "markdown", "content": text},
-            ],
-        }
-
-        # 运行中时添加取消按钮
-        if running:
-            card["elements"].append({"tag": "hr"})
-            card["elements"].append({
-                "tag": "action",
-                "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "取消执行"},
-                    "type": "danger",
-                    "value": {"action": "cancel", "plugin": PLUGIN_KEYWORD},
-                }],
-            })
-
-        return json.dumps(card)
+    # ---- 飞书卡片更新 ----
 
     def _patch_card(self, message_id: str, text: str, running: bool = True,
                     elapsed: int = 0, cancelled: bool = False) -> None:
         """更新飞书卡片消息"""
-        content = self._build_card(text, running=running, elapsed=elapsed, cancelled=cancelled)
+        content = cards.build_execution_card(text, running=running, elapsed=elapsed, cancelled=cancelled)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
             debug_log = self._data_dir / "cc_card_debug.log"
@@ -2133,6 +706,77 @@ class ClaudeCodePlugin(Plugin):
             self.bot.patch_message(message_id, content)
         except Exception as e:
             logger.warning("卡片更新失败: %s", e)
+
+    # ---- AskUserQuestion 响应处理 ----
+
+    def _handle_ask_user_response(
+        self, user_id: str, request_id: str, question_index: int, answer: str,
+    ):
+        """处理用户对 AskUserQuestion 某道题的回答，返回卡片响应
+
+        记录答案后判断：若所有问题已回答则 resolve 请求并返回灰色已回答卡片，
+        否则返回更新后的部分回答卡片。
+        """
+        state = self._get_state(user_id)
+        pending = state.get("_pending_ask_user")
+        if not pending or pending["request_id"] != request_id:
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        perm_mgr = self._ensure_perm_manager()
+        if not perm_mgr.server or not perm_mgr.server.has_pending_request(request_id):
+            state.pop("_pending_ask_user", None)
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        # 记录本题答案
+        answers = pending["answers"]
+        answers[question_index] = answer
+        questions = pending["questions"]
+        total = pending["total"]
+
+        if len(answers) < total:
+            # 尚有未回答的问题，刷新卡片
+            logger.info(
+                "[CC] 用户回答问题 %d/%d: user=%s, request=%s, answer=%s",
+                len(answers), total, user_id, request_id[:8], answer,
+            )
+            updated_card = cards.build_ask_user_card(request_id, questions, answers)
+            return self.bot.make_card_response(
+                card=json.loads(updated_card),
+                toast=f"已回答 {len(answers)}/{total}",
+            )
+
+        # 所有问题已回答，resolve 请求
+        state.pop("_pending_ask_user", None)
+
+        if total == 1:
+            # 单问题：保持原有格式，向后兼容
+            reason = (
+                f"用户选择了「{answers[0]}」。"
+                f"请按照用户的选择继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
+            )
+        else:
+            lines = []
+            for qi in range(total):
+                q_text = questions[qi].get("question", "")[:80]
+                lines.append(f"{qi + 1}. {q_text} → 「{answers[qi]}」")
+            reason = (
+                "用户回答了以下问题：\n"
+                + "\n".join(lines)
+                + "\n请按照用户的回答继续执行，不要再次调用 AskUserQuestion 询问同一个问题。"
+            )
+
+        ok = perm_mgr.server.resolve_request(request_id, "deny", reason=reason)
+        if ok:
+            logger.info(
+                "[CC] 用户回答全部完成 (%d题): user=%s, request=%s",
+                total, user_id, request_id[:8],
+            )
+            answered_card = cards.build_ask_user_answered_card(questions, answers)
+            return self.bot.make_card_response(
+                card=json.loads(answered_card),
+                toast="已完成全部回答",
+            )
+        return self.bot.make_card_response(toast="该请求已过期或已处理")
 
     # ---- Plugin 接口实现 ----
 
@@ -2187,14 +831,14 @@ class ClaudeCodePlugin(Plugin):
 
         # 5. 特殊指令：历史会话
         if text == "/session":
-            sessions = self._load_user_sessions(user_id)
+            sessions = self._session_store.load_user_sessions(user_id)
             if not sessions:
                 self.bot.reply(
                     chat_id,
                     "暂无历史会话记录。完成第一次任务后将自动记录，可在此查看并恢复。",
                 )
                 return
-            card = self._build_sessions_card(sessions, state["session_id"])
+            card = cards.build_sessions_card(sessions, state["session_id"])
             self.bot.send_message(chat_id, "interactive", json.dumps(card))
             return
 
@@ -2203,7 +847,7 @@ class ClaudeCodePlugin(Plugin):
             if not state["session_started"]:
                 self.bot.reply(chat_id, "当前会话尚未开始，无法收藏。请先发送一条消息。")
                 return
-            new_starred = self._toggle_session_star(user_id, state["session_id"])
+            new_starred = self._session_store.toggle_star(user_id, state["session_id"])
             if new_starred is None:
                 self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能收藏。")
                 return
@@ -2224,7 +868,7 @@ class ClaudeCodePlugin(Plugin):
             if not state["session_started"]:
                 self.bot.reply(chat_id, "当前会话尚未开始，无法重命名。请先发送一条消息。")
                 return
-            ok = self._rename_session(user_id, state["session_id"], new_title)
+            ok = self._session_store.rename_session(user_id, state["session_id"], new_title)
             if not ok:
                 self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能重命名。")
                 return
@@ -2235,7 +879,7 @@ class ClaudeCodePlugin(Plugin):
         if text == "/cd":
             old_session = state["session_id"]
             self._reset_session(user_id)
-            state["working_dir"] = _resolve_working_dir(self._load_plugin_config().get("default_working_dir", ""))
+            state["working_dir"] = resolve_working_dir(self._load_plugin_config().get("default_working_dir", ""))
             logger.info(
                 "[CC] 用户重置工作目录为默认: user=%s, 旧session=%s, 新session=%s",
                 user_id, old_session[:8], state["session_id"][:8],
@@ -2272,7 +916,7 @@ class ClaudeCodePlugin(Plugin):
             if state["running"]:
                 self.bot.reply(chat_id, "任务运行中，请等待完成后再切换权限模式。")
                 return
-            card = self._build_permission_mode_card(state["session_perm_mode"])
+            card = cards.build_permission_mode_card(state["session_perm_mode"])
             self.bot.send_message(chat_id, "interactive", card)
             return
 
@@ -2281,7 +925,10 @@ class ClaudeCodePlugin(Plugin):
             if state["running"]:
                 self.bot.reply(chat_id, "任务运行中，请等待完成后再切换模型。")
                 return
-            card = self._build_model_select_card(state.get("session_model", ""))
+            card = cards.build_model_select_card(
+                state.get("session_model", ""),
+                self._load_plugin_config()["models"],
+            )
             self.bot.send_message(chat_id, "interactive", card)
             return
 
@@ -2341,10 +988,10 @@ class ClaudeCodePlugin(Plugin):
         )
 
         # 确保权限确认服务器已启动（首次调用时初始化）
-        self._ensure_permission_server()
+        self._ensure_perm_manager().ensure_server()
 
         # 发送占位卡片
-        placeholder = self._build_card("正在启动 Claude Code...", running=True)
+        placeholder = cards.build_execution_card("正在启动 Claude Code...", running=True)
         message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
         state["current_message_id"] = message_id
 
@@ -2366,6 +1013,7 @@ class ClaudeCodePlugin(Plugin):
         )
 
         action = action_value.get("action", "")
+        perm_mgr = self._ensure_perm_manager()
 
         # 飞书表单提交时 button.value 丢失（action 为空），从 form_value 提取
         if not action and "_form_value" in action_value:
@@ -2380,12 +1028,12 @@ class ClaudeCodePlugin(Plugin):
                 target_sid = state.get("_pending_rename", "")
                 if not target_sid:
                     return self.bot.make_card_response(toast="无效的会话 ID")
-                ok = self._rename_session(user_id, target_sid, new_title)
+                ok = self._session_store.rename_session(user_id, target_sid, new_title)
                 if not ok:
                     return self.bot.make_card_response(toast="重命名失败，会话可能已不存在")
                 state.pop("_pending_rename", None)
-                sessions = self._load_user_sessions(user_id)
-                card = self._build_sessions_card(sessions, state["session_id"])
+                sessions = self._session_store.load_user_sessions(user_id)
+                card = cards.build_sessions_card(sessions, state["session_id"])
                 return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
 
             # 自定义回答表单：input name 格式为 custom_answer_{qi}
@@ -2420,7 +1068,7 @@ class ClaudeCodePlugin(Plugin):
                 state["running"] = False
                 state["cancelled"] = True
                 # 立即返回更新后的卡片，移除取消按钮并更新标题
-                cancel_card = json.loads(self._build_card("**已取消执行**", cancelled=True))
+                cancel_card = json.loads(cards.build_execution_card("**已取消执行**", cancelled=True))
                 return self.bot.make_card_response(card=cancel_card, toast="已取消执行")
             return self.bot.make_card_response(toast="当前没有运行中的任务")
 
@@ -2429,17 +1077,17 @@ class ClaudeCodePlugin(Plugin):
             behavior = "allow" if action == "perm_allow" else "deny"
             behavior_cn = "允许" if behavior == "allow" else "拒绝"
 
-            if not self._perm_server:
+            if not perm_mgr.server:
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
-            ok = self._perm_server.resolve_request(request_id, behavior)
+            ok = perm_mgr.server.resolve_request(request_id, behavior)
             if ok:
                 logger.info(
                     "[CC] 用户权限响应: user=%s, request=%s, decision=%s",
                     user_id, request_id[:8], behavior,
                 )
                 # 更新卡片为已处理状态
-                handled_card = self._build_permission_handled_card(behavior_cn)
+                handled_card = cards.build_permission_handled_card(behavior_cn)
                 return self.bot.make_card_response(
                     card=json.loads(handled_card),
                     toast=f"已{behavior_cn}",
@@ -2456,7 +1104,7 @@ class ClaudeCodePlugin(Plugin):
             state["session_perm_mode"] = new_mode
             mode_cn = {"interactive": "交互确认", "accept_edits": "自动接受编辑", "bypass": "全部放行"}[new_mode]
             logger.info("[CC] 用户切换权限模式: user=%s, mode=%s", user_id, new_mode)
-            updated_card = self._build_permission_mode_card(new_mode)
+            updated_card = cards.build_permission_mode_card(new_mode)
             return self.bot.make_card_response(
                 card=json.loads(updated_card),
                 toast=f"已切换为{mode_cn}模式",
@@ -2474,7 +1122,7 @@ class ClaudeCodePlugin(Plugin):
             state["session_model"] = model_alias
             display = self._get_model_label(model_alias) if model_alias else "CLI 默认"
             logger.info("[CC] 用户切换模型: user=%s, model=%s", user_id, model_alias or "(default)")
-            updated_card = self._build_model_select_card(model_alias)
+            updated_card = cards.build_model_select_card(model_alias, self._load_plugin_config()["models"])
             return self.bot.make_card_response(
                 card=json.loads(updated_card),
                 toast=f"已切换为 {display}",
@@ -2483,7 +1131,7 @@ class ClaudeCodePlugin(Plugin):
         if action == "perm_accept_edits":
             request_id = action_value.get("request_id", "")
 
-            if not self._perm_server:
+            if not perm_mgr.server:
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
             # 切换为 accept_edits 模式，同时放行当前挂起的请求
@@ -2493,9 +1141,9 @@ class ClaudeCodePlugin(Plugin):
                 "[CC] 用户通过权限卡片开启 accept_edits 模式: user=%s, request=%s",
                 user_id, request_id[:8] if request_id else "?",
             )
-            ok = self._perm_server.resolve_request(request_id, "allow")
+            ok = perm_mgr.server.resolve_request(request_id, "allow")
             if ok:
-                handled_card = self._build_permission_handled_card("允许（已开启 accept_edits 模式）")
+                handled_card = cards.build_permission_handled_card("允许（已开启 accept_edits 模式）")
                 return self.bot.make_card_response(
                     card=json.loads(handled_card),
                     toast="已开启 accept_edits 模式，工作目录内文件修改自动放行",
@@ -2505,7 +1153,7 @@ class ClaudeCodePlugin(Plugin):
         if action == "perm_bypass":
             request_id = action_value.get("request_id", "")
 
-            if not self._perm_server:
+            if not perm_mgr.server:
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
             # 开启会话级 bypass 模式
@@ -2517,9 +1165,9 @@ class ClaudeCodePlugin(Plugin):
             )
 
             # 同时放行当前挂起的请求
-            ok = self._perm_server.resolve_request(request_id, "allow")
+            ok = perm_mgr.server.resolve_request(request_id, "allow")
             if ok:
-                handled_card = self._build_permission_handled_card("允许（已开启 bypass 模式）")
+                handled_card = cards.build_permission_handled_card("允许（已开启 bypass 模式）")
                 return self.bot.make_card_response(
                     card=json.loads(handled_card),
                     toast="已开启 bypass 模式，本会话后续请求自动放行",
@@ -2552,11 +1200,11 @@ class ClaudeCodePlugin(Plugin):
 
         if action == "show_more_sessions":
             state = self._get_state(user_id)
-            sessions = self._load_user_sessions(user_id)
+            sessions = self._session_store.load_user_sessions(user_id)
             if not sessions:
                 return self.bot.make_card_response(toast="暂无历史会话记录")
             next_count = action_value.get("show_count", _SESSION_INITIAL_COUNT + _SESSION_PAGE_SIZE)
-            card = self._build_sessions_card(sessions, state["session_id"], show_count=next_count)
+            card = cards.build_sessions_card(sessions, state["session_id"], show_count=next_count)
             return self.bot.make_card_response(card=card)
 
         if action == "resume_session":
@@ -2570,7 +1218,7 @@ class ClaudeCodePlugin(Plugin):
             if target_sid == state["session_id"]:
                 return self.bot.make_card_response(toast="当前会话无需恢复")
             # 校验工作目录是否存在
-            resolved_dir = _resolve_working_dir(target_dir)
+            resolved_dir = resolve_working_dir(target_dir)
             if not os.path.isdir(resolved_dir):
                 return self.bot.make_card_response(
                     toast=f"工作目录已不存在: {resolved_dir}，请使用 /cd 切换到有效目录"
@@ -2589,11 +1237,11 @@ class ClaudeCodePlugin(Plugin):
                 user_id, target_sid[:8], target_dir,
             )
             # 发送历史对话预览卡片
-            jsonl_path = self._find_session_jsonl(target_sid, target_dir)
+            jsonl_path = find_session_jsonl(target_sid, target_dir)
             if jsonl_path:
-                rounds = self._parse_session_rounds(jsonl_path, _HISTORY_PREVIEW_ROUNDS)
+                rounds = parse_session_rounds(jsonl_path, HISTORY_PREVIEW_ROUNDS)
                 if rounds:
-                    card = self._build_history_preview_card(target_sid, rounds)
+                    card = cards.build_history_preview_card(target_sid, rounds)
                     self.bot.reply_card(chat_id, card)
             self._send_perm_select_card_if_manual(chat_id, user_id)
             return self.bot.make_card_response(
@@ -2604,14 +1252,14 @@ class ClaudeCodePlugin(Plugin):
             target_sid = action_value.get("session_id", "")
             if not target_sid:
                 return self.bot.make_card_response(toast="无效的会话 ID")
-            new_starred = self._toggle_session_star(user_id, target_sid)
+            new_starred = self._session_store.toggle_star(user_id, target_sid)
             if new_starred is None:
                 return self.bot.make_card_response(toast="会话不存在")
             # 刷新会话列表卡片
             state = self._get_state(user_id)
-            sessions = self._load_user_sessions(user_id)
+            sessions = self._session_store.load_user_sessions(user_id)
             show_count = action_value.get("show_count", _SESSION_INITIAL_COUNT)
-            card = self._build_sessions_card(sessions, state["session_id"], show_count=show_count)
+            card = cards.build_sessions_card(sessions, state["session_id"], show_count=show_count)
             tip = "已收藏" if new_starred else "已取消收藏"
             return self.bot.make_card_response(card=card, toast=f"{tip} {target_sid[:8]}…")
 
@@ -2619,14 +1267,14 @@ class ClaudeCodePlugin(Plugin):
             target_sid = action_value.get("session_id", "")
             if not target_sid:
                 return self.bot.make_card_response(toast="无效的会话 ID")
-            sessions = self._load_user_sessions(user_id)
+            sessions = self._session_store.load_user_sessions(user_id)
             target = next((s for s in sessions if s["session_id"] == target_sid), None)
             if not target:
                 return self.bot.make_card_response(toast="会话不存在")
             # 暂存待重命名的 session_id，用于表单提交时读取
             state = self._get_state(user_id)
             state["_pending_rename"] = target_sid
-            card = self._build_rename_card(target)
+            card = cards.build_rename_card(target)
             return self.bot.make_card_response(card=card)
 
         if action == "rename_session":
@@ -2641,36 +1289,21 @@ class ClaudeCodePlugin(Plugin):
                 target_sid = state.get("_pending_rename", "")
             if not target_sid:
                 return self.bot.make_card_response(toast="无效的会话 ID")
-            ok = self._rename_session(user_id, target_sid, new_title)
+            ok = self._session_store.rename_session(user_id, target_sid, new_title)
             if not ok:
                 return self.bot.make_card_response(toast="重命名失败，会话可能已不存在")
             # 清除暂存状态，刷新会话列表
             state = self._get_state(user_id)
             state.pop("_pending_rename", None)
-            sessions = self._load_user_sessions(user_id)
-            card = self._build_sessions_card(sessions, state["session_id"])
+            sessions = self._session_store.load_user_sessions(user_id)
+            card = cards.build_sessions_card(sessions, state["session_id"])
             return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
 
         if action == "cancel_rename":
             state = self._get_state(user_id)
             state.pop("_pending_rename", None)
-            sessions = self._load_user_sessions(user_id)
-            card = self._build_sessions_card(sessions, state["session_id"])
+            sessions = self._session_store.load_user_sessions(user_id)
+            card = cards.build_sessions_card(sessions, state["session_id"])
             return self.bot.make_card_response(card=card)
 
         return P2CardActionTriggerResponse()
-
-    @staticmethod
-    def _build_permission_handled_card(decision: str) -> str:
-        """构造权限确认已处理的卡片（灰色，无按钮）"""
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": f"Claude Code 权限确认 - 已{decision}"},
-                "template": "grey",
-            },
-            "elements": [
-                {"tag": "markdown", "content": f"已{decision}此操作。"},
-            ],
-        }
-        return json.dumps(card)

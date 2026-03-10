@@ -11,11 +11,21 @@ import pytest
 
 from plugins.claude_code.claude_code_plugin import (
     ClaudeCodePlugin,
-    PLUGIN_KEYWORD,
     _DEFAULT_TIMEOUT,
-    _DEFAULT_MAX_OUTPUT,
     _DEFAULT_MAX_TURNS,
 )
+from plugins.claude_code.constants import PLUGIN_KEYWORD
+from plugins.claude_code.stream_parser import (
+    DEFAULT_MAX_OUTPUT as _DEFAULT_MAX_OUTPUT,
+    format_tool_call,
+    parse_stream_line,
+    render_log,
+    assemble_card_text,
+    _MAX_STREAK_DISPLAY,
+    _TOOL_PARAM_MAX,
+)
+from plugins.claude_code.cards import build_execution_card
+from plugins.claude_code.permission_manager import _DEFAULT_PERM_PORT, _DEFAULT_PERM_TIMEOUT
 
 
 # ---- 辅助函数 ----
@@ -112,7 +122,6 @@ def _make_result_event(result_text="", cost=0.01, duration=2000, turns=1, sessio
 @pytest.fixture
 def plugin(mock_bot):
     """返回已注册 mock bot 的 ClaudeCodePlugin，并注入测试配置"""
-    from plugins.claude_code.claude_code_plugin import _DEFAULT_PERM_PORT, _DEFAULT_PERM_TIMEOUT
     p = ClaudeCodePlugin()
     p.on_register(mock_bot)
     p._config = {
@@ -128,7 +137,8 @@ def plugin(mock_bot):
         "default_model": "",
     }
     # 跳过真实 HTTP 服务器启动，避免端口冲突和测试副作用
-    p._perm_server_started = True
+    perm_mgr = p._ensure_perm_manager()
+    perm_mgr._started = True
     return p
 
 
@@ -300,7 +310,7 @@ class TestParseStreamLine:
     def test_assistant_event(self):
         """正确提取 assistant 事件中的文本"""
         line = _make_assistant_event("Hello World!")
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == "Hello World!"
         assert log_actions == []
         assert meta == ""
@@ -308,14 +318,14 @@ class TestParseStreamLine:
     def test_assistant_event_with_previous(self):
         """有前序文本时 assistant 事件直接返回文本，分隔符由主循环负责"""
         line = _make_assistant_event("第二段")
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, True)
+        text, log_actions, meta = parse_stream_line(line, True)
         assert text == "第二段"
         assert log_actions == []
 
     def test_result_event_meta(self):
         """result 事件提取费用/耗时信息"""
         line = _make_result_event(cost=0.05, duration=5000, turns=3)
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, True)
+        text, log_actions, meta = parse_stream_line(line, True)
         assert text == ""  # 有前序文本时不重复追加
         assert log_actions == []
         assert "$0.0500" in meta
@@ -325,13 +335,13 @@ class TestParseStreamLine:
     def test_result_event_text_fallback(self):
         """无前序 assistant 文本时用 result 的文本"""
         line = _make_result_event(result_text="最终结果")
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == "最终结果"
         assert log_actions == []
 
     def test_invalid_json(self):
         """无效 JSON 返回空"""
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line("not json", False)
+        text, log_actions, meta = parse_stream_line("not json", False)
         assert text == ""
         assert log_actions == []
         assert meta == ""
@@ -339,7 +349,7 @@ class TestParseStreamLine:
     def test_unknown_type(self):
         """未知事件类型返回空"""
         line = json.dumps({"type": "system", "message": "info"})
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == ""
         assert log_actions == []
         assert meta == ""
@@ -347,7 +357,7 @@ class TestParseStreamLine:
     def test_tool_use_event(self):
         """assistant 事件中的 tool_use block 生成 add 日志动作"""
         line = _make_tool_use_event("Edit", {"file_path": "src/main.py"}, "toolu_001")
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == ""
         assert len(log_actions) == 1
         action = log_actions[0]
@@ -359,7 +369,7 @@ class TestParseStreamLine:
     def test_thinking_event(self):
         """assistant 事件中的 thinking block 生成思考日志动作"""
         line = _make_thinking_event()
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == ""
         assert len(log_actions) == 1
         assert log_actions[0]["action"] == "add"
@@ -369,7 +379,7 @@ class TestParseStreamLine:
     def test_tool_result_success(self):
         """user 事件中工具成功结果生成 result 日志动作"""
         line = _make_tool_result_event("toolu_001", content="file content", is_error=False)
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert text == ""
         assert len(log_actions) == 1
         action = log_actions[0]
@@ -381,7 +391,7 @@ class TestParseStreamLine:
     def test_tool_result_error(self):
         """user 事件中工具失败结果包含错误摘要"""
         line = _make_tool_result_event("toolu_002", content="Permission denied: /etc/passwd", is_error=True)
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert len(log_actions) == 1
         action = log_actions[0]
         assert action["action"] == "result"
@@ -402,7 +412,7 @@ class TestParseStreamLine:
                 }],
             },
         })
-        text, log_actions, meta = ClaudeCodePlugin._parse_stream_line(line, False)
+        text, log_actions, meta = parse_stream_line(line, False)
         assert log_actions[0]["is_error"] is True
         assert "Error: not found" in log_actions[0]["summary"]
 
@@ -415,35 +425,34 @@ class TestRenderLog:
 
     def test_empty_log(self):
         """无任何日志时返回空字符串"""
-        result = ClaudeCodePlugin._render_log([], [], running=False)
+        result = render_log([], [], running=False)
         assert result == ""
 
     def test_running_with_log_shows_spinner(self):
         """执行中且有日志时显示⏳"""
         streak = [{"line": "📖 Read `file.py`", "tool_use_id": "t1"}]
-        result = ClaudeCodePlugin._render_log([], streak, running=True)
+        result = render_log([], streak, running=True)
         assert "⏳" in result
         assert "📖" in result
 
     def test_running_without_log_shows_spinner(self):
         """执行中且无日志时也显示⏳（初始思考阶段）"""
-        result = ClaudeCodePlugin._render_log([], [], running=True)
+        result = render_log([], [], running=True)
         assert "⏳" in result
 
     def test_streak_within_limit(self):
         """连续工具调用未超上限时全部显示"""
         streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(5)]
-        result = ClaudeCodePlugin._render_log([], streak, running=False)
+        result = render_log([], streak, running=False)
         for i in range(5):
             assert f"file{i}.py" in result
         assert "省略" not in result
 
     def test_streak_exceeds_limit_folds(self):
         """连续工具调用超过上限时折叠显示最近 N 条"""
-        from plugins.claude_code.claude_code_plugin import _MAX_STREAK_DISPLAY
         total = _MAX_STREAK_DISPLAY + 5
         streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(total)]
-        result = ClaudeCodePlugin._render_log([], streak, running=False)
+        result = render_log([], streak, running=False)
         assert "省略" in result
         assert "5 次" in result
         # 最后 _MAX_STREAK_DISPLAY 条应显示
@@ -459,7 +468,7 @@ class TestRenderLog:
             {"type": "tools", "entries": ["📖 Read `a.py`"]},
         ]
         streak = [{"line": "📝 Edit `b.py`", "tool_use_id": "t2"}]
-        result = ClaudeCodePlugin._render_log(segments, streak, running=False)
+        result = render_log(segments, streak, running=False)
         # 段间有空行
         assert "\n\n" in result or "\n \n" in result or result.count("\n") >= 2
 
@@ -471,7 +480,7 @@ class TestRenderLog:
             {"type": "tools", "entries": ["💻 Bash `git commit` → ✅"]},
             {"type": "text", "content": "提交完成"},
         ]
-        result = ClaudeCodePlugin._render_log(segments, [], running=False)
+        result = render_log(segments, [], running=False)
         idx_tool1 = result.index("Read")
         idx_text1 = result.index("分析结果")
         idx_tool2 = result.index("Bash")
@@ -486,7 +495,7 @@ class TestRenderLog:
             {"type": "text", "content": "这是中间文字"},
             {"type": "tools", "entries": ["💻 Bash `ls` → ✅"]},
         ]
-        result = ClaudeCodePlugin._render_log(segments, [], running=False)
+        result = render_log(segments, [], running=False)
         assert "这是中间文字" in result
         # 文字夹在两段工具调用之间
         assert result.index("Read") < result.index("这是中间文字") < result.index("Bash")
@@ -497,33 +506,32 @@ class TestFormatToolCall:
 
     def test_read_tool(self):
         """Read 工具显示文件路径和图标"""
-        line = ClaudeCodePlugin._format_tool_call("Read", {"file_path": "src/main.py"})
+        line = format_tool_call("Read", {"file_path": "src/main.py"})
         assert "📖" in line
         assert "src/main.py" in line
 
     def test_bash_tool(self):
         """Bash 工具显示命令"""
-        line = ClaudeCodePlugin._format_tool_call("Bash", {"command": "python -m pytest"})
+        line = format_tool_call("Bash", {"command": "python -m pytest"})
         assert "💻" in line
         assert "python -m pytest" in line
 
     def test_long_param_truncated(self):
         """超长参数被截断"""
-        from plugins.claude_code.claude_code_plugin import _TOOL_PARAM_MAX
         long_path = "a" * (_TOOL_PARAM_MAX + 20)
-        line = ClaudeCodePlugin._format_tool_call("Read", {"file_path": long_path})
+        line = format_tool_call("Read", {"file_path": long_path})
         assert "..." in line
         assert len(line) < len(long_path) + 20
 
     def test_unknown_tool(self):
         """未知工具使用默认图标"""
-        line = ClaudeCodePlugin._format_tool_call("CustomTool", {"key": "value"})
+        line = format_tool_call("CustomTool", {"key": "value"})
         assert "🔧" in line
         assert "CustomTool" in line
 
     def test_tool_no_params(self):
         """无参数工具只显示图标和名称"""
-        line = ClaudeCodePlugin._format_tool_call("Bash", {})
+        line = format_tool_call("Bash", {})
         assert "💻" in line
         assert "Bash" in line
 
@@ -533,24 +541,24 @@ class TestAssembleCardText:
 
     def test_both_log_and_text(self):
         """日志和文字都有时用分隔线连接"""
-        result = ClaudeCodePlugin._assemble_card_text("log content", "reply text")
+        result = assemble_card_text("log content", "reply text")
         assert "log content" in result
         assert "reply text" in result
         assert "---" in result
 
     def test_only_log(self):
         """只有日志时返回日志"""
-        result = ClaudeCodePlugin._assemble_card_text("log content", "")
+        result = assemble_card_text("log content", "")
         assert result == "log content"
 
     def test_only_text(self):
         """只有文字时返回文字"""
-        result = ClaudeCodePlugin._assemble_card_text("", "reply text")
+        result = assemble_card_text("", "reply text")
         assert result == "reply text"
 
     def test_both_empty(self):
         """都为空时返回空字符串"""
-        result = ClaudeCodePlugin._assemble_card_text("", "")
+        result = assemble_card_text("", "")
         assert result == ""
 
 
@@ -562,7 +570,7 @@ class TestCardBuilding:
 
     def test_running_card_has_cancel_button(self):
         """执行中卡片包含取消按钮"""
-        card = json.loads(ClaudeCodePlugin._build_card("测试", running=True))
+        card = json.loads(build_execution_card("测试", running=True))
         assert card["header"]["template"] == "turquoise"
         assert "执行中" in card["header"]["title"]["content"]
         # 检查有 action 元素
@@ -572,7 +580,7 @@ class TestCardBuilding:
 
     def test_completed_card_no_cancel(self):
         """完成卡片不包含取消按钮"""
-        card = json.loads(ClaudeCodePlugin._build_card("测试", running=False))
+        card = json.loads(build_execution_card("测试", running=False))
         assert card["header"]["template"] == "blue"
         assert "执行中" not in card["header"]["title"]["content"]
         actions = [e for e in card["elements"] if e.get("tag") == "action"]
@@ -580,7 +588,7 @@ class TestCardBuilding:
 
     def test_card_contains_text(self):
         """卡片正文包含指定文本"""
-        card = json.loads(ClaudeCodePlugin._build_card("hello world"))
+        card = json.loads(build_execution_card("hello world"))
         assert card["elements"][0]["content"] == "hello world"
 
 

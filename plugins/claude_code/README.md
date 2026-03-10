@@ -112,8 +112,13 @@ permission_hook.sh → PermissionServer → 插件识别为 AskUserQuestion
 ```
 claude_code/
 ├── __init__.py              # 导出 ClaudeCodePlugin
-├── claude_code_plugin.py    # 插件主体（约 1170 行，含会话管理、流式推送）
-├── permission_server.py     # HTTP 权限确认服务（277 行）
+├── claude_code_plugin.py    # 插件核心：指令路由、子进程管理、流式推送、卡片回调
+├── constants.py             # 共享常量和纯工具函数（路径处理、模型列表等）
+├── cards.py                 # 飞书卡片 JSON 构建（执行卡片、权限卡片、会话列表等）
+├── stream_parser.py         # CLI 流式输出解析与工具调用日志渲染
+├── session_store.py         # 会话持久化（JSON 文件读写、过期清理、JSONL 历史解析）
+├── permission_manager.py    # 权限服务器生命周期管理（Hook 注册、请求回调分发）
+├── permission_server.py     # HTTP 权限确认服务（阻塞等待用户飞书确认）
 ├── permission_hook.sh       # Claude Code PreToolUse Hook 脚本
 ├── standalone.py            # 独立机器人模式（跳过 HubBot 直连飞书）
 └── __main__.py              # python -m plugins.claude_code 入口
@@ -123,7 +128,12 @@ claude_code/
 
 | 模块 | 职责 |
 |------|------|
-| `claude_code_plugin.py` | 插件核心：指令解析、子进程管理、输出流式推送、会话状态 |
+| `claude_code_plugin.py` | 插件核心：指令路由、子进程管理、输出流式推送、卡片回调处理 |
+| `constants.py` | 共享常量（关键词、数据目录、默认模型列表）和纯工具函数（路径展示、工作目录解析）|
+| `cards.py` | 所有飞书卡片 JSON 构建逻辑，纯函数无状态 |
+| `stream_parser.py` | CLI stdout 流式解析（JSON 行 → 文本/工具日志段）和日志渲染 |
+| `session_store.py` | 历史会话持久化存储、过期清理，以及 Claude Code JSONL 会话文件读取 |
+| `permission_manager.py` | 权限确认服务器的启动、Hook 注册、权限请求回调分发（通过回调与主插件解耦）|
 | `permission_server.py` | 内嵌 HTTP 服务器，接收 Hook 请求并阻塞等待用户飞书确认 |
 | `permission_hook.sh` | 由 Claude Code 调用，将权限请求转发给 PermissionServer |
 | `standalone.py` | 绕过 HubBot，以独立机器人身份运行 CC 插件 |
