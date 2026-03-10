@@ -88,7 +88,7 @@ class TestExitRouting:
 
         bot.on_message("user1", "chat1", text)
         bot.reply.assert_called_once()
-        assert "user1" not in bot.active_plugin
+        assert ("user1", "chat1") not in bot.active_plugin
 
 
 class TestPluginRouting:
@@ -98,7 +98,7 @@ class TestPluginRouting:
         """发送关键词激活对应插件"""
         bot, plugin = bot_with_plugin
         bot.on_message("user1", "chat1", "test")
-        assert bot.active_plugin.get("user1") == "test"
+        assert bot.active_plugin.get(("user1", "chat1")) == "test"
         assert plugin.received_messages == [("user1", "chat1", "test")]
 
     def test_active_plugin_receives_followup(self, bot_with_plugin):
@@ -119,8 +119,8 @@ class TestPluginRouting:
         mock_bot.on_message("user1", "chat1", "a")
         mock_bot.on_message("user1", "chat1", "b")
 
-        p1.deactivate_user.assert_called_once_with("user1")
-        assert mock_bot.active_plugin["user1"] == "b"
+        p1.deactivate_user.assert_called_once_with("user1", "chat1")
+        assert mock_bot.active_plugin[("user1", "chat1")] == "b"
 
     def test_plugin_auto_deactivate_when_not_active(self, mock_bot):
         """插件 is_user_active 返回 False 时自动移除活跃状态"""
@@ -131,7 +131,7 @@ class TestPluginRouting:
         mock_bot.on_message("user1", "chat1", "once")
         # 发送后续消息，插件处理后 is_user_active=False，应被移除
         mock_bot.on_message("user1", "chat1", "followup")
-        assert "user1" not in mock_bot.active_plugin
+        assert ("user1", "chat1") not in mock_bot.active_plugin
 
 
 class TestCardActionRouting:
@@ -153,7 +153,7 @@ class TestCardActionRouting:
         p.is_user_active = MagicMock(return_value=True)
         mock_bot.register(p)
 
-        mock_bot.active_plugin["u1"] = "game"
+        mock_bot.active_plugin[("u1", "c1")] = "game"
         mock_bot.on_card_action("u1", "c1", "m1", {"data": 1})
         p.handle_card_action.assert_called_once()
 
@@ -191,7 +191,7 @@ class TestFileMessageRouting:
         mock_bot.on_message("u1", "c1", "fp")
         # StubPlugin.is_user_active 默认返回 False
         mock_bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
-        assert "u1" not in mock_bot.active_plugin
+        assert ("u1", "c1") not in mock_bot.active_plugin
 
 
 class TestBotMenuRouting:
@@ -201,7 +201,7 @@ class TestBotMenuRouting:
         """菜单点击匹配插件 keyword 时激活插件"""
         bot, plugin = bot_with_plugin
         bot.on_bot_menu("user1", "ou_open1", "test")
-        assert bot.active_plugin.get("user1") == "test"
+        assert bot.active_plugin.get(("user1", "ou_open1")) == "test"
         assert plugin.received_messages == [("user1", "ou_open1", "test")]
 
     def test_bot_menu_switches_plugin(self, mock_bot):
@@ -214,8 +214,8 @@ class TestBotMenuRouting:
         mock_bot.on_bot_menu("user1", "ou_open1", "a")
         mock_bot.on_bot_menu("user1", "ou_open1", "b")
 
-        p1.deactivate_user.assert_called_once_with("user1")
-        assert mock_bot.active_plugin["user1"] == "b"
+        p1.deactivate_user.assert_called_once_with("user1", "ou_open1")
+        assert mock_bot.active_plugin[("user1", "ou_open1")] == "b"
 
     def test_bot_menu_unknown_key_shows_menu(self, bot_with_plugin):
         """菜单点击未匹配任何插件时展示菜单"""
@@ -276,7 +276,7 @@ class TestGroupChatRouting:
             mentions=[_make_mention("@_user_1")],
         )
         bot._on_raw_message(event)
-        assert bot.active_plugin.get("user1") == "test"
+        assert bot.active_plugin.get(("user1", "oc_group1")) == "test"
         assert plugin.received_messages == [("user1", "oc_group1", "test")]
 
     def test_group_at_mention_forwards_to_active_plugin(self, bot_with_plugin):

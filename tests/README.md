@@ -139,7 +139,7 @@ def test_plugin_integrates_with_hub(self, mock_bot):
     mock_bot.register(plugin)
 
     mock_bot.on_message("u1", "c1", plugin.keyword)
-    assert mock_bot.active_plugin.get("u1") == plugin.keyword
+    assert mock_bot.active_plugin.get(("u1", "c1")) == plugin.keyword
 ```
 
 ## 编写规范

@@ -47,7 +47,7 @@ rps_game/
 | `RPSPlugin` | 插件主类 |
 | `handle_message()` | 处理文本消息（游戏开始、结束指令）|
 | `handle_card_action()` | 处理卡片按钮点击（用户出拳）|
-| `is_user_active()` | 返回用户是否正在游戏中 |
+| `is_user_active(user_id, chat_id)` | 返回用户是否正在游戏中 |
 
 ## 配置
 

@@ -51,13 +51,15 @@ class MyPlugin(Plugin):
         """处理文件消息（用户上传文件时调用）。不需要文件处理的插件可以不实现。"""
         ...
 
-    def is_user_active(self, user_id: str) -> bool:
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
         """返回 True 表示用户仍在本插件会话中，后续消息继续路由到本插件。
-        返回 False（默认）则每次消息处理完后自动退出插件。"""
+        返回 False（默认）则每次消息处理完后自动退出插件。
+        chat_id 用于跨群聊隔离——同一用户在不同群聊中可独立维护会话状态。"""
         return False
 
-    def deactivate_user(self, user_id: str) -> None:
-        """用户退出插件时调用，用于清理会话状态。"""
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
+        """用户退出插件时调用，用于清理会话状态。
+        chat_id 用于跨群聊隔离，与 is_user_active 中的 chat_id 语义一致。"""
         pass
 ```
 
@@ -101,8 +103,10 @@ def on_register(self, bot) -> None:
 
 ```
 用户发送 keyword → HubBot 激活插件 → handle_message(text=keyword)
-用户继续发消息 → HubBot 检查 is_user_active() → True → handle_message(text)
-用户发送"退出" → HubBot 调用 deactivate_user() → 回到主菜单
+用户继续发消息 → HubBot 检查 is_user_active(user_id, chat_id) → True → handle_message(text)
+用户发送"退出" → HubBot 调用 deactivate_user(user_id, chat_id) → 回到主菜单
+
+注意：同一用户在不同群聊中的插件激活状态互相独立（按 (user_id, chat_id) 隔离）。
 ```
 
 ## 示例

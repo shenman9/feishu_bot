@@ -42,7 +42,7 @@ class ClaudeCodeBot(FeishuBot):
 
     def on_message(self, user_id: str, chat_id: str, text: str) -> None:
         """将消息转发给 CC 插件；首条消息自动激活，无需发送关键词"""
-        state = self._plugin._get_state(user_id)
+        state = self._plugin._get_state(user_id, chat_id)
 
         if not state["active"]:
             logger.info("[CC-Standalone] 自动激活用户: user=%s", user_id)

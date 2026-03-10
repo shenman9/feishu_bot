@@ -18,6 +18,14 @@
 * 插件与外界的交互必须通过 `HubBot` 提供的统一接口（Context/API）进行。
 * 如果插件 A 需要触发插件 B 的逻辑，必须向 Hub 发送指令，由 Hub 调度。
 
+## 跨群聊隔离 (Per-Chat Isolation)
+
+插件应支持跨群聊隔离——同一用户在不同群聊中激活同一插件时，各自维护独立的会话状态：
+
+* Plugin 基类的 `is_user_active(user_id, chat_id="")` 和 `deactivate_user(user_id, chat_id="")` 已支持 `chat_id` 参数。
+* 需要维护用户状态的插件（如 CC、Claude Chat）应使用 `(user_id, chat_id)` 复合键管理内部状态。
+* 不需要群聊隔离的简单插件可忽略 `chat_id` 参数（默认值 `""` 兼容原有行为）。
+
 ## 错误处理
 
 在 `HubBot` 中调用插件时，必须使用类似以下的防御性编程：

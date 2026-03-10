@@ -69,10 +69,20 @@ class Plugin(ABC):
 
     # ---- 会话状态 ----
 
-    def is_user_active(self, user_id: str) -> bool:
-        """用户是否在本插件的活跃会话中，默认 False（无状态插件）"""
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
+        """用户是否在本插件的活跃会话中，默认 False（无状态插件）
+
+        Args:
+            user_id: 用户 ID
+            chat_id: 群聊 ID（可选，支持 per-chat 隔离的插件应使用此参数）
+        """
         return False
 
-    def deactivate_user(self, user_id: str) -> None:
-        """清理用户会话状态，默认无操作"""
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
+        """清理用户会话状态，默认无操作
+
+        Args:
+            user_id: 用户 ID
+            chat_id: 群聊 ID（可选，支持 per-chat 隔离的插件应使用此参数）
+        """
         pass

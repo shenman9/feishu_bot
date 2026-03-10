@@ -170,7 +170,7 @@ class TestActivation:
     def test_keyword_activates(self, plugin):
         """发送关键词激活插件"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        assert plugin.is_user_active("u1") is True
+        assert plugin.is_user_active("u1", "c1") is True
         msg = plugin.bot.reply.call_args[0][1]
         assert "已激活" in msg
 
@@ -182,10 +182,10 @@ class TestActivation:
         assert "工作目录" in msg
 
     def test_deactivate_clears_state(self, plugin):
-        """deactivate 清理用户全部状态"""
+        """deactivate 清理用户在指定群聊中的全部状态"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.deactivate_user("u1")
-        assert "u1" not in plugin.user_states
+        plugin.deactivate_user("u1", "c1")
+        assert plugin._state_key("u1", "c1") not in plugin.user_states
 
     def test_deactivate_kills_running_process(self, plugin):
         """deactivate 终止运行中的进程"""
@@ -193,16 +193,17 @@ class TestActivation:
         proc.poll = Mock(return_value=None)
         proc.terminate = Mock()
         proc.wait = Mock()
-        plugin._running_processes["u1"] = proc
+        key = plugin._state_key("u1", "c1")
+        plugin._running_processes[key] = proc
 
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin.deactivate_user("u1")
+        plugin.deactivate_user("u1", "c1")
 
         proc.terminate.assert_called_once()
 
     def test_inactive_user_returns_false(self, plugin):
         """未激活用户 is_user_active 返回 False"""
-        assert plugin.is_user_active("unknown") is False
+        assert plugin.is_user_active("unknown", "c1") is False
 
 
 # ---- 用户指令测试 ----
@@ -214,12 +215,12 @@ class TestUserCommands:
     def test_new_session(self, plugin):
         """「新会话」重置 session_id 和 session_started"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        old_session = plugin._get_state("u1")["session_id"]
+        old_session = plugin._get_state("u1", "c1")["session_id"]
         # 模拟已完成过一次调用
-        plugin._get_state("u1")["session_started"] = True
+        plugin._get_state("u1", "c1")["session_started"] = True
 
         plugin.handle_message("u1", "c1", "/new")
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
 
         assert state["session_id"] != old_session
         assert state["session_started"] is False
@@ -229,13 +230,13 @@ class TestUserCommands:
     def test_cancel_when_running(self, plugin):
         """运行中「取消」终止进程"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         state["running"] = True
         proc = Mock()
         proc.poll = Mock(return_value=None)
         proc.terminate = Mock()
         proc.wait = Mock()
-        plugin._running_processes["u1"] = proc
+        plugin._running_processes[plugin._state_key("u1", "c1")] = proc
 
         plugin.handle_message("u1", "c1", "/cancel")
 
@@ -267,7 +268,7 @@ class TestUserCommands:
             plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
             plugin.handle_message("u1", "c1", "/cd /tmp")
 
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         assert state["working_dir"] == "/tmp"
         msg = plugin.bot.reply.call_args[0][1]
         assert "已切换" in msg
@@ -291,7 +292,7 @@ class TestConcurrency:
     def test_reject_when_running(self, plugin):
         """运行中拒绝新任务"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         state["running"] = True
 
         plugin.bot.reply.reset_mock()
@@ -601,13 +602,13 @@ class TestCardAction:
     def test_cancel_action_when_running(self, plugin):
         """运行中点击取消"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         state["running"] = True
         proc = Mock()
         proc.poll = Mock(return_value=None)
         proc.terminate = Mock()
         proc.wait = Mock()
-        plugin._running_processes["u1"] = proc
+        plugin._running_processes[plugin._state_key("u1", "c1")] = proc
 
         plugin.handle_card_action(
             "u1", "c1", "msg1",
@@ -647,7 +648,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", "say hello")
 
         # 等待后台线程完成
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -659,7 +660,7 @@ class TestSubprocessExecution:
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
         assert "Hello!" in last_card["elements"][0]["content"]
         # 运行状态已恢复
-        assert plugin._get_state("u1")["running"] is False
+        assert plugin._get_state("u1", "c1")["running"] is False
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_command_includes_session_id(self, mock_popen_cls, plugin):
@@ -669,10 +670,10 @@ class TestSubprocessExecution:
         ])
 
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        session_id = plugin._get_state("u1")["session_id"]
+        session_id = plugin._get_state("u1", "c1")["session_id"]
         plugin.handle_message("u1", "c1", "test prompt")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -690,15 +691,15 @@ class TestSubprocessExecution:
         ])
 
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        assert plugin._get_state("u1")["session_started"] is False
+        assert plugin._get_state("u1", "c1")["session_started"] is False
 
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
-        assert plugin._get_state("u1")["session_started"] is True
+        assert plugin._get_state("u1", "c1")["session_started"] is True
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_second_call_uses_resume(self, mock_popen_cls, plugin):
@@ -711,7 +712,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "first prompt")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -722,10 +723,10 @@ class TestSubprocessExecution:
             _make_result_event() + "\n",
         ])
 
-        session_id = plugin._get_state("u1")["session_id"]
+        session_id = plugin._get_state("u1", "c1")["session_id"]
         plugin.handle_message("u1", "c1", "second prompt")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -742,7 +743,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -758,7 +759,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -778,7 +779,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -795,11 +796,11 @@ class TestSubprocessExecution:
         ])
 
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         state["working_dir"] = "/tmp/test_project"
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -816,7 +817,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -837,7 +838,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "read file")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -867,7 +868,7 @@ class TestSubprocessExecution:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "build")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -925,8 +926,8 @@ class TestUserIsolation:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u2", "c2", PLUGIN_KEYWORD)
 
-        s1 = plugin._get_state("u1")["session_id"]
-        s2 = plugin._get_state("u2")["session_id"]
+        s1 = plugin._get_state("u1", "c1")["session_id"]
+        s2 = plugin._get_state("u2", "c2")["session_id"]
         assert s1 != s2
 
     def test_independent_working_dirs(self, plugin):
@@ -938,8 +939,8 @@ class TestUserIsolation:
             plugin.handle_message("u1", "c1", "/cd /project_a")
             plugin.handle_message("u2", "c2", "/cd /project_b")
 
-        assert plugin._get_state("u1")["working_dir"] == "/project_a"
-        assert plugin._get_state("u2")["working_dir"] == "/project_b"
+        assert plugin._get_state("u1", "c1")["working_dir"] == "/project_a"
+        assert plugin._get_state("u2", "c2")["working_dir"] == "/project_b"
 
 
 # ---- 进程终止测试 ----
@@ -954,12 +955,13 @@ class TestProcessKill:
         proc.poll = Mock(return_value=None)
         proc.terminate = Mock()
         proc.wait = Mock()
-        plugin._running_processes["u1"] = proc
+        key = plugin._state_key("u1", "c1")
+        plugin._running_processes[key] = proc
 
-        plugin._kill_process("u1")
+        plugin._kill_process("u1", "c1")
 
         proc.terminate.assert_called_once()
-        assert "u1" not in plugin._running_processes
+        assert key not in plugin._running_processes
 
     def test_kill_stubborn_process(self, plugin):
         """terminate 超时后用 kill"""
@@ -968,9 +970,9 @@ class TestProcessKill:
         proc.terminate = Mock()
         proc.wait = Mock(side_effect=subprocess.TimeoutExpired("cmd", 5))
         proc.kill = Mock()
-        plugin._running_processes["u1"] = proc
+        plugin._running_processes[plugin._state_key("u1", "c1")] = proc
 
-        plugin._kill_process("u1")
+        plugin._kill_process("u1", "c1")
 
         proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
@@ -980,15 +982,15 @@ class TestProcessKill:
         proc = Mock()
         proc.poll = Mock(return_value=0)
         proc.terminate = Mock()
-        plugin._running_processes["u1"] = proc
+        plugin._running_processes[plugin._state_key("u1", "c1")] = proc
 
-        plugin._kill_process("u1")
+        plugin._kill_process("u1", "c1")
 
         proc.terminate.assert_not_called()
 
     def test_kill_nonexistent_user(self, plugin):
         """终止不存在用户的进程不报错"""
-        plugin._kill_process("nonexistent")  # 不应抛异常
+        plugin._kill_process("nonexistent", "c1")  # 不应抛异常
 
 
 # ---- 用户切换测试 ----
@@ -1063,7 +1065,7 @@ class TestRunAsUser:
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "test")
 
-        thread = plugin._running_threads.get("u1")
+        thread = plugin._running_threads.get(plugin._state_key("u1", "c1"))
         if thread:
             thread.join(timeout=10)
 
@@ -1078,7 +1080,7 @@ class TestPermissionToggle:
 
     def test_default_bypass_is_false(self, plugin):
         """新用户默认为交互确认模式"""
-        state = plugin._get_state("u1")
+        state = plugin._get_state("u1", "c1")
         assert state.get("bypass_permission", False) is False
 
     def test_toggle_on(self, plugin):
@@ -1087,7 +1089,7 @@ class TestPermissionToggle:
         plugin.handle_card_action("u1", "c1", "m1", {
             "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
         })
-        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "bypass"
 
     def test_toggle_off(self, plugin):
         """卡片动作 set_perm_mode 可切换回 interactive 模式"""
@@ -1098,16 +1100,16 @@ class TestPermissionToggle:
         plugin.handle_card_action("u1", "c1", "m1", {
             "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "interactive"
         })
-        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "interactive"
 
     def test_toggle_blocked_when_running(self, plugin):
         """任务运行中，/permission 指令被拒绝并提示"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
-        plugin._get_state("u1")["running"] = True
+        plugin._get_state("u1", "c1")["running"] = True
         plugin.handle_message("u1", "c1", "/permission")
         msg = plugin.bot.reply.call_args[0][1]
         assert "运行中" in msg
-        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "interactive"
 
     def test_new_session_resets_bypass(self, plugin):
         """「/new」重置权限模式为默认（interactive）"""
@@ -1115,16 +1117,16 @@ class TestPermissionToggle:
         plugin.handle_card_action("u1", "c1", "m1", {
             "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
         })
-        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "bypass"
         plugin.handle_message("u1", "c1", "/new")
-        assert plugin._get_state("u1")["session_perm_mode"] == "interactive"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "interactive"
 
     def test_deactivate_resets_bypass(self, plugin):
         """deactivate 后重新获取状态默认为交互确认"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         plugin.handle_message("u1", "c1", "/bypass")
-        plugin.deactivate_user("u1")
-        assert plugin._get_state("u1").get("bypass_permission", False) is False
+        plugin.deactivate_user("u1", "c1")
+        assert plugin._get_state("u1", "c1").get("bypass_permission", False) is False
 
     def test_status_shows_interactive_mode(self, plugin):
         """「status」显示交互确认模式"""
@@ -1157,5 +1159,5 @@ class TestPermissionToggle:
         plugin.handle_card_action("u1", "c1", "m1", {
             "action": "set_perm_mode", "plugin": PLUGIN_KEYWORD, "mode": "bypass"
         })
-        assert plugin._get_state("u1")["session_perm_mode"] == "bypass"
-        assert plugin._get_state("u2")["session_perm_mode"] == "interactive"
+        assert plugin._get_state("u1", "c1")["session_perm_mode"] == "bypass"
+        assert plugin._get_state("u2", "c2")["session_perm_mode"] == "interactive"

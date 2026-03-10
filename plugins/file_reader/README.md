@@ -53,7 +53,7 @@ file_reader/
 | `FileReaderPlugin` | 插件主类 |
 | `handle_message()` | 处理文本消息（数字编号重新查看文件）|
 | `handle_file_message()` | 处理文件消息（下载、读取、返回内容）|
-| `is_user_active()` | 返回用户是否处于活跃会话中 |
+| `is_user_active(user_id, chat_id)` | 返回用户是否处于活跃会话中 |
 
 ## 限制说明
 

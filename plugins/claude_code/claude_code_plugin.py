@@ -104,11 +104,11 @@ class ClaudeCodePlugin(Plugin):
         self._data_dir: pathlib.Path = data_dir if data_dir is not None else CC_DATA_DIR
         # 配置目录（None 表示使用默认的 config/claude_code.yaml）
         self._config_dir: Optional[pathlib.Path] = config_dir
-        # user_id -> 用户状态
+        # "user_id:chat_id" -> 用户状态（按群聊隔离）
         self.user_states: dict[str, dict] = {}
-        # user_id -> 运行中的子进程
+        # "user_id:chat_id" -> 运行中的子进程
         self._running_processes: dict[str, subprocess.Popen] = {}
-        # user_id -> 运行中的线程
+        # "user_id:chat_id" -> 运行中的线程
         self._running_threads: dict[str, threading.Thread] = {}
         self._config: Optional[dict] = None
         # 会话持久化
@@ -192,39 +192,46 @@ class ClaudeCodePlugin(Plugin):
 
     # ---- 状态管理 ----
 
-    def _get_state(self, user_id: str) -> dict:
-        """获取用户会话状态，不存在则初始化"""
-        if user_id not in self.user_states:
+    @staticmethod
+    def _state_key(user_id: str, chat_id: str) -> str:
+        """生成 per-user-per-chat 的状态 key"""
+        return f"{user_id}:{chat_id}"
+
+    def _get_state(self, user_id: str, chat_id: str) -> dict:
+        """获取用户在指定群聊中的会话状态，不存在则初始化"""
+        key = self._state_key(user_id, chat_id)
+        if key not in self.user_states:
             cfg = self._load_plugin_config()
             default_perm = cfg["default_perm_mode"]
             # manual_select 模式：新会话暂用 interactive 作为安全默认，创建后弹卡片由用户选择
             init_perm = "interactive" if default_perm == "manual_select" else default_perm
-            self.user_states[user_id] = {
+            self.user_states[key] = {
                 "active": False,
                 "session_id": str(uuid.uuid4()),
                 "session_started": False,
                 "running": False,
                 "working_dir": resolve_working_dir(cfg["default_working_dir"]),
-                "last_chat_id": "",
+                "last_chat_id": chat_id,
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
                 "session_model": cfg["default_model"],  # 会话级模型: "" 表示 CLI 默认
                 "perm_timeout_count": 0,  # 当前任务中权限确认超时次数
             }
-        return self.user_states[user_id]
+        return self.user_states[key]
 
-    def is_user_active(self, user_id: str) -> bool:
-        """用户是否在活跃会话中"""
-        return self._get_state(user_id).get("active", False)
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
+        """用户是否在指定群聊中处于活跃会话"""
+        return self._get_state(user_id, chat_id).get("active", False)
 
-    def deactivate_user(self, user_id: str) -> None:
-        """清理用户状态，终止运行中的进程"""
-        self._kill_process(user_id)
-        self.user_states.pop(user_id, None)
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
+        """清理用户在指定群聊中的状态，终止运行中的进程"""
+        self._kill_process(user_id, chat_id)
+        key = self._state_key(user_id, chat_id)
+        self.user_states.pop(key, None)
 
-    def _reset_session(self, user_id: str) -> str:
+    def _reset_session(self, user_id: str, chat_id: str) -> str:
         """重置会话状态，终止运行中的进程，返回新会话 ID"""
-        self._kill_process(user_id)
-        state = self._get_state(user_id)
+        self._kill_process(user_id, chat_id)
+        state = self._get_state(user_id, chat_id)
         state["session_id"] = str(uuid.uuid4())
         state["session_started"] = False
         state["running"] = False
@@ -237,13 +244,13 @@ class ClaudeCodePlugin(Plugin):
     def _send_perm_select_card_if_manual(self, chat_id: str, user_id: str) -> None:
         """若 default_perm_mode 配置为 manual_select，向用户发送权限模式选择卡片"""
         if self._load_plugin_config()["default_perm_mode"] == "manual_select":
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             card = cards.build_permission_mode_card(state["session_perm_mode"])
             self.bot.send_message(chat_id, "interactive", card)
 
-    def _format_status(self, user_id: str) -> str:
+    def _format_status(self, user_id: str, chat_id: str) -> str:
         """格式化当前会话状态文本（复用于激活、/status、/new、/cd）"""
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
         working_dir = state["working_dir"]  # 始终为有效绝对路径（由 resolve_working_dir 保证）
         cfg = self._load_plugin_config()
         default_dir = resolve_working_dir(cfg.get("default_working_dir", ""))
@@ -305,16 +312,18 @@ class ClaudeCodePlugin(Plugin):
             cmd.extend(["--model", model])
         return cmd
 
-    def _kill_process(self, user_id: str, wait: bool = True) -> None:
-        """安全终止用户的运行中进程
+    def _kill_process(self, user_id: str, chat_id: str, wait: bool = True) -> None:
+        """安全终止用户在指定群聊中运行的进程
 
         Args:
             user_id: 用户 ID
+            chat_id: 群聊 ID
             wait: 是否等待进程退出。在飞书卡片回调中应设为 False，
                   避免阻塞导致回调超时（飞书要求 3s 内响应）。
                   后台线程会自行处理进程退出和资源清理。
         """
-        proc = self._running_processes.pop(user_id, None)
+        key = self._state_key(user_id, chat_id)
+        proc = self._running_processes.pop(key, None)
         if proc and proc.poll() is None:
             logger.info("[CC] 终止进程: user=%s, pid=%d, wait=%s", user_id, proc.pid, wait)
             try:
@@ -376,7 +385,7 @@ class ClaudeCodePlugin(Plugin):
         self, user_id: str, chat_id: str, prompt: str, message_id: Optional[str]
     ) -> None:
         """在后台线程执行 Claude Code 子进程，流式更新飞书卡片"""
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
         cfg = self._load_plugin_config()
         timer: Optional[threading.Timer] = None
         start_time = time.time()
@@ -408,16 +417,14 @@ class ClaudeCodePlugin(Plugin):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=cwd,
-                text=True,
-                bufsize=1,
                 env=env,
                 preexec_fn=preexec_fn,
             )
-            self._running_processes[user_id] = proc
+            self._running_processes[self._state_key(user_id, chat_id)] = proc
             logger.info("[CC] 子进程已启动: pid=%d, user=%s", proc.pid, user_id)
 
             # 启动超时定时器
-            timer = self._start_timeout_timer(user_id, cfg["timeout"])
+            timer = self._start_timeout_timer(user_id, chat_id, cfg["timeout"])
 
             # 流式读取并更新卡片
             full_text = ""
@@ -461,10 +468,12 @@ class ClaudeCodePlugin(Plugin):
                         last_patch_time = time.time()
                     continue
 
-                line = proc.stdout.readline()
-                if not line:
+                raw = proc.stdout.readline()
+                if not raw:
                     break
-                line = line.strip()
+                # 二进制模式：手动解码，容错处理不完整的 UTF-8 序列
+                line = (raw.decode("utf-8", errors="replace")
+                        if isinstance(raw, bytes) else raw).strip()
                 if not line:
                     continue
                 line_count += 1
@@ -553,7 +562,7 @@ class ClaudeCodePlugin(Plugin):
                             "[CC] 输出截断: user=%s, 字符数已达 %d 上限",
                             user_id, cfg["max_output_chars"],
                         )
-                        self._kill_process(user_id)
+                        self._kill_process(user_id, chat_id)
                         break
 
                 if meta:
@@ -582,9 +591,11 @@ class ClaudeCodePlugin(Plugin):
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 logger.warning("[CC] 进程等待超时，强制终止: user=%s, pid=%d", user_id, proc.pid)
-                self._kill_process(user_id)
+                self._kill_process(user_id, chat_id)
 
-            stderr_output = proc.stderr.read() if proc.stderr else ""
+            stderr_raw = proc.stderr.read() if proc.stderr else b""
+            stderr_output = (stderr_raw.decode("utf-8", errors="replace")
+                             if isinstance(stderr_raw, bytes) else stderr_raw) if stderr_raw else ""
             elapsed = time.time() - start_time
 
             logger.info(
@@ -662,8 +673,9 @@ class ClaudeCodePlugin(Plugin):
             if timer:
                 timer.cancel()
             state["running"] = False
-            self._running_processes.pop(user_id, None)
-            self._running_threads.pop(user_id, None)
+            key = self._state_key(user_id, chat_id)
+            self._running_processes.pop(key, None)
+            self._running_threads.pop(key, None)
             # 移除权限服务器中的会话映射
             if perm_mgr.server and perm_mgr.started:
                 perm_mgr.server.unregister_session(session_id)
@@ -675,11 +687,11 @@ class ClaudeCodePlugin(Plugin):
                     logger.debug("[CC] 加急通知发送失败: %s", ue)
             logger.info("[CC] 任务清理完成: user=%s", user_id)
 
-    def _start_timeout_timer(self, user_id: str, timeout: int) -> threading.Timer:
+    def _start_timeout_timer(self, user_id: str, chat_id: str, timeout: int) -> threading.Timer:
         """启动超时定时器，超时后终止进程"""
         def _on_timeout():
             logger.warning("Claude Code 执行超时 (%ds), user=%s", timeout, user_id)
-            self._kill_process(user_id)
+            self._kill_process(user_id, chat_id)
 
         timer = threading.Timer(timeout, _on_timeout)
         timer.daemon = True
@@ -710,14 +722,15 @@ class ClaudeCodePlugin(Plugin):
     # ---- AskUserQuestion 响应处理 ----
 
     def _handle_ask_user_response(
-        self, user_id: str, request_id: str, question_index: int, answer: str,
+        self, user_id: str, chat_id: str,
+        request_id: str, question_index: int, answer: str,
     ):
         """处理用户对 AskUserQuestion 某道题的回答，返回卡片响应
 
         记录答案后判断：若所有问题已回答则 resolve 请求并返回灰色已回答卡片，
         否则返回更新后的部分回答卡片。
         """
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
         pending = state.get("_pending_ask_user")
         if not pending or pending["request_id"] != request_id:
             return self.bot.make_card_response(toast="该请求已过期或已处理")
@@ -782,17 +795,17 @@ class ClaudeCodePlugin(Plugin):
 
     def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
         """处理用户消息"""
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
 
         # 1. 关键词激活
         if text == self.keyword:
-            logger.info("[CC] 用户激活插件: user=%s", user_id)
+            logger.info("[CC] 用户激活插件: user=%s, chat=%s", user_id, chat_id)
             state["active"] = True
             state["last_chat_id"] = chat_id
             self.bot.reply(
                 chat_id,
                 f"Claude Code 已激活。\n"
-                f"{self._format_status(user_id)}\n\n"
+                f"{self._format_status(user_id, chat_id)}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
                 f"{self._commands_brief()}",
@@ -803,8 +816,8 @@ class ClaudeCodePlugin(Plugin):
         # 2. 特殊指令：新会话
         if text == "/new":
             logger.info("[CC] 用户重置会话: user=%s, 旧session=%s", user_id, state["session_id"][:8])
-            self._reset_session(user_id)
-            self.bot.reply(chat_id, f"会话已重置。\n{self._format_status(user_id)}")
+            self._reset_session(user_id, chat_id)
+            self.bot.reply(chat_id, f"会话已重置。\n{self._format_status(user_id, chat_id)}")
             self._send_perm_select_card_if_manual(chat_id, user_id)
             return
 
@@ -812,7 +825,7 @@ class ClaudeCodePlugin(Plugin):
         if text == "/cancel":
             if state["running"]:
                 logger.info("[CC] 用户取消任务: user=%s", user_id)
-                self._kill_process(user_id)
+                self._kill_process(user_id, chat_id)
                 state["running"] = False
                 state["cancelled"] = True
                 # 立即更新执行卡片，移除取消按钮
@@ -826,7 +839,7 @@ class ClaudeCodePlugin(Plugin):
 
         # 4. 特殊指令：状态
         if text == "/status":
-            self.bot.reply(chat_id, self._format_status(user_id))
+            self.bot.reply(chat_id, self._format_status(user_id, chat_id))
             return
 
         # 5. 特殊指令：历史会话
@@ -878,7 +891,7 @@ class ClaudeCodePlugin(Plugin):
         # 6. 特殊指令：切换目录（不带路径则重置为默认）
         if text == "/cd":
             old_session = state["session_id"]
-            self._reset_session(user_id)
+            self._reset_session(user_id, chat_id)
             state["working_dir"] = resolve_working_dir(self._load_plugin_config().get("default_working_dir", ""))
             logger.info(
                 "[CC] 用户重置工作目录为默认: user=%s, 旧session=%s, 新session=%s",
@@ -886,7 +899,7 @@ class ClaudeCodePlugin(Plugin):
             )
             self.bot.reply(
                 chat_id,
-                f"工作目录已重置为默认。\n{self._format_status(user_id)}",
+                f"工作目录已重置为默认。\n{self._format_status(user_id, chat_id)}",
             )
             self._send_perm_select_card_if_manual(chat_id, user_id)
             return
@@ -895,7 +908,7 @@ class ClaudeCodePlugin(Plugin):
             new_dir = os.path.realpath(text[len("/cd "):].strip())
             if os.path.isdir(new_dir):
                 old_session = state["session_id"]
-                self._reset_session(user_id)
+                self._reset_session(user_id, chat_id)
                 state["working_dir"] = new_dir
                 logger.info(
                     "[CC] 用户切换目录: user=%s, dir=%s, 旧session=%s, 新session=%s",
@@ -904,7 +917,7 @@ class ClaudeCodePlugin(Plugin):
                 self.bot.reply(
                     chat_id,
                     f"工作目录已切换: {new_dir}\n"
-                    f"{self._format_status(user_id)}",
+                    f"{self._format_status(user_id, chat_id)}",
                 )
                 self._send_perm_select_card_if_manual(chat_id, user_id)
             else:
@@ -1002,7 +1015,7 @@ class ClaudeCodePlugin(Plugin):
             daemon=True,
         )
         t.start()
-        self._running_threads[user_id] = t
+        self._running_threads[self._state_key(user_id, chat_id)] = t
 
     def handle_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict
@@ -1024,7 +1037,7 @@ class ClaudeCodePlugin(Plugin):
                 new_title = (form_value.get("rename_title") or "").strip()
                 if not new_title:
                     return self.bot.make_card_response(toast="请输入新标题")
-                state = self._get_state(user_id)
+                state = self._get_state(user_id, chat_id)
                 target_sid = state.get("_pending_rename", "")
                 if not target_sid:
                     return self.bot.make_card_response(toast="无效的会话 ID")
@@ -1050,21 +1063,21 @@ class ClaudeCodePlugin(Plugin):
             if not custom_answer:
                 return self.bot.make_card_response(toast="请先在输入框中输入你的回答")
 
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             pending = state.get("_pending_ask_user")
             if not pending:
                 return self.bot.make_card_response(toast="该请求已过期或已处理")
 
             return self._handle_ask_user_response(
-                user_id, pending["request_id"], question_index, custom_answer,
+                user_id, chat_id, pending["request_id"], question_index, custom_answer,
             )
 
         if action == "cancel":
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             if state.get("running"):
                 logger.info("[CC] 卡片取消按钮点击: user=%s", user_id)
                 # wait=False: 不等待进程退出，避免阻塞飞书卡片回调超时
-                self._kill_process(user_id, wait=False)
+                self._kill_process(user_id, chat_id, wait=False)
                 state["running"] = False
                 state["cancelled"] = True
                 # 立即返回更新后的卡片，移除取消按钮并更新标题
@@ -1098,7 +1111,7 @@ class ClaudeCodePlugin(Plugin):
             new_mode = action_value.get("mode", "interactive")
             if new_mode not in ("interactive", "accept_edits", "bypass"):
                 return self.bot.make_card_response(toast="无效的权限模式")
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             if state["running"]:
                 return self.bot.make_card_response(toast="任务运行中，无法切换权限模式")
             state["session_perm_mode"] = new_mode
@@ -1116,7 +1129,7 @@ class ClaudeCodePlugin(Plugin):
             valid_aliases = {""} | {m.get("alias", "") for m in self._load_plugin_config()["models"]}
             if model_alias not in valid_aliases:
                 return self.bot.make_card_response(toast="无效的模型选择")
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             if state["running"]:
                 return self.bot.make_card_response(toast="任务运行中，无法切换模型")
             state["session_model"] = model_alias
@@ -1135,7 +1148,7 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
             # 切换为 accept_edits 模式，同时放行当前挂起的请求
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             state["session_perm_mode"] = "accept_edits"
             logger.info(
                 "[CC] 用户通过权限卡片开启 accept_edits 模式: user=%s, request=%s",
@@ -1157,7 +1170,7 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(toast="权限服务器未启动")
 
             # 开启会话级 bypass 模式
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             state["session_perm_mode"] = "bypass"
             logger.info(
                 "[CC] 用户通过权限卡片开启 bypass 模式: user=%s, request=%s",
@@ -1179,7 +1192,7 @@ class ClaudeCodePlugin(Plugin):
             answer_label = action_value.get("answer_label", "")
             question_index = action_value.get("question_index", 0)
             return self._handle_ask_user_response(
-                user_id, request_id, question_index, answer_label,
+                user_id, chat_id, request_id, question_index, answer_label,
             )
 
         if action == "ask_user_custom":
@@ -1195,11 +1208,11 @@ class ClaudeCodePlugin(Plugin):
                 return self.bot.make_card_response(toast="请先在输入框中输入你的回答")
 
             return self._handle_ask_user_response(
-                user_id, request_id, question_index, custom_answer,
+                user_id, chat_id, request_id, question_index, custom_answer,
             )
 
         if action == "show_more_sessions":
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             sessions = self._session_store.load_user_sessions(user_id)
             if not sessions:
                 return self.bot.make_card_response(toast="暂无历史会话记录")
@@ -1208,7 +1221,7 @@ class ClaudeCodePlugin(Plugin):
             return self.bot.make_card_response(card=card)
 
         if action == "resume_session":
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             if state.get("running"):
                 return self.bot.make_card_response(toast="任务运行中，无法切换会话")
             target_sid = action_value.get("session_id", "")
@@ -1224,7 +1237,7 @@ class ClaudeCodePlugin(Plugin):
                     toast=f"工作目录已不存在: {resolved_dir}，请使用 /cd 切换到有效目录"
                 )
             # 终止旧进程并切换到目标会话
-            self._kill_process(user_id)
+            self._kill_process(user_id, chat_id)
             state["session_id"] = target_sid
             state["session_started"] = True   # 下次调用使用 --resume
             state["working_dir"] = resolved_dir
@@ -1256,7 +1269,7 @@ class ClaudeCodePlugin(Plugin):
             if new_starred is None:
                 return self.bot.make_card_response(toast="会话不存在")
             # 刷新会话列表卡片
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             sessions = self._session_store.load_user_sessions(user_id)
             show_count = action_value.get("show_count", _SESSION_INITIAL_COUNT)
             card = cards.build_sessions_card(sessions, state["session_id"], show_count=show_count)
@@ -1272,7 +1285,7 @@ class ClaudeCodePlugin(Plugin):
             if not target:
                 return self.bot.make_card_response(toast="会话不存在")
             # 暂存待重命名的 session_id，用于表单提交时读取
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             state["_pending_rename"] = target_sid
             card = cards.build_rename_card(target)
             return self.bot.make_card_response(card=card)
@@ -1285,7 +1298,7 @@ class ClaudeCodePlugin(Plugin):
             target_sid = action_value.get("session_id", "")
             if not target_sid:
                 # 飞书表单提交可能丢失 button.value，从 state 回退
-                state = self._get_state(user_id)
+                state = self._get_state(user_id, chat_id)
                 target_sid = state.get("_pending_rename", "")
             if not target_sid:
                 return self.bot.make_card_response(toast="无效的会话 ID")
@@ -1293,14 +1306,14 @@ class ClaudeCodePlugin(Plugin):
             if not ok:
                 return self.bot.make_card_response(toast="重命名失败，会话可能已不存在")
             # 清除暂存状态，刷新会话列表
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             state.pop("_pending_rename", None)
             sessions = self._session_store.load_user_sessions(user_id)
             card = cards.build_sessions_card(sessions, state["session_id"])
             return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
 
         if action == "cancel_rename":
-            state = self._get_state(user_id)
+            state = self._get_state(user_id, chat_id)
             state.pop("_pending_rename", None)
             sessions = self._session_store.load_user_sessions(user_id)
             card = cards.build_sessions_card(sessions, state["session_id"])

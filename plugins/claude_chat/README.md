@@ -52,7 +52,7 @@ claude_chat/
 | `handle_message()` | 处理用户消息，调用 API 并流式推送回复 |
 | `_stream_response()` | 流式请求 Claude API，节流更新飞书卡片 |
 | `_trim_history()` | 裁剪超长对话历史 |
-| `is_user_active()` | 返回用户是否处于活跃会话中 |
+| `is_user_active(user_id, chat_id)` | 返回用户是否处于活跃会话中 |
 
 ## 配置
 

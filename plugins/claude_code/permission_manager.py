@@ -55,7 +55,7 @@ class PermissionManager:
         self,
         data_dir: pathlib.Path,
         load_config: Callable[[], dict],
-        get_state: Callable[[str], dict],
+        get_state: Callable[[str, str], dict],  # (user_id, chat_id) -> state
         send_card: Callable[[str, str], None],
         send_card_get_id: Callable[[str, str], Optional[str]],
     ):
@@ -139,7 +139,7 @@ class PermissionManager:
             input_summary = json.dumps(tool_input, ensure_ascii=False)[:500]
 
         # 读取当前会话权限模式
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
         perm_mode = state.get("session_perm_mode", "interactive")
         effective_working_dir = state["working_dir"]  # 始终为有效绝对路径
         logger.info(
@@ -171,7 +171,7 @@ class PermissionManager:
             msg_id = self._send_card_get_id(chat_id, card)
             if msg_id:
                 # 保存表单元数据：飞书表单提交时 button.value 丢失，需从此恢复
-                state = self._get_state(user_id)
+                state = self._get_state(user_id, chat_id)
                 state["_pending_ask_user"] = {
                     "request_id": request_id,
                     "questions": questions,
@@ -239,7 +239,7 @@ class PermissionManager:
         timeout: int,
     ) -> None:
         """权限确认超时回调：记录超时事件到用户状态，供任务结束时在卡片中提示"""
-        state = self._get_state(user_id)
+        state = self._get_state(user_id, chat_id)
         state["perm_timeout_count"] = state.get("perm_timeout_count", 0) + 1
         logger.warning(
             "[CC] 权限确认超时: user=%s, tool=%s, request=%s, timeout=%ds",
