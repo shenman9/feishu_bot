@@ -17,13 +17,16 @@ from plugins.claude_code.permission_server import (
 )
 from plugins.claude_code.claude_code_plugin import (
     ClaudeCodePlugin,
-    PLUGIN_KEYWORD,
     _DEFAULT_TIMEOUT,
     _DEFAULT_MAX_OUTPUT,
     _DEFAULT_MAX_TURNS,
+)
+from plugins.claude_code.constants import PLUGIN_KEYWORD
+from plugins.claude_code.permission_manager import (
     _DEFAULT_PERM_PORT,
     _DEFAULT_PERM_TIMEOUT,
 )
+from plugins.claude_code import cards
 
 
 # ---- 辅助函数 ----
@@ -271,7 +274,7 @@ class TestPermissionCard:
 
     def test_bash_command_card(self):
         """Bash 命令显示为代码块"""
-        card_json = ClaudeCodePlugin._build_permission_card(
+        card_json = cards.build_permission_card(
             "req-1", "Bash", {"command": "rm -rf /tmp/test"}
         )
         card = json.loads(card_json)
@@ -283,7 +286,7 @@ class TestPermissionCard:
 
     def test_edit_file_card(self):
         """Edit 工具显示文件路径"""
-        card_json = ClaudeCodePlugin._build_permission_card(
+        card_json = cards.build_permission_card(
             "req-2", "Edit", {"file_path": "/tmp/test.py"}
         )
         card = json.loads(card_json)
@@ -293,7 +296,7 @@ class TestPermissionCard:
 
     def test_write_file_card(self):
         """Write 工具显示文件路径"""
-        card_json = ClaudeCodePlugin._build_permission_card(
+        card_json = cards.build_permission_card(
             "req-3", "Write", {"file_path": "/tmp/new.py"}
         )
         card = json.loads(card_json)
@@ -303,7 +306,7 @@ class TestPermissionCard:
 
     def test_generic_tool_card(self):
         """通用工具以 JSON 展示"""
-        card_json = ClaudeCodePlugin._build_permission_card(
+        card_json = cards.build_permission_card(
             "req-4", "WebFetch", {"url": "http://example.com"}
         )
         card = json.loads(card_json)
@@ -313,7 +316,7 @@ class TestPermissionCard:
 
     def test_card_has_allow_deny_buttons(self):
         """卡片包含允许、拒绝和全部放行按钮"""
-        card_json = ClaudeCodePlugin._build_permission_card(
+        card_json = cards.build_permission_card(
             "req-5", "Bash", {"command": "ls"}
         )
         card = json.loads(card_json)
@@ -336,7 +339,7 @@ class TestPermissionCard:
 
     def test_handled_card(self):
         """已处理卡片为灰色模板"""
-        card_json = ClaudeCodePlugin._build_permission_handled_card("允许")
+        card_json = cards.build_permission_handled_card("允许")
         card = json.loads(card_json)
         assert card["header"]["template"] == "grey"
         assert "已允许" in card["header"]["title"]["content"]
@@ -365,6 +368,10 @@ class TestPluginPermissionIntegration:
             "permission_timeout": _DEFAULT_PERM_TIMEOUT,
             "default_model": "",
         }
+        # 初始化权限管理器并注入 mock server
+        perm_mgr = p._ensure_perm_manager()
+        perm_mgr._server = MagicMock()
+        perm_mgr._started = True
         return p
 
     @pytest.fixture
@@ -384,45 +391,39 @@ class TestPluginPermissionIntegration:
             "permission_timeout": _DEFAULT_PERM_TIMEOUT,
             "default_model": "",
         }
+        perm_mgr = p._ensure_perm_manager()
+        perm_mgr._server = MagicMock()
+        perm_mgr._started = True
         return p
-
-    def test_needs_permission_server_always_true(self, plugin):
-        """权限服务器始终需要启动（默认启用交互确认）"""
-        assert plugin._needs_permission_server() is True
-
-    def test_needs_permission_server_bypass_mode_also_true(self, bypass_plugin):
-        """bypassPermissions 配置下权限服务器同样需要启动"""
-        assert bypass_plugin._needs_permission_server() is True
 
     def test_perm_allow_card_action(self, plugin):
         """权限允许按钮点击"""
-        # 手动设置权限服务器 mock
-        plugin._perm_server = MagicMock()
-        plugin._perm_server.resolve_request.return_value = True
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr.server.resolve_request.return_value = True
 
         result = plugin.handle_card_action(
             "u1", "c1", "msg1",
             {"action": "perm_allow", "plugin": "CC", "request_id": "req-123"}
         )
 
-        plugin._perm_server.resolve_request.assert_called_once_with("req-123", "allow")
+        perm_mgr.server.resolve_request.assert_called_once_with("req-123", "allow")
 
     def test_perm_deny_card_action(self, plugin):
         """权限拒绝按钮点击"""
-        plugin._perm_server = MagicMock()
-        plugin._perm_server.resolve_request.return_value = True
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr.server.resolve_request.return_value = True
 
         result = plugin.handle_card_action(
             "u1", "c1", "msg1",
             {"action": "perm_deny", "plugin": "CC", "request_id": "req-456"}
         )
 
-        plugin._perm_server.resolve_request.assert_called_once_with("req-456", "deny")
+        perm_mgr.server.resolve_request.assert_called_once_with("req-456", "deny")
 
     def test_expired_request_card_action(self, plugin):
         """过期请求的按钮点击"""
-        plugin._perm_server = MagicMock()
-        plugin._perm_server.resolve_request.return_value = False
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr.server.resolve_request.return_value = False
 
         result = plugin.handle_card_action(
             "u1", "c1", "msg1",
@@ -430,11 +431,12 @@ class TestPluginPermissionIntegration:
         )
 
         # resolve 返回 False，应该提示已过期
-        plugin._perm_server.resolve_request.assert_called_once()
+        perm_mgr.server.resolve_request.assert_called_once()
 
     def test_no_perm_server_card_action(self, plugin):
         """权限服务器未启动时的按钮点击"""
-        plugin._perm_server = None
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr._server = None
 
         result = plugin.handle_card_action(
             "u1", "c1", "msg1",
@@ -445,11 +447,11 @@ class TestPluginPermissionIntegration:
 
     def test_bypass_mode_auto_allows(self, plugin):
         """会话免确认模式下权限请求自动放行，不发飞书卡片"""
-        plugin._perm_server = MagicMock()
+        perm_mgr = plugin._ensure_perm_manager()
         plugin.handle_message("u1", "c1", "CC")
-        plugin._get_state("u1")["session_perm_mode"] = "bypass"
+        plugin._get_state("u1", "c1")["session_perm_mode"] = "bypass"
 
-        plugin._on_permission_request(
+        perm_mgr.on_permission_request(
             user_id="u1",
             chat_id="c1",
             request_id="req-auto",
@@ -459,15 +461,15 @@ class TestPluginPermissionIntegration:
 
         # 自动放行，不发送飞书卡片
         plugin.bot.send_message.assert_not_called()
-        plugin._perm_server.resolve_request.assert_called_once_with("req-auto", "allow")
+        perm_mgr.server.resolve_request.assert_called_once_with("req-auto", "allow")
 
     def test_interactive_mode_sends_card(self, plugin):
         """交互确认模式下权限请求发送飞书卡片"""
-        plugin._perm_server = MagicMock()
+        perm_mgr = plugin._ensure_perm_manager()
         plugin.handle_message("u1", "c1", "CC")
-        assert plugin._get_state("u1").get("session_perm_mode") == "interactive"
+        assert plugin._get_state("u1", "c1").get("session_perm_mode") == "interactive"
 
-        plugin._on_permission_request(
+        perm_mgr.on_permission_request(
             user_id="u1",
             chat_id="c1",
             request_id="req-card",
@@ -478,5 +480,5 @@ class TestPluginPermissionIntegration:
         # 应发送飞书卡片
         plugin.bot.send_message.assert_called_once()
         # 自动放行不应被调用
-        plugin._perm_server.resolve_request.assert_not_called()
+        perm_mgr.server.resolve_request.assert_not_called()
 

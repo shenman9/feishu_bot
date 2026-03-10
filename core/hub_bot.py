@@ -40,7 +40,13 @@ class HubBot(FeishuBot):
 
     def register_all(self, plugins: list[Plugin]) -> None:
         for p in plugins:
-            self.register(p)
+            try:
+                self.register(p)
+            except Exception as e:
+                logger.error(
+                    "插件 '%s' 注册失败，已跳过: %s",
+                    type(p).__name__, e, exc_info=True,
+                )
 
     # ---- 功能菜单 ----
 
@@ -77,7 +83,10 @@ class HubBot(FeishuBot):
         if text.lower() in EXIT_KEYWORDS:
             prev_kw = self.active_plugin.pop((sender_id, chat_id), None)
             if prev_kw and prev_kw in self.plugins:
-                self.plugins[prev_kw].deactivate_user(sender_id, chat_id)
+                try:
+                    self.plugins[prev_kw].deactivate_user(sender_id, chat_id)
+                except Exception as e:
+                    logger.error("插件 '%s' deactivate_user 异常: %s", prev_kw, e, exc_info=True)
             self.reply(chat_id, "已退出当前功能。发送「菜单」查看可用功能。")
             return
 
@@ -85,18 +94,32 @@ class HubBot(FeishuBot):
         if text in self.plugins:
             prev_kw = self.active_plugin.get((sender_id, chat_id))
             if prev_kw and prev_kw in self.plugins:
-                self.plugins[prev_kw].deactivate_user(sender_id, chat_id)
+                try:
+                    self.plugins[prev_kw].deactivate_user(sender_id, chat_id)
+                except Exception as e:
+                    logger.error("插件 '%s' deactivate_user 异常: %s", prev_kw, e, exc_info=True)
             self.active_plugin[(sender_id, chat_id)] = text
-            self.plugins[text].handle_message(sender_id, chat_id, text)
+            try:
+                self.plugins[text].handle_message(sender_id, chat_id, text)
+            except Exception as e:
+                logger.error("插件 '%s' 处理消息异常: %s", text, e, exc_info=True)
+                self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")
             return
 
         # 4. 用户有活跃插件 → 转发
         active_kw = self.active_plugin.get((sender_id, chat_id))
         if active_kw and active_kw in self.plugins:
             plugin = self.plugins[active_kw]
-            plugin.handle_message(sender_id, chat_id, text)
-            if not plugin.is_user_active(sender_id, chat_id):
-                self.active_plugin.pop((sender_id, chat_id), None)
+            try:
+                plugin.handle_message(sender_id, chat_id, text)
+            except Exception as e:
+                logger.error("插件 '%s' 处理消息异常: %s", active_kw, e, exc_info=True)
+                self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")
+            try:
+                if not plugin.is_user_active(sender_id, chat_id):
+                    self.active_plugin.pop((sender_id, chat_id), None)
+            except Exception as e:
+                logger.error("插件 '%s' is_user_active 异常: %s", active_kw, e, exc_info=True)
             return
 
         # 5. 无上下文 → 展示菜单
@@ -113,9 +136,13 @@ class HubBot(FeishuBot):
             plugin_kw = self.active_plugin.get((user_id, chat_id))
 
         if plugin_kw and plugin_kw in self.plugins:
-            return self.plugins[plugin_kw].handle_card_action(
-                user_id, chat_id, message_id, action_value
-            )
+            try:
+                return self.plugins[plugin_kw].handle_card_action(
+                    user_id, chat_id, message_id, action_value
+                )
+            except Exception as e:
+                logger.error("插件 '%s' 处理卡片事件异常: %s", plugin_kw, e, exc_info=True)
+                return self.make_card_response(toast="该功能暂时遇到问题")
 
         return self.make_card_response(toast="请先选择一个功能（发送「菜单」查看）")
 
@@ -129,11 +156,18 @@ class HubBot(FeishuBot):
         active_kw = self.active_plugin.get((sender_id, chat_id))
         if active_kw and active_kw in self.plugins:
             plugin = self.plugins[active_kw]
-            plugin.handle_file_message(
-                sender_id, chat_id, message_id, file_key, file_name
-            )
-            if not plugin.is_user_active(sender_id, chat_id):
-                self.active_plugin.pop((sender_id, chat_id), None)
+            try:
+                plugin.handle_file_message(
+                    sender_id, chat_id, message_id, file_key, file_name
+                )
+            except Exception as e:
+                logger.error("插件 '%s' 处理文件消息异常: %s", active_kw, e, exc_info=True)
+                self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")
+            try:
+                if not plugin.is_user_active(sender_id, chat_id):
+                    self.active_plugin.pop((sender_id, chat_id), None)
+            except Exception as e:
+                logger.error("插件 '%s' is_user_active 异常: %s", active_kw, e, exc_info=True)
             return
 
         self.reply(chat_id, "请先发送「文件阅读」激活文件阅读功能，再上传文件。")
@@ -151,9 +185,16 @@ class HubBot(FeishuBot):
             # 退出当前会话中的活跃插件
             prev_kw = self.active_plugin.get((user_id, open_id))
             if prev_kw and prev_kw in self.plugins:
-                self.plugins[prev_kw].deactivate_user(user_id, open_id)
+                try:
+                    self.plugins[prev_kw].deactivate_user(user_id, open_id)
+                except Exception as e:
+                    logger.error("插件 '%s' deactivate_user 异常: %s", prev_kw, e, exc_info=True)
             # 激活目标插件，open_id 作为消息目标（send_message 自动检测 ID 类型）
             self.active_plugin[(user_id, open_id)] = event_key
-            self.plugins[event_key].handle_message(user_id, open_id, event_key)
+            try:
+                self.plugins[event_key].handle_message(user_id, open_id, event_key)
+            except Exception as e:
+                logger.error("插件 '%s' 处理消息异常: %s", event_key, e, exc_info=True)
+                self.reply(open_id, "该功能暂时遇到问题，请稍后再试。")
         else:
             self._send_menu(open_id)

@@ -289,10 +289,10 @@ class ClaudeChatPlugin(Plugin):
         if not message_id:
             self.bot.reply(chat_id, reply_text)
 
-    def is_user_active(self, user_id: str) -> bool:
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
         """用户是否在活跃会话中"""
         return self._get_state(user_id)["active"]
 
-    def deactivate_user(self, user_id: str) -> None:
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
         """清理用户全部会话状态"""
         self.user_states.pop(user_id, None)

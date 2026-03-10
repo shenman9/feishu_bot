@@ -131,6 +131,13 @@ class FeishuBot(ABC):
 
         群聊消息仅处理 @机器人 的消息，非 @消息直接忽略。
         """
+        try:
+            self._handle_raw_message(data)
+        except Exception as e:
+            logger.error("处理消息事件异常: %s", e, exc_info=True)
+
+    def _handle_raw_message(self, data: P2ImMessageReceiveV1) -> None:
+        """_on_raw_message 的实际逻辑，拆分以便顶层异常捕获"""
         message = data.event.message
         sender_id = data.event.sender.sender_id.user_id
         chat_id = message.chat_id
@@ -186,24 +193,31 @@ class FeishuBot(ABC):
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         """解析卡片按钮点击事件，交给子类处理"""
-        user_id = data.event.operator.user_id
-        chat_id = data.event.context.open_chat_id
-        message_id = data.event.context.open_message_id
-        action_value = data.event.action.value or {}
-        # 表单提交时携带输入框的值，注入 action_value 供插件读取
-        if data.event.action.form_value:
-            action_value["_form_value"] = data.event.action.form_value
-        logger.info("卡片点击: user=%s, action=%s", user_id, action_value)
-        return self.on_card_action(user_id, chat_id, message_id, action_value)
+        try:
+            user_id = data.event.operator.user_id
+            chat_id = data.event.context.open_chat_id
+            message_id = data.event.context.open_message_id
+            action_value = data.event.action.value or {}
+            # 表单提交时携带输入框的值，注入 action_value 供插件读取
+            if data.event.action.form_value:
+                action_value["_form_value"] = data.event.action.form_value
+            logger.info("卡片点击: user=%s, action=%s", user_id, action_value)
+            return self.on_card_action(user_id, chat_id, message_id, action_value)
+        except Exception as e:
+            logger.error("处理卡片事件异常: %s", e, exc_info=True)
+            return P2CardActionTriggerResponse()
 
     def _on_raw_bot_menu(self, data: P2ApplicationBotMenuV6) -> None:
         """解析机器人菜单点击事件，交给子类处理"""
-        operator = data.event.operator
-        user_id = operator.operator_id.user_id
-        open_id = operator.operator_id.open_id
-        event_key = data.event.event_key
-        logger.info("菜单点击: user=%s, event_key=%s", user_id, event_key)
-        self.on_bot_menu(user_id, open_id, event_key)
+        try:
+            operator = data.event.operator
+            user_id = operator.operator_id.user_id
+            open_id = operator.operator_id.open_id
+            event_key = data.event.event_key
+            logger.info("菜单点击: user=%s, event_key=%s", user_id, event_key)
+            self.on_bot_menu(user_id, open_id, event_key)
+        except Exception as e:
+            logger.error("处理菜单事件异常: %s", e, exc_info=True)
 
     @staticmethod
     def _detect_id_type(receive_id: str) -> str:

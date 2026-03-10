@@ -120,8 +120,8 @@ class FileReaderPlugin(Plugin):
         idx = len(state["files"])
         self.bot.reply(chat_id, f"📄 文件 #{idx}: {file_name}\n\n{content}")
 
-    def is_user_active(self, user_id: str) -> bool:
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
         return self._get_state(user_id)["active"]
 
-    def deactivate_user(self, user_id: str) -> None:
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
         self.user_states.pop(user_id, None)

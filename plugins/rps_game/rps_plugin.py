@@ -146,8 +146,8 @@ class RPSPlugin(Plugin):
         self._play(chat_id, state, choice)
         return P2CardActionTriggerResponse()
 
-    def is_user_active(self, user_id: str) -> bool:
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
         return self._get_state(user_id)["playing"]
 
-    def deactivate_user(self, user_id: str) -> None:
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
         self.user_states.pop(user_id, None)

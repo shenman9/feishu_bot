@@ -101,10 +101,10 @@ class PaperDailyPlugin(Plugin):
             self.user_states[user_id] = {"active": False, "running": False}
         return self.user_states[user_id]
 
-    def is_user_active(self, user_id: str) -> bool:
+    def is_user_active(self, user_id: str, chat_id: str = "") -> bool:
         return self._get_state(user_id).get("active", False)
 
-    def deactivate_user(self, user_id: str) -> None:
+    def deactivate_user(self, user_id: str, chat_id: str = "") -> None:
         self.user_states.pop(user_id, None)
 
     # ---- 订阅管理 ----

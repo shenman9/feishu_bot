@@ -388,3 +388,73 @@ class TestGroupChatRouting:
         event.event.message.chat_type = None
         bot._on_raw_message(event)
         assert plugin.received_messages == [("user1", "ou_dm1", "test")]
+
+
+class TestPluginExceptionHandling:
+    """插件异常处理测试——验证插件抛异常时主进程不崩溃"""
+
+    def test_handle_message_exception_does_not_crash(self, mock_bot):
+        """handle_message 抛异常时主流程不崩溃，并回复错误提示"""
+        p = StubPlugin(keyword="boom")
+        p.handle_message = MagicMock(side_effect=RuntimeError("插件爆炸"))
+        mock_bot.register(p)
+
+        mock_bot.on_message("u1", "c1", "boom")
+        # 不应崩溃，且回复了错误提示
+        mock_bot.reply.assert_called_once()
+        assert "遇到问题" in mock_bot.reply.call_args[0][1]
+
+    def test_deactivate_user_exception_does_not_crash(self, mock_bot):
+        """deactivate_user 抛异常时退出流程不崩溃"""
+        p = StubPlugin(keyword="err")
+        p.is_user_active = MagicMock(return_value=True)
+        mock_bot.register(p)
+        mock_bot.on_message("u1", "c1", "err")
+
+        p.deactivate_user = MagicMock(side_effect=RuntimeError("清理爆炸"))
+        # 退出不应崩溃
+        mock_bot.on_message("u1", "c1", "退出")
+        assert ("u1", "c1") not in mock_bot.active_plugin
+
+    def test_is_user_active_exception_does_not_crash(self, mock_bot):
+        """is_user_active 抛异常时不影响消息处理"""
+        p = StubPlugin(keyword="flaky")
+        mock_bot.register(p)
+        mock_bot.on_message("u1", "c1", "flaky")
+
+        p.is_user_active = MagicMock(side_effect=RuntimeError("状态查询爆炸"))
+        # 后续消息不应崩溃
+        mock_bot.on_message("u1", "c1", "后续消息")
+
+    def test_card_action_exception_returns_toast(self, mock_bot):
+        """handle_card_action 抛异常时返回错误 toast"""
+        p = StubPlugin(keyword="card_err")
+        p.handle_card_action = MagicMock(side_effect=RuntimeError("卡片处理爆炸"))
+        mock_bot.register(p)
+
+        result = mock_bot.on_card_action("u1", "c1", "m1", {"plugin": "card_err"})
+        assert result is not None
+
+    def test_file_message_exception_does_not_crash(self, mock_bot):
+        """handle_file_message 抛异常时不崩溃"""
+        p = StubPlugin(keyword="file_err")
+        p.handle_file_message = MagicMock(side_effect=RuntimeError("文件处理爆炸"))
+        p.is_user_active = MagicMock(return_value=True)
+        mock_bot.register(p)
+        mock_bot.active_plugin[("u1", "c1")] = "file_err"
+
+        mock_bot.on_file_message("u1", "c1", "msg1", "fk1", "a.txt")
+        mock_bot.reply.assert_called_once()
+        assert "遇到问题" in mock_bot.reply.call_args[0][1]
+
+    def test_register_all_skips_failed_plugin(self, mock_bot):
+        """register_all 中某个插件注册失败时跳过，不影响其他插件"""
+        p1 = StubPlugin(name="Good", keyword="good")
+        p2 = StubPlugin(name="Bad", keyword="bad")
+        p2.on_register = MagicMock(side_effect=RuntimeError("初始化爆炸"))
+        p3 = StubPlugin(name="Also Good", keyword="also_good")
+
+        mock_bot.register_all([p1, p2, p3])
+        assert "good" in mock_bot.plugins
+        assert "bad" not in mock_bot.plugins
+        assert "also_good" in mock_bot.plugins
