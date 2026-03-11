@@ -76,15 +76,15 @@
 * Python 解释器可用性
 * `config/system.yaml` 文件是否存在
 * `main.py` 文件是否存在
-* 权限服务器端口是否已被占用（从 `config/claude_code.yaml` 读取，缺省 9876），占用时显示占用进程 PID 与命令名
+* 权限服务器端口是否已被占用（从 `config/claude_code.yaml` 读取，缺省 `0` 即 OS 动态分配），占用时显示占用进程 PID 与命令名
 
 ## CC 插件权限服务器机制
 
-CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权限确认服务器，并将端口号写入 `data/claude_code/.feishu_perm_port`（即 `self._data_dir`，可在构造时注入自定义路径以支持多实例隔离）。同时通过环境变量 `FEISHU_CC_DATA_DIR` 将数据目录传递给子进程，`permission_hook.sh` 优先读取该变量，回落到默认路径 `<项目根>/data/claude_code`。
+CC 插件（ClaudeCodePlugin）启动时会在独立端口启动一个 HTTP 权限确认服务器（端口由 OS 动态分配，配置 `permission_server_port: 0`），并将实际监听端口写入 `data/claude_code/.feishu_perm_port`（即 `self._data_dir`，可在构造时注入自定义路径以支持多实例隔离）。同时通过环境变量 `FEISHU_CC_DATA_DIR` 将数据目录传递给子进程，`permission_hook.sh` 优先读取该变量，回落到默认路径 `<项目根>/data/claude_code`。
 
-**降级机制**：若权限服务器启动失败（如端口被占用），插件会立即删除端口文件。hook 脚本检测不到端口文件时直接 `exit 0` 自动放行，避免因 curl 超时（默认 180s）卡住每次工具调用。
+**安全机制（fail-close）**：若权限服务器启动失败，`ensure_server()` 返回 `False`，非 bypass 模式下插件拒绝执行任务并通知用户。hook 脚本在端口文件存在但服务器不可达时 `exit 2` 拒绝操作，确保不会因服务异常而绕过权限确认。
 
-**并发安全**：`_ensure_permission_server()` 内部使用双重检查锁（`_perm_server_lock`），防止多线程同时尝试绑定端口产生 `Address already in use` 错误。
+**并发安全**：`PermissionManager.ensure_server()` 内部使用双重检查锁（`self._lock`），防止多线程同时尝试绑定端口产生 `Address already in use` 错误。
 
 ### 权限模式（session_perm_mode）
 

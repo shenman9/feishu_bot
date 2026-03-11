@@ -38,6 +38,6 @@ permission_timeout: 120               # 用户确认超时秒数，超时自动�
 # - 默认始终启用交互式权限确认：Claude Code 执行危险操作（如 Bash 命令）前
 #   会通过飞书卡片询问用户确认，用户可选择「允许」或「拒绝」。
 # - 插件会自动启动 HTTP 服务器（端口由 OS 动态分配，见 permission_server_port），
-#   的 settings.json 注册 PreToolUse Hook。
-# - 用户可在会话内发送 /bypass 指令切换为自动放行模式，再次发送可恢复确认。
-#   此设置仅限当前会话，开启新会话后自动恢复交互确认。
+#   并向 Claude 的 settings.json 注册 PreToolUse Hook。
+# - 用户可在会话内发送 /permission 指令切换权限模式（interactive/accept_edits/bypass）。
+#   此设置仅限当前会话，开启新会话后自动恢复默认权限模式。

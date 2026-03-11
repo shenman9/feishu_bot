@@ -8,8 +8,11 @@
 hub_agent/
 ├── main.py                  # 启动入口
 ├── config.py                # 配置加载
-├── config.yaml              # 实际配置（不提交）
-├── config.yaml.example      # 配置模板
+├── run.sh                   # 服务管理脚本（启动/停止/重启）
+├── config/                  # 配置文件目录
+│   ├── system.yaml.example  # 系统配置模板（飞书凭证等）
+│   ├── claude_code.yaml.example  # CC 插件配置模板
+│   └── ...                  # 其他插件配置模板（*.yaml 不提交）
 ├── pyproject.toml           # pytest 配置
 ├── requirements-dev.txt     # 测试依赖
 ├── core/                    # 核心框架
@@ -47,22 +50,26 @@ pip install -r requirements-dev.txt  # 测试依赖
 ### 2. 配置
 
 ```bash
-cp config.yaml.example config.yaml
+cp config/system.yaml.example config/system.yaml
+cp config/claude_code.yaml.example config/claude_code.yaml
+# 按需复制其他插件配置
 ```
 
-编辑 `config.yaml`，填入飞书应用的凭证及各插件配置（详见 `config.yaml.example` 中的注释）：
+编辑 `config/system.yaml`，填入飞书应用的凭证：
 
 ```yaml
 app_id: "your_app_id"
 app_secret: "your_app_secret"
 ```
 
+各插件配置项详见对应 `config/*.yaml.example` 中的注释。
+
 > 应用需在[飞书开放平台](https://open.feishu.cn)创建，并开启「机器人」能力和 WebSocket 长连接模式。
 
 ### 3. 启动
 
 ```bash
-python main.py
+./run.sh start
 ```
 
 ## 使用方式

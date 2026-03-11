@@ -6,11 +6,9 @@
 
 ## 一、高优先级 — 运行鲁棒性
 
-### 1. HubBot 插件调用增加异常隔离
+### 1. ~~HubBot 插件调用增加异常隔离~~ ✅ 已完成
 
-- **文件**：`core/hub_bot.py`
-- **问题**：HubBot 是消息路由中枢，其 `on_message()`（line 61）、`on_card_action()`（line 98）、`on_file_message()`（line 115）、`on_bot_menu()`（line 134）四个方法在调用插件的 `handle_message()` / `handle_card_action()` / `handle_file_message()` 时，没有任何 try-except 包裹。一旦某个插件内部抛出未捕获的异常，整条路由链断裂，用户端表现为"发消息没有任何回复"。而项目 CLAUDE.md 明确要求"主进程永不崩溃，插件异常必须被 HubBot 捕获"，当前代码未满足此约束。
-- **目标**：在每个插件调用点统一 catch Exception，记录完整堆栈（`exc_info=True`），向用户发送友好错误提示（如"功能遇到问题，请稍后再试"），并清理该用户的 `active_plugin` 状态防止残留。
+- **状态**：已在 commit `e07e2bf` 中修复，HubBot 的所有插件调用点已添加 try-except 保护。
 
 ---
 
@@ -29,11 +27,9 @@
 
 ---
 
-### 3. 权限服务器增加故障检测与恢复
+### 3. ~~权限服务器增加故障检测与恢复~~ ✅ 已完成
 
-- **文件**：`plugins/claude_code/claude_code_plugin.py`（`_ensure_permission_server` 方法，line 375-407）及 `plugins/claude_code/permission_server.py`
-- **问题**：权限确认服务器（HTTP，监听 localhost:9876）在首次需要时懒初始化，启动成功后将 `_perm_server_started` 置为 True（line 405）。此标志此后永远不会被重置为 False。如果 HTTP 服务器的监听线程因未捕获的异常而退出（如端口被占用后重新绑定失败、系统资源耗尽等），`_perm_server_started` 仍为 True，`_ensure_permission_server()` 直接 return 跳过（line 377），导致后续所有任务的权限请求都无法送达（Hook 脚本 POST 到 9876 端口连接被拒），最终全部超时自动拒绝，任务莫名失败。用户无法通过任何操作恢复，只能重启整个服务。
-- **目标**：在 `_ensure_permission_server()` 中增加服务器线程存活检查（如 `thread.is_alive()`），若线程已退出则重置标志并尝试重新启动。
+- **状态**：已在 commit `e365956` 中修复。权限服务器改为 OS 动态分配端口（`port=0`），`ensure_server()` 返回 bool 控制任务是否执行，hook 脚本改为 fail-close，进程退出时通过 atexit 清理端口文件。
 
 ---
 
@@ -68,7 +64,7 @@
 ### 7. config.py 增加启动时配置校验
 
 - **文件**：`config.py:20-24`
-- **问题**：`load_config()` 函数读取 `config.yaml` 后，仅检查了 `app_id` 和 `app_secret` 两个必填项是否存在。其余配置项（如 `claude_code.permission_server_port` 是否为有效端口范围 1-65535、`timeout` 是否为正整数、`claude_path` 对应的文件是否存在且可执行等）完全不校验。错误配置只会在运行时某个具体功能触发时才暴露，报错信息往往是底层异常（如 `OSError: [Errno 99] Cannot assign requested address`），难以定位到配置问题。
+- **问题**：`load_config()` 函数读取配置后，仅检查了 `app_id` 和 `app_secret` 两个必填项是否存在。其余配置项（如 `claude_code.permission_server_port` 是否为有效端口范围 0-65535、`timeout` 是否为正整数、`claude_path` 对应的文件是否存在且可执行等）完全不校验。错误配置只会在运行时某个具体功能触发时才暴露，报错信息往往是底层异常，难以定位到配置问题。
 - **目标**：在 `load_config()` 或启动流程中增加关键配置项的类型和范围校验，启动时即报出明确的配置错误信息。
 
 ---

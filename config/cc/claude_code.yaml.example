@@ -1,6 +1,6 @@
 # Claude Code 专属机器人插件配置（cc_agent 独立实例）
 # 注意：此文件配置的是 CC 专属机器人，通过 run_cc.sh 启动
-# Hub 机器人使用 config/claude_code.yaml，端口为 9877，与此文件互不干扰
+# Hub 机器人使用 config/claude_code.yaml，两者端口由 OS 动态分配，互不干扰
 claude_path: "/usr/bin/claude"        # Claude Code CLI 路径
 default_working_dir: ""               # 默认工作目录（空=机器人进程当前目录）
 timeout: 600                          # 单次执行超时（秒）
