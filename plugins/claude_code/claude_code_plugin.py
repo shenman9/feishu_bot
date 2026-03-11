@@ -804,7 +804,8 @@ class ClaudeCodePlugin(Plugin):
                 f"{self._format_status(user_id, chat_id)}\n\n"
                 f"直接发送消息作为 prompt 执行。\n"
                 f"特殊指令:\n"
-                f"{self._commands_brief()}",
+                f"{self._commands_brief()}\n\n"
+                f"💡 群聊中默认需要 @机器人 才能触发，发送「唤醒模式」可切换为免@使用。",
             )
             self._send_perm_select_card_if_manual(chat_id, user_id)
             return
@@ -961,6 +962,10 @@ class ClaudeCodePlugin(Plugin):
                 "**模型选择**（发送 `/model` 可切换）\n"
                 "• 默认使用 CLI 自带模型，无需手动选择\n"
                 "• 切换模型仅影响当前会话，新会话恢复默认\n\n"
+                "**群聊唤醒模式**\n"
+                "群聊中默认需要 @机器人 才能触发响应。在群内发送「唤醒模式」可弹出设置卡片：\n"
+                "• 「全部唤醒」— 群内所有消息都直接发给机器人，无需 @\n"
+                "• 「仅@唤醒」— 只有 @机器人 的消息才触发响应（默认）\n\n"
                 "**退出插件**\n"
                 "发送「退出」或「返回」可退出 CC 插件，回到主菜单。"
             )

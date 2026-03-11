@@ -6,7 +6,7 @@
 
 本项目是一个模块化的飞书机器人框架。核心架构模式为 **微内核 + 插件** 体系。
 
-* **FeishuBot (Core)**: 处理 WebSocket 连接、鉴权、基础消息收发。
+* **FeishuBot (Core)**: 处理 WebSocket 连接、鉴权、基础消息收发、群聊唤醒模式。
 * **HubBot (Core)**: 继承自 FeishuBot，作为系统的**中央处理器**。负责加载插件、路由消息、处理异常。
 * **Plugins**: 独立的功能模块。
 
@@ -25,6 +25,11 @@
     * 用户在不同群聊中的插件激活状态独立管理，`active_plugin` 使用 `(user_id, chat_id)` 元组作为 key。
     * 同一用户可在群 A 和群 B 同时使用不同的（或相同的）插件，互不干扰。
     * 插件基类的 `is_user_active(user_id, chat_id)` 和 `deactivate_user(user_id, chat_id)` 均支持 `chat_id` 参数，插件内部状态也应按 `(user_id, chat_id)` 隔离。
+5.  **群聊唤醒模式**（FeishuBot 基类）:
+    * 默认群聊仅处理 @机器人 的消息，非 @消息直接忽略。
+    * 用户在群内发送关键词 `唤醒模式` 可弹出选择卡片，切换为「全部唤醒」（免 @）或「仅@唤醒」（默认）。
+    * 唤醒模式按群聊独立存储（`_wake_mode_groups: set[str]`），仅内存状态，重启后丢失。
+    * 卡片回调 `action == "set_wake_mode"` 在基类拦截处理，不交给子类。
 
 ## 技术栈
 

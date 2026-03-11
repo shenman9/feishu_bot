@@ -458,3 +458,119 @@ class TestPluginExceptionHandling:
         assert "good" in mock_bot.plugins
         assert "bad" not in mock_bot.plugins
         assert "also_good" in mock_bot.plugins
+
+
+class TestWakeMode:
+    """唤醒模式测试——群聊中通过卡片切换是否需要 @机器人"""
+
+    def test_wake_keyword_sends_card_in_group(self, bot_with_plugin):
+        """群聊中发送'唤醒模式'触发选项卡片"""
+        bot, plugin = bot_with_plugin
+        event = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 唤醒模式",
+            message_id="wake_msg_001",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event)
+        bot.reply_card.assert_called_once()
+        # 不应路由到插件
+        assert plugin.received_messages == []
+
+    def test_wake_keyword_ignored_in_p2p(self, bot_with_plugin):
+        """私聊中'唤醒模式'不触发卡片，正常路由给插件/菜单"""
+        bot, plugin = bot_with_plugin
+        event = _make_mock_event(
+            "user1", "ou_dm1", "唤醒模式",
+            message_id="wake_msg_002",
+            chat_type="p2p",
+        )
+        bot._on_raw_message(event)
+        # 私聊中不触发唤醒模式卡片，应走正常路由（无匹配插件 → 菜单）
+        bot.reply_card.assert_called_once()  # 菜单卡片
+        assert "唤醒模式" not in str(bot.reply_card.call_args)
+
+    def test_enable_wake_mode_allows_no_mention(self, bot_with_plugin):
+        """开启唤醒模式后群聊非@消息能正常处理"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group1")
+        event = _make_mock_event(
+            "user1", "oc_group1", "test",
+            message_id="wake_msg_003",
+            chat_type="group",
+            mentions=None,
+        )
+        bot._on_raw_message(event)
+        assert plugin.received_messages == [("user1", "oc_group1", "test")]
+
+    def test_disable_wake_mode_blocks_no_mention(self, bot_with_plugin):
+        """关闭唤醒模式后群聊非@消息被忽略"""
+        bot, plugin = bot_with_plugin
+        # 先开启再关闭
+        bot._wake_mode_groups.add("oc_group1")
+        bot._wake_mode_groups.discard("oc_group1")
+        event = _make_mock_event(
+            "user1", "oc_group1", "test",
+            message_id="wake_msg_004",
+            chat_type="group",
+            mentions=None,
+        )
+        bot._on_raw_message(event)
+        assert plugin.received_messages == []
+
+    def test_wake_mode_per_group_isolation(self, bot_with_plugin):
+        """唤醒模式按群隔离，群A开启不影响群B"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group_a")
+        # 群A: 非@消息通过
+        event_a = _make_mock_event(
+            "user1", "oc_group_a", "test",
+            message_id="wake_msg_005",
+            chat_type="group",
+            mentions=None,
+        )
+        bot._on_raw_message(event_a)
+        assert plugin.received_messages == [("user1", "oc_group_a", "test")]
+        # 群B: 非@消息被忽略
+        event_b = _make_mock_event(
+            "user1", "oc_group_b", "test",
+            message_id="wake_msg_006",
+            chat_type="group",
+            mentions=None,
+        )
+        bot._on_raw_message(event_b)
+        assert len(plugin.received_messages) == 1  # 仍然只有群A的消息
+
+    def test_card_action_set_wake_mode_all(self, mock_bot):
+        """卡片点击'全部唤醒'将群加入唤醒列表"""
+        action_value = {"action": "set_wake_mode", "mode": "all"}
+        mock_bot._handle_set_wake_mode("oc_group1", action_value)
+        assert "oc_group1" in mock_bot._wake_mode_groups
+
+    def test_card_action_set_wake_mode_mention_only(self, mock_bot):
+        """卡片点击'仅@唤醒'将群移出唤醒列表"""
+        mock_bot._wake_mode_groups.add("oc_group1")
+        action_value = {"action": "set_wake_mode", "mode": "mention_only"}
+        mock_bot._handle_set_wake_mode("oc_group1", action_value)
+        assert "oc_group1" not in mock_bot._wake_mode_groups
+
+    def test_card_action_returns_updated_card(self, mock_bot):
+        """卡片点击后返回刷新后的卡片"""
+        action_value = {"action": "set_wake_mode", "mode": "all"}
+        # _on_raw_card_action 会调用 _handle_set_wake_mode，需要直接测试
+        result = mock_bot._handle_set_wake_mode("oc_group1", action_value)
+        assert result is not None
+        assert result.card is not None
+
+    def test_wake_mode_with_mention_still_works(self, bot_with_plugin):
+        """开启唤醒模式后带@的消息仍然正常处理"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group1")
+        event = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 test",
+            message_id="wake_msg_007",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event)
+        assert plugin.received_messages == [("user1", "oc_group1", "test")]

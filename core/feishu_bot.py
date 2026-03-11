@@ -39,11 +39,18 @@ class FeishuBot(ABC):
     3. 业务逻辑层: 子类实现 on_message 和 on_card_action
     """
 
+    # 唤醒模式关键词和模式常量
+    _WAKE_MODE_KEYWORD = "唤醒模式"
+    _WAKE_MODE_ALL = "all"
+    _WAKE_MODE_MENTION = "mention_only"
+
     def __init__(self, app_id: str, app_secret: str):
         self.app_id = app_id
         self.app_secret = app_secret
         self._seen_messages: OrderedDict[str, float] = OrderedDict()
         self._dedup_lock = threading.Lock()
+        # 唤醒模式：这些群聊中所有消息都直接处理，无需 @机器人
+        self._wake_mode_groups: set[str] = set()
 
         self.client = lark.Client.builder() \
             .app_id(app_id) \
@@ -151,10 +158,11 @@ class FeishuBot(ABC):
             logger.info("跳过重复消息: message_id=%s", message_id)
             return
 
-        # 群聊非 @消息直接忽略（后续可扩展为被动监控）
+        # 群聊非 @消息：不在唤醒模式的群则忽略
         if chat_type == "group" and not mentions:
-            logger.debug("忽略群聊非@消息: chat=%s, user=%s", chat_id, sender_id)
-            return
+            if chat_id not in self._wake_mode_groups:
+                logger.debug("忽略群聊非@消息: chat=%s, user=%s", chat_id, sender_id)
+                return
 
         try:
             content_dict = json.loads(message.content)
@@ -189,6 +197,10 @@ class FeishuBot(ABC):
                 return
             logger.info("收到消息: user=%s, chat_type=%s, message_id=%s, text=%s",
                        sender_id, chat_type, message_id, text)
+            # 唤醒模式关键词拦截（仅群聊生效）
+            if text == self._WAKE_MODE_KEYWORD and chat_type == "group":
+                self._send_wake_mode_card(chat_id)
+                return
             self.on_message(sender_id, chat_id, text)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
@@ -202,6 +214,9 @@ class FeishuBot(ABC):
             if data.event.action.form_value:
                 action_value["_form_value"] = data.event.action.form_value
             logger.info("卡片点击: user=%s, action=%s", user_id, action_value)
+            # 唤醒模式卡片回调在基类拦截，不交给子类
+            if action_value.get("action") == "set_wake_mode":
+                return self._handle_set_wake_mode(chat_id, action_value)
             return self.on_card_action(user_id, chat_id, message_id, action_value)
         except Exception as e:
             logger.error("处理卡片事件异常: %s", e, exc_info=True)
@@ -344,6 +359,71 @@ class FeishuBot(ABC):
         if not response.success():
             raise RuntimeError(f"文件下载失败: code={response.code}, msg={response.msg}")
         return response.file.read()
+
+    # ---- 唤醒模式 ----
+
+    def _build_wake_mode_card(self, chat_id: str) -> dict:
+        """构造唤醒模式选择卡片，高亮当前模式"""
+        is_all = chat_id in self._wake_mode_groups
+        current = self._WAKE_MODE_ALL if is_all else self._WAKE_MODE_MENTION
+
+        modes = [
+            (self._WAKE_MODE_ALL, "全部唤醒",
+             "群内所有消息都直接发给机器人，无需 @"),
+            (self._WAKE_MODE_MENTION, "仅@唤醒",
+             "只有 @机器人 的消息才会触发响应"),
+        ]
+
+        elements: list[dict] = []
+        for mode, label, desc in modes:
+            elements.append({"tag": "markdown", "content": f"**{label}**\n{desc}"})
+
+        buttons = []
+        for mode, label, _ in modes:
+            is_current = mode == current
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text",
+                         "content": f"{'✓ ' if is_current else ''}{label}"},
+                "type": "primary" if is_current else "default",
+                "value": {"action": "set_wake_mode", "mode": mode},
+            })
+        elements.append({"tag": "action", "actions": buttons})
+
+        current_label = "全部唤醒" if is_all else "仅@唤醒"
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "唤醒模式"},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "markdown",
+                 "content": f"当前模式：**{current_label}**"},
+                {"tag": "hr"},
+                *elements,
+            ],
+        }
+
+    def _send_wake_mode_card(self, chat_id: str) -> None:
+        """发送唤醒模式选择卡片"""
+        card = self._build_wake_mode_card(chat_id)
+        self.reply_card(chat_id, card)
+
+    def _handle_set_wake_mode(
+        self, chat_id: str, action_value: dict
+    ) -> P2CardActionTriggerResponse:
+        """处理唤醒模式卡片按钮点击"""
+        mode = action_value.get("mode", self._WAKE_MODE_MENTION)
+        if mode == self._WAKE_MODE_ALL:
+            self._wake_mode_groups.add(chat_id)
+            toast = "已切换为「全部唤醒」模式，群内消息无需 @ 即可触发"
+        else:
+            self._wake_mode_groups.discard(chat_id)
+            toast = "已切换为「仅@唤醒」模式"
+        logger.info("唤醒模式切换: chat=%s, mode=%s", chat_id, mode)
+        updated_card = self._build_wake_mode_card(chat_id)
+        return self.make_card_response(card=updated_card, toast=toast)
 
     # ---- 业务逻辑层 (子类实现) ----
 
