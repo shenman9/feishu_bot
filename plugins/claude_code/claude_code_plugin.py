@@ -8,7 +8,6 @@ Claude Code 桥接插件
 将 Claude Code 的权限请求转发给飞书用户确认。
 """
 
-import difflib
 import datetime
 import json
 import logging
@@ -90,9 +89,6 @@ class ClaudeCodePlugin(Plugin):
         {"usage": "/model",     "brief": "切换模型",                     "detail": "弹出模型选择卡片，切换当前会话使用的 Claude 模型"},
         {"usage": "/help",      "brief": "查看帮助信息",                 "detail": "显示此帮助信息"},
     ]
-
-    # 透传指令：不在插件层拦截，直接作为 prompt 发送给 Claude Code
-    _PASSTHROUGH_COMMANDS: set[str] = {"/compact"}
 
     def __init__(
         self,
@@ -971,17 +967,7 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, help_text)
             return
 
-        # 10. 未知特殊指令拦截（以 / 开头但不匹配任何已知指令；透传指令除外）
-        if text.startswith("/") and text.split()[0] not in self._PASSTHROUGH_COMMANDS:
-            input_cmd = text.split()[0]
-            # 从指令定义表中提取纯指令名（去掉参数部分，如 "/cd <路径>" → "/cd"）
-            known_cmds = list({cmd["usage"].split()[0] for cmd in self._SPECIAL_COMMANDS})
-            matches = difflib.get_close_matches(input_cmd, known_cmds, n=1, cutoff=0.6)
-            hint = f"\n您是不是想输入 `{matches[0]}`？" if matches else ""
-            self.bot.reply(chat_id, f"未知指令 `{input_cmd}`，发送 `/help` 查看所有可用指令。{hint}")
-            return
-
-        # 11. 并发控制：运行中拒绝新任务
+        # 10. 并发控制：运行中拒绝新任务
         if state["running"]:
             logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
             self.bot.reply(
