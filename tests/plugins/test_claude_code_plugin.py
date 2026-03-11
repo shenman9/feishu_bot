@@ -19,8 +19,7 @@ from plugins.claude_code.stream_parser import (
     DEFAULT_MAX_OUTPUT as _DEFAULT_MAX_OUTPUT,
     format_tool_call,
     parse_stream_line,
-    render_log,
-    assemble_card_text,
+    render_log_parts,
     _MAX_STREAK_DISPLAY,
     _TOOL_PARAM_MAX,
 )
@@ -421,87 +420,6 @@ class TestParseStreamLine:
 # ---- 工具调用日志渲染测试 ----
 
 
-class TestRenderLog:
-    """工具调用日志渲染测试"""
-
-    def test_empty_log(self):
-        """无任何日志时返回空字符串"""
-        result = render_log([], [], running=False)
-        assert result == ""
-
-    def test_running_with_log_shows_spinner(self):
-        """执行中且有日志时显示⏳"""
-        streak = [{"line": "📖 Read `file.py`", "tool_use_id": "t1"}]
-        result = render_log([], streak, running=True)
-        assert "⏳" in result
-        assert "📖" in result
-
-    def test_running_without_log_shows_spinner(self):
-        """执行中且无日志时也显示⏳（初始思考阶段）"""
-        result = render_log([], [], running=True)
-        assert "⏳" in result
-
-    def test_streak_within_limit(self):
-        """连续工具调用未超上限时全部显示"""
-        streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(5)]
-        result = render_log([], streak, running=False)
-        for i in range(5):
-            assert f"file{i}.py" in result
-        assert "省略" not in result
-
-    def test_streak_exceeds_limit_folds(self):
-        """连续工具调用超过上限时折叠显示最近 N 条"""
-        total = _MAX_STREAK_DISPLAY + 5
-        streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(total)]
-        result = render_log([], streak, running=False)
-        assert "省略" in result
-        assert "5 次" in result
-        # 最后 _MAX_STREAK_DISPLAY 条应显示
-        for i in range(5, total):
-            assert f"file{i}.py" in result
-        # 前 5 条不应显示
-        for i in range(5):
-            assert f"file{i}.py" not in result
-
-    def test_segments_separated_by_blank_line(self):
-        """不同段之间有空行分隔"""
-        segments = [
-            {"type": "tools", "entries": ["📖 Read `a.py`"]},
-        ]
-        streak = [{"line": "📝 Edit `b.py`", "tool_use_id": "t2"}]
-        result = render_log(segments, streak, running=False)
-        # 段间有空行
-        assert "\n\n" in result or "\n \n" in result or result.count("\n") >= 2
-
-    def test_interleaved_tools_and_text_order(self):
-        """工具调用与文字段按实际执行顺序交错渲染（非两段式）"""
-        segments = [
-            {"type": "tools", "entries": ["📖 Read `a.py` → ✅"]},
-            {"type": "text", "content": "分析结果：文件已读取"},
-            {"type": "tools", "entries": ["💻 Bash `git commit` → ✅"]},
-            {"type": "text", "content": "提交完成"},
-        ]
-        result = render_log(segments, [], running=False)
-        idx_tool1 = result.index("Read")
-        idx_text1 = result.index("分析结果")
-        idx_tool2 = result.index("Bash")
-        idx_text2 = result.index("提交完成")
-        # 必须严格按 工具1 → 文字1 → 工具2 → 文字2 顺序排列
-        assert idx_tool1 < idx_text1 < idx_tool2 < idx_text2
-
-    def test_text_segment_rendered_inline(self):
-        """文字段内联渲染，不被折叠或放到末尾"""
-        segments = [
-            {"type": "tools", "entries": ["📖 Read `x.py` → ✅"]},
-            {"type": "text", "content": "这是中间文字"},
-            {"type": "tools", "entries": ["💻 Bash `ls` → ✅"]},
-        ]
-        result = render_log(segments, [], running=False)
-        assert "这是中间文字" in result
-        # 文字夹在两段工具调用之间
-        assert result.index("Read") < result.index("这是中间文字") < result.index("Bash")
-
-
 class TestFormatToolCall:
     """工具调用格式化测试"""
 
@@ -537,60 +455,184 @@ class TestFormatToolCall:
         assert "Bash" in line
 
 
-class TestAssembleCardText:
-    """两段式卡片内容组装测试"""
+class TestRenderLogParts:
+    """render_log_parts 分离工具日志和回复文本测试"""
 
-    def test_both_log_and_text(self):
-        """日志和文字都有时用分隔线连接"""
-        result = assemble_card_text("log content", "reply text")
-        assert "log content" in result
-        assert "reply text" in result
-        assert "---" in result
+    def test_empty_returns_empty_tuple(self):
+        """无任何内容时返回两个空字符串"""
+        log, reply = render_log_parts([], [], running=False)
+        assert log == ""
+        assert reply == ""
 
-    def test_only_log(self):
-        """只有日志时返回日志"""
-        result = assemble_card_text("log content", "")
-        assert result == "log content"
+    def test_only_tools_returns_log_only(self):
+        """仅有工具调用段时，log_text 有内容，reply_text 为空"""
+        segments = [{"type": "tools", "entries": ["📖 Read `a.py` → ✅"]}]
+        log, reply = render_log_parts(segments, [], running=False)
+        assert "Read" in log
+        assert reply == ""
 
-    def test_only_text(self):
-        """只有文字时返回文字"""
-        result = assemble_card_text("", "reply text")
-        assert result == "reply text"
+    def test_only_text_returns_reply_only(self):
+        """仅有文字段时，log_text 为空，reply_text 有内容"""
+        segments = [{"type": "text", "content": "回复内容"}]
+        log, reply = render_log_parts(segments, [], running=False)
+        assert log == ""
+        assert reply == "回复内容"
 
-    def test_both_empty(self):
-        """都为空时返回空字符串"""
-        result = assemble_card_text("", "")
-        assert result == ""
+    def test_interleaved_separates_correctly(self):
+        """中间文字归入日志，只有最后一段文字作为回复"""
+        segments = [
+            {"type": "tools", "entries": ["📖 Read `a.py` → ✅"]},
+            {"type": "text", "content": "分析结果"},
+            {"type": "tools", "entries": ["💻 Bash `ls` → ✅"]},
+            {"type": "text", "content": "提交完成"},
+        ]
+        log, reply = render_log_parts(segments, [], running=False)
+        assert "Read" in log
+        assert "Bash" in log
+        # 中间文字归入日志
+        assert "分析结果" in log
+        # 最后一段文字作为回复
+        assert reply == "提交完成"
+        # 回复不包含工具和中间文字
+        assert "Read" not in reply
+        assert "分析结果" not in reply
+
+    def test_running_spinner_in_log(self):
+        """运行中提示归入 log_text"""
+        log, reply = render_log_parts([], [], running=True)
+        assert "⏳" in log
+        assert reply == ""
+
+    def test_current_streak_in_log(self):
+        """current_streak 归入 log_text"""
+        streak = [{"line": "📖 Read `file.py`", "tool_use_id": "t1"}]
+        log, reply = render_log_parts([], streak, running=False)
+        assert "Read" in log
+        assert reply == ""
+
+    def test_multiple_text_segments_joined(self):
+        """多个文字段时，中间文字归入日志，最后一段作为回复"""
+        segments = [
+            {"type": "text", "content": "第一段"},
+            {"type": "text", "content": "第二段"},
+        ]
+        log, reply = render_log_parts(segments, [], running=False)
+        assert "第一段" in log
+        assert reply == "第二段"
+
+    def test_streak_folding(self):
+        """超过上限的连续调用折叠"""
+        total = _MAX_STREAK_DISPLAY + 5
+        streak = [{"line": f"📖 Read `file{i}.py`", "tool_use_id": f"t{i}"} for i in range(total)]
+        log, reply = render_log_parts([], streak, running=False)
+        assert "省略" in log
+        assert "5 次" in log
 
 
 # ---- 卡片构建测试 ----
 
 
 class TestCardBuilding:
-    """飞书卡片构建测试"""
+    """飞书卡片构建测试（v2 格式）"""
+
+    def _get_elements(self, card: dict) -> list[dict]:
+        """从 v2 卡片中提取 elements"""
+        return card["body"]["elements"]
+
+    def test_v2_schema(self):
+        """卡片包含 v2 schema 标识"""
+        card = json.loads(build_execution_card(log_text="测试"))
+        assert card["schema"] == "2.0"
+        assert "body" in card
+        assert "elements" in card["body"]
 
     def test_running_card_has_cancel_button(self):
         """执行中卡片包含取消按钮"""
-        card = json.loads(build_execution_card("测试", running=True))
+        card = json.loads(build_execution_card(log_text="测试", running=True))
         assert card["header"]["template"] == "turquoise"
         assert "执行中" in card["header"]["title"]["content"]
-        # 检查有 action 元素
-        actions = [e for e in card["elements"] if e.get("tag") == "action"]
-        assert len(actions) == 1
-        assert actions[0]["actions"][0]["value"]["action"] == "cancel"
+        elements = self._get_elements(card)
+        buttons = [e for e in elements if e.get("tag") == "button"]
+        assert len(buttons) == 1
+        assert buttons[0]["value"]["action"] == "cancel"
 
     def test_completed_card_no_cancel(self):
         """完成卡片不包含取消按钮"""
-        card = json.loads(build_execution_card("测试", running=False))
+        card = json.loads(build_execution_card(log_text="测试", running=False))
         assert card["header"]["template"] == "blue"
         assert "执行中" not in card["header"]["title"]["content"]
-        actions = [e for e in card["elements"] if e.get("tag") == "action"]
-        assert len(actions) == 0
+        elements = self._get_elements(card)
+        buttons = [e for e in elements if e.get("tag") == "button"]
+        assert len(buttons) == 0
 
-    def test_card_contains_text(self):
-        """卡片正文包含指定文本"""
-        card = json.loads(build_execution_card("hello world"))
-        assert card["elements"][0]["content"] == "hello world"
+    def test_only_log_uses_panel(self):
+        """仅有 log_text 时使用折叠面板"""
+        card = json.loads(build_execution_card(log_text="hello world"))
+        elements = self._get_elements(card)
+        assert elements[0]["tag"] == "collapsible_panel"
+        assert "执行过程" in elements[0]["header"]["title"]["content"]
+        assert elements[0]["elements"][0]["content"] == "hello world"
+
+    def test_panel_has_arrow_icon(self):
+        """折叠面板包含箭头图标和旋转配置"""
+        card = json.loads(build_execution_card(log_text="日志", reply_text="回复"))
+        elements = self._get_elements(card)
+        for panel in [e for e in elements if e.get("tag") == "collapsible_panel"]:
+            header = panel["header"]
+            # 箭头图标
+            assert header["icon"]["tag"] == "standard_icon"
+            assert header["icon"]["token"] == "right-small-ccm_outlined"
+            # 图标位置和展开旋转角度
+            assert header["icon_position"] == "left"
+            assert header["icon_expanded_angle"] == 90
+
+    def test_log_and_reply_layout(self):
+        """同时有 log_text 和 reply_text 时，各自放入折叠面板"""
+        card = json.loads(build_execution_card(log_text="工具日志", reply_text="回复内容"))
+        elements = self._get_elements(card)
+        panels = [e for e in elements if e.get("tag") == "collapsible_panel"]
+        assert len(panels) == 2
+        # 第一个面板：执行过程
+        assert "执行过程" in panels[0]["header"]["title"]["content"]
+        assert panels[0]["elements"][0]["content"] == "工具日志"
+        # 第二个面板：回复（默认展开）
+        assert "回复" in panels[1]["header"]["title"]["content"]
+        assert panels[1]["elements"][0]["content"] == "回复内容"
+        assert panels[1]["expanded"] is True
+
+    def test_running_panel_expanded(self):
+        """执行中时日志折叠面板展开"""
+        card = json.loads(build_execution_card(log_text="日志", reply_text="回复", running=True))
+        elements = self._get_elements(card)
+        log_panel = elements[0]
+        assert log_panel["tag"] == "collapsible_panel"
+        assert log_panel["expanded"] is True
+        # 标题包含进行中提示
+        assert "进行中" in log_panel["header"]["title"]["content"]
+        # 回复面板始终展开
+        reply_panel = elements[1]
+        assert reply_panel["tag"] == "collapsible_panel"
+        assert reply_panel["expanded"] is True
+
+    def test_completed_panel_collapsed(self):
+        """完成后日志折叠面板收起，回复面板仍展开"""
+        card = json.loads(build_execution_card(log_text="日志", reply_text="回复", running=False))
+        elements = self._get_elements(card)
+        log_panel = elements[0]
+        assert log_panel["tag"] == "collapsible_panel"
+        assert log_panel["expanded"] is False
+        reply_panel = elements[1]
+        assert reply_panel["tag"] == "collapsible_panel"
+        assert reply_panel["expanded"] is True
+
+    def test_only_reply_uses_panel(self):
+        """仅有 reply_text 时也使用折叠面板"""
+        card = json.loads(build_execution_card(log_text="", reply_text="仅回复"))
+        elements = self._get_elements(card)
+        assert elements[0]["tag"] == "collapsible_panel"
+        assert "回复" in elements[0]["header"]["title"]["content"]
+        assert elements[0]["elements"][0]["content"] == "仅回复"
+        assert elements[0]["expanded"] is True
 
 
 # ---- 卡片按钮处理测试 ----
@@ -632,6 +674,19 @@ class TestCardAction:
 # ---- 子进程执行测试 ----
 
 
+def _extract_card_content(card: dict) -> str:
+    """从 v2 卡片中提取所有文本内容（折叠面板 + 普通 markdown）"""
+    parts = []
+    for el in card.get("body", {}).get("elements", []):
+        if el.get("tag") == "collapsible_panel":
+            for sub in el.get("elements", []):
+                if sub.get("tag") == "markdown":
+                    parts.append(sub["content"])
+        elif el.get("tag") == "markdown":
+            parts.append(el["content"])
+    return "\n\n---\n\n".join(parts)
+
+
 class TestSubprocessExecution:
     """子进程执行测试"""
 
@@ -658,7 +713,7 @@ class TestSubprocessExecution:
         plugin.bot.patch_message.assert_called()
         # 最终卡片包含输出文本
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        assert "Hello!" in last_card["elements"][0]["content"]
+        assert "Hello!" in _extract_card_content(last_card)
         # 运行状态已恢复
         assert plugin._get_state("u1", "c1")["running"] is False
 
@@ -749,7 +804,7 @@ class TestSubprocessExecution:
 
         plugin.bot.patch_message.assert_called()
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        assert "未产生输出" in last_card["elements"][0]["content"]
+        assert "未产生输出" in _extract_card_content(last_card)
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_file_not_found(self, mock_popen_cls, plugin):
@@ -765,7 +820,7 @@ class TestSubprocessExecution:
 
         plugin.bot.patch_message.assert_called()
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        assert "未安装" in last_card["elements"][0]["content"]
+        assert "未安装" in _extract_card_content(last_card)
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_output_truncation(self, mock_popen_cls, plugin):
@@ -785,7 +840,7 @@ class TestSubprocessExecution:
 
         plugin.bot.patch_message.assert_called()
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        content = last_card["elements"][0]["content"]
+        content = _extract_card_content(last_card)
         assert "截断" in content
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
@@ -844,15 +899,20 @@ class TestSubprocessExecution:
 
         plugin.bot.patch_message.assert_called()
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        content = last_card["elements"][0]["content"]
+        elements = last_card["body"]["elements"]
+        # v2 格式：有工具日志和回复，应产生折叠面板 + markdown
+        panel = elements[0]
+        assert panel["tag"] == "collapsible_panel"
+        panel_content = panel["elements"][0]["content"]
         # 日志部分含工具调用和成功标记
-        assert "Read" in content
-        assert "src/main.py" in content
-        assert "✅" in content
-        # 文字回复部分
-        assert "已读取文件。" in content
-        # 分隔线
-        assert "---" in content
+        assert "Read" in panel_content
+        assert "src/main.py" in panel_content
+        assert "✅" in panel_content
+        # 文字回复在回复折叠面板中
+        reply_panel = elements[1]
+        assert reply_panel["tag"] == "collapsible_panel"
+        assert reply_panel["expanded"] is True
+        assert "已读取文件。" in reply_panel["elements"][0]["content"]
 
     @patch("plugins.claude_code.claude_code_plugin.subprocess.Popen")
     def test_tool_call_error_shows_failure(self, mock_popen_cls, plugin):
@@ -873,7 +933,7 @@ class TestSubprocessExecution:
             thread.join(timeout=10)
 
         last_card = json.loads(plugin.bot.patch_message.call_args[0][1])
-        content = last_card["elements"][0]["content"]
+        content = _extract_card_content(last_card)
         assert "❌" in content
         assert "Permission denied" in content
 
@@ -1161,3 +1221,67 @@ class TestPermissionToggle:
         })
         assert plugin._get_state("u1", "c1")["session_perm_mode"] == "bypass"
         assert plugin._get_state("u2", "c2")["session_perm_mode"] == "interactive"
+
+
+# ---- 权限服务器启动失败时的任务阻止测试 ----
+
+
+class TestPermServerFailBlocksTask:
+    """权限服务器启动失败时，非 bypass 模式应阻止任务执行"""
+
+    def test_interactive_mode_blocks_on_server_failure(self, plugin):
+        """interactive 模式下权限服务器启动失败时拒绝执行"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["session_perm_mode"] = "interactive"
+
+        # 模拟权限服务器启动失败
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr._started = False
+        perm_mgr._server = None
+        with patch.object(perm_mgr, "ensure_server", return_value=False):
+            plugin.handle_message("u1", "c1", "测试任务")
+
+        # 应该回复错误信息而非开始执行
+        reply_msg = plugin.bot.reply.call_args[0][1]
+        assert "权限确认服务器启动失败" in reply_msg
+        assert state["running"] is False
+
+    def test_accept_edits_mode_blocks_on_server_failure(self, plugin):
+        """accept_edits 模式下权限服务器启动失败时也拒绝执行"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["session_perm_mode"] = "accept_edits"
+
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr._started = False
+        perm_mgr._server = None
+        with patch.object(perm_mgr, "ensure_server", return_value=False):
+            plugin.handle_message("u1", "c1", "测试任务")
+
+        reply_msg = plugin.bot.reply.call_args[0][1]
+        assert "权限确认服务器启动失败" in reply_msg
+        assert state["running"] is False
+
+    def test_bypass_mode_allows_on_server_failure(self, plugin):
+        """bypass 模式下权限服务器启动失败时仍可执行"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["session_perm_mode"] = "bypass"
+
+        perm_mgr = plugin._ensure_perm_manager()
+        perm_mgr._started = False
+        perm_mgr._server = None
+        with patch.object(perm_mgr, "ensure_server", return_value=False), \
+             patch("plugins.claude_code.claude_code_plugin.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock(
+                stdout=io.BytesIO(b''),
+                stderr=io.BytesIO(b''),
+                poll=MagicMock(return_value=0),
+                returncode=0,
+                wait=MagicMock(return_value=0),
+            )
+            plugin.handle_message("u1", "c1", "测试任务")
+            # bypass 模式不应被阻止：应该进入运行状态（或至少不是"启动失败"提示）
+            last_reply = plugin.bot.reply.call_args[0][1] if plugin.bot.reply.call_args else ""
+            assert "权限确认服务器启动失败" not in last_reply

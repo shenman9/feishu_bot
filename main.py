@@ -3,6 +3,8 @@
 """
 
 import logging
+import signal
+import sys
 
 from config import load_config
 from core.hub_bot import HubBot
@@ -30,6 +32,9 @@ def main():
         PaperDailyPlugin(),
         ClaudeCodePlugin(),
     ])
+
+    # 注册 SIGTERM 处理器：将 SIGTERM 转为正常退出，确保 atexit 清理逻辑被触发
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     bot.start()
 

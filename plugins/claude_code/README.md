@@ -63,7 +63,7 @@ Claude Code 触发危险操作
     ↓
 permission_hook.sh（Claude PreToolUse Hook）
     ↓
-POST /permission-request → PermissionServer（localhost:9876）
+POST /permission-request → PermissionServer（localhost:<动态端口>）
     ↓
 服务器向飞书用户发送确认卡片，阻塞等待
     ↓
@@ -159,7 +159,7 @@ default_perm_mode: "interactive"    # 新会话默认权限模式
                                     #   interactive   / accept_edits / bypass / manual_select
 max_turns: 50                       # Claude Code 最大对话轮数
 run_as_user: ""                     # 子进程切换到指定系统用户运行（解决 root 限制）
-permission_server_port: 9876        # 权限确认服务监听端口
+permission_server_port: 0           # 权限确认服务监听端口（0=OS 自动分配空闲端口）
 permission_timeout: 120             # 用户确认超时时间（秒），超时自动拒绝
 models:                             # 可选模型列表，通过 /model 指令选择（可选，有内置默认）
   - alias: "sonnet"                 #   alias: 传给 claude --model 的值
@@ -177,7 +177,7 @@ default_model: ""                   # 新会话默认模型，留空使用 CLI �
 | `default_perm_mode` | `"interactive"` | 新会话启动时的默认权限模式，可选值：`interactive` / `accept_edits` / `bypass` / `manual_select` |
 | `max_turns` | `50` | Claude Code `--max-turns` 参数值 |
 | `run_as_user` | `""` | 以指定系统用户运行子进程，适用于 Docker root 环境 |
-| `permission_server_port` | `9876` | 权限服务 HTTP 监听端口，需确保未被占用 |
+| `permission_server_port` | `0` | 权限服务 HTTP 监听端口，`0` 表示由 OS 自动分配空闲端口 |
 | `permission_timeout` | `120` | 等待用户确认的超时时间（秒）|
 | `models` | 内置 Sonnet/Opus/Haiku | 可选模型列表，每项含 `alias`、`label`、`desc` |
 | `default_model` | `""` | 新会话默认模型，留空使用 CLI 默认，填写应为 `models` 中的某个 `alias` |
@@ -201,7 +201,7 @@ default_model: ""                   # 新会话默认模型，留空使用 CLI �
 ## 注意事项
 
 - 本插件依赖本地安装的 `claude` CLI，需提前安装并完成认证
-- 权限服务器默认绑定 `localhost:9876`，仅供本机 Hook 脚本访问，不对外暴露
+- 权限服务器绑定 `localhost` 动态端口，仅供本机 Hook 脚本访问，不对外暴露
 - `run_as_user` 仅在 Linux 下生效，需要主进程有足够权限切换用户
 - 长时间运行的任务可通过 `/cancel` 中止，避免资源占用
 - `bypass` 模式将跳过所有权限确认，请在充分信任的场景下使用

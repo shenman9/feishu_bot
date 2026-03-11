@@ -36,7 +36,7 @@ from plugins.claude_code.stream_parser import (
     DEFAULT_MAX_OUTPUT,
     format_tool_call,
     parse_stream_line,
-    render_log,
+    render_log_parts,
 )
 from plugins.claude_code import cards
 from plugins.claude_code.cards import _SESSION_INITIAL_COUNT, _SESSION_PAGE_SIZE
@@ -455,11 +455,12 @@ class ClaudeCodePlugin(Plugin):
                     # 无新数据时刷新进度计时
                     if message_id:
                         elapsed = int(time.time() - phase_start_time)
-                        card_text = render_log(
+                        log_text, reply_text = render_log_parts(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
-                        self._patch_card(message_id, card_text, running=True,
+                        self._patch_card(message_id, log_text, reply_text,
+                                         running=True,
                                          elapsed=int(time.time() - start_time))
                         last_patch_time = time.time()
                     continue
@@ -572,11 +573,12 @@ class ClaudeCodePlugin(Plugin):
                     time_since = now - last_patch_time
                     if chars_since >= _PATCH_MIN_CHARS or time_since >= _PATCH_INTERVAL:
                         elapsed = int(now - phase_start_time)
-                        card_text = render_log(
+                        log_text, reply_text = render_log_parts(
                             segments, current_streak, running=True,
                             elapsed=elapsed, thinking=model_thinking,
                         )
-                        self._patch_card(message_id, card_text, running=True,
+                        self._patch_card(message_id, log_text, reply_text,
+                                         running=True,
                                          elapsed=int(now - start_time))
                         last_patch_len = len(full_text)
                         last_patch_time = now
@@ -628,28 +630,28 @@ class ClaudeCodePlugin(Plugin):
                     "entries": [e["line"] for e in current_streak],
                 })
 
-            card_text = render_log(segments, [], running=False)
+            log_text, reply_text = render_log_parts(segments, [], running=False)
             if cost_info:
-                card_text += f"\n\n---\n{cost_info}"
+                reply_text += f"\n\n---\n{cost_info}"
 
             # 如果本次任务中发生过权限确认超时，追加警告
             timeout_count = state.get("perm_timeout_count", 0)
             if timeout_count > 0:
                 perm_timeout = self._load_plugin_config()["permission_timeout"]
-                card_text += (
+                reply_text += (
                     f"\n\n---\n⚠️ 本次任务中有 {timeout_count} 次权限确认超时"
                     f"（{perm_timeout}s），操作已自动拒绝"
                 )
 
             if message_id:
                 cancelled = state.get("cancelled", False)
-                self._patch_card(message_id, card_text, running=False, cancelled=cancelled)
+                self._patch_card(message_id, log_text, reply_text, running=False, cancelled=cancelled)
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI 未安装或路径错误，请检查配置。"
             logger.error("[CC] CLI 未找到: %s", self._load_plugin_config()["claude_path"])
             if message_id:
-                self._patch_card(message_id, error_msg, running=False)
+                self._patch_card(message_id, log_text=error_msg, running=False)
             else:
                 self.bot.reply(chat_id, error_msg)
 
@@ -661,7 +663,7 @@ class ClaudeCodePlugin(Plugin):
             )
             error_msg = f"执行失败: {e}"
             if message_id:
-                self._patch_card(message_id, error_msg, running=False)
+                self._patch_card(message_id, log_text=error_msg, running=False)
             else:
                 self.bot.reply(chat_id, error_msg)
 
@@ -696,18 +698,17 @@ class ClaudeCodePlugin(Plugin):
 
     # ---- 飞书卡片更新 ----
 
-    def _patch_card(self, message_id: str, text: str, running: bool = True,
-                    elapsed: int = 0, cancelled: bool = False) -> None:
+    def _patch_card(self, message_id: str, log_text: str, reply_text: str = "",
+                    running: bool = True, elapsed: int = 0, cancelled: bool = False) -> None:
         """更新飞书卡片消息"""
-        content = cards.build_execution_card(text, running=running, elapsed=elapsed, cancelled=cancelled)
+        content = cards.build_execution_card(log_text, reply_text, running=running, elapsed=elapsed, cancelled=cancelled)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
             debug_log = self._data_dir / "cc_card_debug.log"
             debug_log.parent.mkdir(parents=True, exist_ok=True)
             with debug_log.open("a", encoding="utf-8") as _f:
                 _f.write(f"\n{'='*60}\n[{datetime.datetime.now().isoformat()}] message_id={message_id} running={running}\n")
-                _f.write(text)
-                _f.write("\n")
+                _f.write(f"[log_text]\n{log_text}\n[reply_text]\n{reply_text}\n")
         except Exception:
             pass
         try:
@@ -828,7 +829,7 @@ class ClaudeCodePlugin(Plugin):
                 # 立即更新执行卡片，移除取消按钮
                 mid = state.get("current_message_id")
                 if mid:
-                    self._patch_card(mid, "**已取消执行**", cancelled=True)
+                    self._patch_card(mid, log_text="**已取消执行**", cancelled=True)
                 self.bot.reply(chat_id, "已取消当前任务。")
             else:
                 self.bot.reply(chat_id, "当前没有运行中的任务。")
@@ -992,10 +993,26 @@ class ClaudeCodePlugin(Plugin):
         )
 
         # 确保权限确认服务器已启动（首次调用时初始化）
-        self._ensure_perm_manager().ensure_server()
+        perm_mgr = self._ensure_perm_manager()
+        server_ok = perm_mgr.ensure_server()
+
+        # 非 bypass 模式下，权限服务器必须正常运行才能安全执行任务
+        perm_mode = state.get("session_perm_mode", "interactive")
+        if not server_ok and perm_mode != "bypass":
+            logger.error(
+                "[CC] 权限服务器启动失败，%s 模式下拒绝执行: user=%s",
+                perm_mode, user_id,
+            )
+            state["running"] = False
+            self.bot.reply(
+                chat_id,
+                "⚠️ 权限确认服务器启动失败，无法在当前权限模式下安全执行任务。\n"
+                "请联系管理员检查服务器端口配置，或切换到 bypass 模式（/permission）后重试。",
+            )
+            return
 
         # 发送占位卡片
-        placeholder = cards.build_execution_card("正在启动 Claude Code...", running=True)
+        placeholder = cards.build_execution_card(log_text="正在启动 Claude Code...", running=True)
         message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
         state["current_message_id"] = message_id
 
@@ -1072,7 +1089,7 @@ class ClaudeCodePlugin(Plugin):
                 state["running"] = False
                 state["cancelled"] = True
                 # 立即返回更新后的卡片，移除取消按钮并更新标题
-                cancel_card = json.loads(cards.build_execution_card("**已取消执行**", cancelled=True))
+                cancel_card = json.loads(cards.build_execution_card(log_text="**已取消执行**", cancelled=True))
                 return self.bot.make_card_response(card=cancel_card, toast="已取消执行")
             return self.bot.make_card_response(toast="当前没有运行中的任务")
 

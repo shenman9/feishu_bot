@@ -29,6 +29,6 @@
 * **注释 & Commit Message 必须使用中文**。Commit 格式: `类型: 描述`。
 * **config/ 目录下的 `*.yaml` 严禁提交到 git**，配置变更只改 `config/*.yaml.example`。
 * **主进程永不崩溃**，插件异常必须被 HubBot 捕获。
-* **禁止使用内置 WebFetch 工具**。由于地区限制，WebFetch 预检会被 Anthropic 拦截（302 → app-unavailable-in-region）。需要抓取网页内容时，一律通过 Bash 执行 `curl -sL <URL>` 获取，再对输出进行分析。
+* **WebFetch 工具问题**。由于地区限制，WebFetch 预检会被 Anthropic 拦截（302 → app-unavailable-in-region）。如果你遇到 `WebFetch` 获取内容失败，可以尝试通过 Bash 执行 `curl` 等系统工具获取，再对输出进行分析。
 * **服务的启动、停止、重启必须通过 `run.sh` 脚本进行**，禁止直接执行 `python main.py` 或手动 kill 进程。
 * **禁止自行重启服务**：除非用户明确要求，否则绝不主动执行重启操作。重启会导致用户与机器人的会话中断，影响用户体验。

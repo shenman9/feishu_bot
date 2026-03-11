@@ -12,7 +12,7 @@ default_perm_mode: "interactive"      # 新会话默认权限模式，可选值�
                                       #   manual_select - 新会话创建后弹出权限选择卡片，由用户手动选择
 max_turns: 50                         # Claude Code 最大轮次
 run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
-permission_server_port: 9876          # 权限确认 HTTP 服务器端口（hub_agent 用 9877，避免冲突）
+permission_server_port: 0             # 权限确认 HTTP 服务器端口（0=OS 自动分配空闲端口，避免冲突）
 permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝
 
 # 模型选择配置

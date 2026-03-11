@@ -1,7 +1,8 @@
 """
-权限确认服务器及插件集成单元测试
+权限确认服务器及权限管理器单元测试
 """
 
+import atexit
 import json
 import threading
 import time
@@ -25,6 +26,7 @@ from plugins.claude_code.constants import PLUGIN_KEYWORD
 from plugins.claude_code.permission_manager import (
     _DEFAULT_PERM_PORT,
     _DEFAULT_PERM_TIMEOUT,
+    PermissionManager,
 )
 from plugins.claude_code import cards
 
@@ -336,6 +338,112 @@ class TestPermissionCard:
         bypass_btn = buttons[2]
         assert bypass_btn["value"]["action"] == "perm_bypass"
         assert bypass_btn["value"]["request_id"] == "req-5"
+
+
+# ---- PermissionManager 生命周期测试 ----
+
+
+class TestPermissionManagerLifecycle:
+    """权限管理器启动、清理、返回值测试"""
+
+    @pytest.fixture
+    def data_dir(self, tmp_path):
+        """提供临时数据目录"""
+        d = tmp_path / "data" / "claude_code"
+        d.mkdir(parents=True)
+        return d
+
+    def _make_manager(self, data_dir, port=None):
+        """构建 PermissionManager 实例，使用空闲端口"""
+        if port is None:
+            port = _find_free_port()
+        cfg = {
+            "permission_server_port": port,
+            "permission_timeout": 5,
+            "run_as_user": "",
+        }
+        return PermissionManager(
+            data_dir=data_dir,
+            load_config=lambda: cfg,
+            get_state=MagicMock(return_value={
+                "session_perm_mode": "interactive",
+                "working_dir": "/tmp",
+            }),
+            send_card=MagicMock(),
+            send_card_get_id=MagicMock(return_value="msg-1"),
+        )
+
+    def test_ensure_server_returns_true_on_success(self, data_dir):
+        """启动成功时返回 True"""
+        mgr = self._make_manager(data_dir)
+        try:
+            result = mgr.ensure_server()
+            assert result is True
+            assert mgr.started is True
+            assert mgr.server is not None
+            # 端口文件已写入
+            assert (data_dir / ".feishu_perm_port").exists()
+        finally:
+            if mgr.server:
+                mgr.server.stop()
+
+    def test_ensure_server_returns_false_on_failure(self, data_dir):
+        """端口被占用时启动失败返回 False"""
+        # 先占用端口
+        import socket
+        port = _find_free_port()
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen(1)
+        try:
+            mgr = self._make_manager(data_dir, port=port)
+            result = mgr.ensure_server()
+            assert result is False
+            assert mgr.started is False
+            # 端口文件不应存在
+            assert not (data_dir / ".feishu_perm_port").exists()
+        finally:
+            blocker.close()
+
+    def test_ensure_server_cleans_stale_port_file(self, data_dir):
+        """启动前清理残留的旧端口文件"""
+        # 写入一个残留端口文件
+        (data_dir / ".feishu_perm_port").write_text("9999")
+        (data_dir / ".feishu_perm_timeout").write_text("120")
+
+        mgr = self._make_manager(data_dir)
+        try:
+            result = mgr.ensure_server()
+            assert result is True
+            # 端口文件已被更新（不再是旧的 9999）
+            new_port = (data_dir / ".feishu_perm_port").read_text()
+            assert new_port != "9999"
+        finally:
+            if mgr.server:
+                mgr.server.stop()
+
+    def test_ensure_server_idempotent(self, data_dir):
+        """多次调用 ensure_server 只启动一次"""
+        mgr = self._make_manager(data_dir)
+        try:
+            assert mgr.ensure_server() is True
+            assert mgr.ensure_server() is True
+            assert mgr.started is True
+        finally:
+            if mgr.server:
+                mgr.server.stop()
+
+    def test_register_cleanup_called(self, data_dir):
+        """启动成功后注册了 atexit 清理"""
+        mgr = self._make_manager(data_dir)
+        try:
+            with patch.object(atexit, "register") as mock_register:
+                mgr.ensure_server()
+                mock_register.assert_called_once()
+        finally:
+            if mgr.server:
+                mgr.server.stop()
 
     def test_handled_card(self):
         """已处理卡片为灰色模板"""

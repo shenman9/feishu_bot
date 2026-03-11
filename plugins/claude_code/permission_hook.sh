@@ -96,9 +96,11 @@ if [ -z "$RESPONSE" ]; then
         echo "权限确认等待超时（${PERM_TIMEOUT}s），操作已拒绝" >&2
         exit 2
     fi
-    # 其他失败（连接拒绝等）：服务器未运行，降级为自动放行
-    _log "响应为空（权限服务器未运行，exit=${CURL_EXIT}），直接放行"
-    exit 0
+    # 端口文件存在但服务器不可达（连接拒绝等）：
+    # 说明 bot 声称在管理权限但服务器异常，拒绝操作以保证安全（fail-close）
+    _log "端口文件存在但服务器不可达 (exit=${CURL_EXIT})，拒绝操作（fail-close）"
+    echo "权限服务器不可达（端口 ${PORT}），操作已拒绝。请检查机器人状态。" >&2
+    exit 2
 fi
 
 _log "收到响应: ${RESPONSE}"

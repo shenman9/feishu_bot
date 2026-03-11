@@ -15,6 +15,7 @@ Claude Code 独立机器人启动入口
 
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -49,6 +50,9 @@ def main() -> None:
             raise ValueError(f"{system_path} 中 app_id 和 app_secret 不能为空")
     else:
         cfg = load_config()
+
+    # 注册 SIGTERM 处理器：将 SIGTERM 转为正常退出，确保 atexit 清理逻辑被触发
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     bot = ClaudeCodeBot(cfg["app_id"], cfg["app_secret"])
     bot.start()

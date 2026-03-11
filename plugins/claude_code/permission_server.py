@@ -183,6 +183,7 @@ class PermissionHTTPServer(ThreadingHTTPServer):
     整个服务器，导致后续所有权限请求因连接超时被 hook 脚本绕过。
     """
 
+    allow_reuse_address = True  # 允许重用 TIME_WAIT 状态的端口，避免重启后绑定失败
     daemon_threads = True  # handler 线程随主线程退出
 
     def __init__(self, server_address, handler_class, perm_server: "PermissionServer"):
@@ -215,6 +216,7 @@ class PermissionServer:
         self._timeout = timeout
         self._on_permission_request = on_permission_request
         self._on_permission_timeout = on_permission_timeout
+        self._actual_port = port  # start() 后可能更新为 OS 分配的端口
 
         # session_id -> (user_id, chat_id)
         self._session_map: dict[str, tuple[str, str]] = {}
@@ -225,18 +227,29 @@ class PermissionServer:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
-        """启动 HTTP 服务器（后台线程）"""
+        """启动 HTTP 服务器（后台线程）
+
+        若 port 为 0，由操作系统分配空闲端口，避免端口冲突。
+        启动后可通过 actual_port 属性获取实际监听端口。
+        """
         self._server = PermissionHTTPServer(
             ("127.0.0.1", self._port),
             _PermissionRequestHandler,
             perm_server=self,
         )
+        # 若传入 port=0，OS 分配后更新内部记录
+        self._actual_port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             daemon=True,
         )
         self._thread.start()
-        logger.info("[权限服务器] 已启动: port=%d, timeout=%ds", self._port, self._timeout)
+        logger.info("[权限服务器] 已启动: port=%d, timeout=%ds", self._actual_port, self._timeout)
+
+    @property
+    def actual_port(self) -> int:
+        """获取实际监听端口（port=0 时由 OS 分配）"""
+        return self._actual_port
 
     def stop(self) -> None:
         """停止 HTTP 服务器"""

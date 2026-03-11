@@ -182,61 +182,67 @@ def parse_stream_line(
     return (text_chunk, log_actions, meta_info)
 
 
-def render_log(
+def _fold_entries(entries: list[str]) -> list[str]:
+    """对超长条目列表进行折叠，保留最后 _MAX_STREAK_DISPLAY 条"""
+    n = len(entries)
+    if n > _MAX_STREAK_DISPLAY:
+        return [f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*"] + entries[-_MAX_STREAK_DISPLAY:]
+    return entries
+
+
+def _running_indicator(elapsed: int, thinking: bool) -> str:
+    """生成执行中的进度提示行"""
+    elapsed_text = f" (已等待 {elapsed}s)" if elapsed > 0 else ""
+    if thinking:
+        return f"💭 思考中...{elapsed_text}"
+    return f"⏳ 正在处理...{elapsed_text}"
+
+
+def render_log_parts(
     log_segments: list[dict],
     current_streak: list[dict],
     running: bool,
     elapsed: int = 0,
     thinking: bool = False,
-) -> str:
-    """将统一内容段列表和当前连续区间渲染为 markdown 文本
+) -> tuple[str, str]:
+    """将内容段列表分离为工具日志文本和最终回复文本
 
-    工具调用段与文字段按实际执行顺序交错渲染，保持与原始 CC 输出一致的顺序。
+    将执行过程（工具调用 + 中间文字）和最终回复分开渲染，用于 v2 卡片的
+    折叠面板布局。
 
-    Args:
-        log_segments: 已完成的段列表，每段为以下之一：
-            {"type": "tools", "entries": list[str]}  工具调用段
-            {"type": "text",  "content": str}        文字段
-        current_streak: 当前正在进行的连续工具调用，每项 {"line": str, "tool_use_id": str|None}
-        running: 是否仍在执行中（控制末尾提示）
-        elapsed: 任务已运行秒数（>0 时在提示后附加计时）
-        thinking: 是否处于模型思考阶段（工具结果已返回、等待模型下一步响应）
+    分离规则：只有最后一段文字被视为最终回复，前面的文字属于执行过程的
+    中间推理，与工具调用一起归入日志。
+
+    Returns:
+        (tool_log_text, reply_text) 二元组：
+        - tool_log_text: 工具调用段 + 中间文字段 + 进度提示的 markdown
+        - reply_text: 最后一段文字（最终回复），无文字段时为空字符串
     """
-    lines: list[str] = []
+    log_lines: list[str] = []
 
-    for segment in log_segments:
+    # 找到最后一个文字段的索引
+    last_text_idx = -1
+    for i, segment in enumerate(log_segments):
+        if segment["type"] == "text":
+            last_text_idx = i
+
+    reply_text = ""
+    for i, segment in enumerate(log_segments):
         if segment["type"] == "tools":
-            entries: list[str] = segment["entries"]
-            n = len(entries)
-            if n > _MAX_STREAK_DISPLAY:
-                lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
-                entries = entries[-_MAX_STREAK_DISPLAY:]
-            lines.extend(entries)
-            lines.append("")  # 段间空行
+            log_lines.extend(_fold_entries(segment["entries"]))
+            log_lines.append("")  # 段间空行
         elif segment["type"] == "text":
-            lines.append(segment["content"])
-            lines.append("")  # 段间空行
+            if i == last_text_idx:
+                reply_text = segment["content"]
+            else:
+                # 中间文字归入日志
+                log_lines.append(segment["content"])
+                log_lines.append("")  # 段间空行
 
     if current_streak:
-        entries = [e["line"] for e in current_streak]
-        n = len(entries)
-        if n > _MAX_STREAK_DISPLAY:
-            lines.append(f"*... 已省略 {n - _MAX_STREAK_DISPLAY} 次工具调用*")
-            entries = entries[-_MAX_STREAK_DISPLAY:]
-        lines.extend(entries)
+        log_lines.extend(_fold_entries([e["line"] for e in current_streak]))
 
     if running:
-        elapsed_text = f" (已等待 {elapsed}s)" if elapsed > 0 else ""
-        if thinking:
-            lines.append(f"💭 思考中...{elapsed_text}")
-        else:
-            lines.append(f"⏳ 正在处理...{elapsed_text}")
+        log_lines.append(_running_indicator(elapsed, thinking))
 
-    return "\n".join(lines)
-
-
-def assemble_card_text(log_text: str, reply_text: str) -> str:
-    """组装两段式卡片内容：过程日志（上）+ 文字回复（下）"""
-    if log_text and reply_text:
-        return log_text + "\n\n---\n\n" + reply_text
-    return log_text or reply_text
+    return "\n".join(log_lines), reply_text

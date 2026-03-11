@@ -6,11 +6,14 @@ Claude Code 权限服务器生命周期管理
 通过回调注入与主插件解耦。
 """
 
+import atexit
 import json
 import logging
 import os
 import pathlib
 import pwd
+import socket
+import subprocess
 from typing import Callable, Optional
 
 from plugins.claude_code.permission_server import PermissionServer
@@ -24,6 +27,71 @@ _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
 
 import threading
+
+
+def _diagnose_port_occupation(port: int) -> str:
+    """诊断端口占用情况，返回可读的诊断信息
+
+    检查项：
+    1. 尝试连接端口，判断是否有活跃服务
+    2. 通过 ss/lsof 查找占用进程的 PID 和命令
+    """
+    lines: list[str] = []
+    addr = f"127.0.0.1:{port}"
+
+    # 1. 尝试 TCP 连接，判断端口是否有活跃服务
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+            lines.append(f"端口 {port} 有活跃的 TCP 服务（连接成功）")
+    except ConnectionRefusedError:
+        lines.append(f"端口 {port} 处于 LISTEN 但连接被拒绝（可能在关闭中）")
+    except OSError as e:
+        lines.append(f"端口 {port} 连接测试: {e}")
+
+    # 2. 通过 ss 查找占用进程
+    try:
+        result = subprocess.run(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ss_output = result.stdout.strip()
+        if ss_output:
+            # 跳过表头，取实际数据行
+            data_lines = [l for l in ss_output.splitlines() if str(port) in l]
+            for dl in data_lines:
+                lines.append(f"ss: {dl.strip()}")
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # 3. 如果 ss 没输出有用信息，尝试 lsof
+    if not any("ss:" in l for l in lines):
+        try:
+            result = subprocess.run(
+                ["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lsof_output = result.stdout.strip()
+            if lsof_output:
+                for ll in lsof_output.splitlines():
+                    lines.append(f"lsof: {ll.strip()}")
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
+    # 4. 通过 /proc/net/tcp 查找 socket inode（兜底方案）
+    if not any(("ss:" in l or "lsof:" in l) for l in lines):
+        try:
+            hex_port = f"{port:04X}"
+            with open("/proc/net/tcp") as f:
+                for tcp_line in f:
+                    parts = tcp_line.split()
+                    if len(parts) >= 4 and parts[1].endswith(f":{hex_port}") and parts[3] == "0A":
+                        inode = parts[9] if len(parts) > 9 else "?"
+                        uid = parts[7] if len(parts) > 7 else "?"
+                        lines.append(f"/proc/net/tcp: 监听中, inode={inode}, uid={uid}")
+        except (OSError, IndexError):
+            pass
+
+    return "; ".join(lines) if lines else "无法获取端口占用详情"
 
 
 def is_within_working_dir(file_path: str, working_dir: str) -> bool:
@@ -79,15 +147,25 @@ class PermissionManager:
         """权限服务器是否已启动"""
         return self._started
 
-    def ensure_server(self) -> None:
-        """确保权限确认服务器已启动（懒初始化，线程安全）"""
+    def ensure_server(self) -> bool:
+        """确保权限确认服务器已启动（懒初始化，线程安全）
+
+        配置中 port=0 时由 OS 分配空闲端口，彻底避免固定端口冲突。
+
+        Returns:
+            True 表示服务器已正常运行，False 表示启动失败
+        """
         if self._started:
-            return
+            return True
 
         with self._lock:
             # 双重检查：加锁后再次确认，防止并发重复初始化
             if self._started:
-                return
+                return True
+
+            # 启动前清理可能残留的旧端口文件（上次异常退出遗留）
+            # 防止 hook 脚本在服务器启动前读到旧端口并被 fail-close 拒绝
+            self._delete_port_file()
 
             cfg = self._load_config()
             port = cfg["permission_server_port"]
@@ -101,18 +179,27 @@ class PermissionManager:
             )
             try:
                 perm_server.start()
+            except OSError as e:
+                # 端口绑定失败：输出详细诊断信息
+                diag = _diagnose_port_occupation(port)
+                logger.error(
+                    "[CC] 权限确认服务器启动失败 (port=%d): %s | 端口诊断: %s",
+                    port, e, diag,
+                )
+                return False
             except Exception as e:
-                # 仅 start()（端口绑定）失败时删除端口文件，让 hook 降级为自动放行
-                # 避免 hook 脚本向无效端口发请求后等待 curl 超时（每次工具调用卡 180s）
-                logger.error("[CC] 权限确认服务器启动失败: %s", e, exc_info=True)
-                self._delete_port_file()
-                return
+                logger.error("[CC] 权限确认服务器启动失败 (port=%d): %s", port, e, exc_info=True)
+                return False
 
-            # start() 成功后才更新状态——_setup_hook 等后续步骤的失败不应回滚端口文件
+            # start() 成功后才更新状态
+            # 使用实际监听端口（port=0 时为 OS 分配的端口）
+            actual_port = perm_server.actual_port
             self._server = perm_server
             self._started = True
-            self._write_port_file(port)
+            self._write_port_file(actual_port)
+            self._register_cleanup()
             self._setup_hook()
+            return True
 
     def on_permission_request(
         self,
@@ -290,7 +377,7 @@ class PermissionManager:
             logger.error("[CC] 写入端口文件失败: %s", e)
 
     def _delete_port_file(self) -> None:
-        """删除端口文件和超时文件，让 hook 脚本不再尝试连接（降级为自动放行）"""
+        """删除端口文件和超时文件，让 hook 脚本不再尝试连接"""
         port_file = self._data_dir / ".feishu_perm_port"
         timeout_file = self._data_dir / ".feishu_perm_timeout"
         try:
@@ -299,6 +386,22 @@ class PermissionManager:
             logger.info("[CC] 端口/超时文件已删除: %s", port_file)
         except OSError as e:
             logger.warning("[CC] 删除端口/超时文件失败: %s", e)
+
+    def _register_cleanup(self) -> None:
+        """注册进程退出时的端口文件清理（通过 atexit）
+
+        配合 main.py 中的 SIGTERM→sys.exit(0) 处理器，
+        确保正常退出和 SIGTERM 时都能清理端口文件。
+        """
+        def _cleanup():
+            self._delete_port_file()
+            if self._server:
+                try:
+                    self._server.stop()
+                except Exception:
+                    pass
+
+        atexit.register(_cleanup)
 
     def _setup_hook(self) -> None:
         """自动注册 PreToolUse Hook 到 Claude 用户设置

@@ -11,7 +11,7 @@ default_perm_mode: "interactive"      # 新会话默认权限模式，可选值�
                                       # 用户也可在会话内通过 /permission 指令随时切换权限模式。
 max_turns: 50                         # Claude Code 最大轮次
 run_as_user: ""                       # 以指定用户身份运行（机器人以 root 运行时必填）
-permission_server_port: 9876          # 权限确认 HTTP 服务器端口
+permission_server_port: 0             # 权限确认 HTTP 服务器端口（0=OS 自动分配空闲端口，避免冲突）
 permission_timeout: 120               # 用户确认超时秒数，超时自动拒绝
 
 # 模型选择配置
@@ -37,7 +37,7 @@ permission_timeout: 120               # 用户确认超时秒数，超时自动�
 # 权限确认模式说明：
 # - 默认始终启用交互式权限确认：Claude Code 执行危险操作（如 Bash 命令）前
 #   会通过飞书卡片询问用户确认，用户可选择「允许」或「拒绝」。
-# - 插件会自动启动 HTTP 服务器（端口见 permission_server_port），并向 Claude
+# - 插件会自动启动 HTTP 服务器（端口由 OS 动态分配，见 permission_server_port），
 #   的 settings.json 注册 PreToolUse Hook。
 # - 用户可在会话内发送 /bypass 指令切换为自动放行模式，再次发送可恢复确认。
 #   此设置仅限当前会话，开启新会话后自动恢复交互确认。

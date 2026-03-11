@@ -23,9 +23,21 @@ _HISTORY_TEXT_MAX = 300
 
 
 def build_execution_card(
-    text: str, running: bool = False, elapsed: int = 0, cancelled: bool = False
+    log_text: str,
+    reply_text: str = "",
+    running: bool = False,
+    elapsed: int = 0,
+    cancelled: bool = False,
 ) -> str:
-    """构造执行中/完成/取消的主卡片 JSON 字符串"""
+    """构造执行中/完成/取消的主卡片 JSON 字符串（v2 格式）
+
+    Args:
+        log_text: 工具调用过程日志（放入折叠面板）
+        reply_text: 文字回复内容（面板外直接展示）
+        running: 是否执行中
+        elapsed: 已用时秒数
+        cancelled: 是否已取消
+    """
     if running:
         template = "turquoise"
         if elapsed > 0:
@@ -39,29 +51,63 @@ def build_execution_card(
         template = "blue"
         header_content = "Claude Code"
 
+    # 折叠面板箭头图标：默认向右，展开时顺时针旋转 90° 变为向下
+    _PANEL_ICON = {
+        "tag": "standard_icon",
+        "token": "right-small-ccm_outlined",
+        "size": "16px 16px",
+    }
+
+    def _panel(title: str, content: str, expanded: bool) -> dict:
+        return {
+            "tag": "collapsible_panel",
+            "expanded": expanded,
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "icon": _PANEL_ICON,
+                "icon_position": "left",
+                "icon_expanded_angle": 90,
+            },
+            "elements": [
+                {"tag": "markdown", "content": content},
+            ],
+        }
+
+    elements: list[dict] = []
+
+    if log_text and reply_text:
+        log_title = "📋 执行过程（进行中）" if running else "📋 执行过程"
+        elements.append(_panel(log_title, log_text, expanded=running))
+        elements.append(_panel("💬 回复", reply_text, expanded=True))
+    elif log_text:
+        log_title = "📋 执行过程（进行中）" if running else "📋 执行过程"
+        elements.append(_panel(log_title, log_text, expanded=running))
+    elif reply_text:
+        elements.append(_panel("💬 回复", reply_text, expanded=True))
+    else:
+        elements.append({"tag": "markdown", "content": ""})
+
+    # 运行中时添加取消按钮（V2 不支持 action 容器，按钮直接放入 elements）
+    if running:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "取消执行"},
+            "type": "danger",
+            "value": {"action": "cancel", "plugin": PLUGIN_KEYWORD},
+        })
+
     card: dict = {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True},
         "header": {
             "title": {"tag": "plain_text", "content": header_content},
             "template": template,
         },
-        "elements": [
-            {"tag": "markdown", "content": text},
-        ],
+        "body": {
+            "elements": elements,
+        },
     }
-
-    # 运行中时添加取消按钮
-    if running:
-        card["elements"].append({"tag": "hr"})
-        card["elements"].append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "取消执行"},
-                "type": "danger",
-                "value": {"action": "cancel", "plugin": PLUGIN_KEYWORD},
-            }],
-        })
 
     return json.dumps(card)
 

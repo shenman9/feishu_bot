@@ -96,6 +96,12 @@ _preflight_check() {
     [ "$failed" = false ]
 }
 
+# 清理权限服务器端口文件和超时文件（防止残留导致 hook 脚本 fail-close 拒绝）
+_clean_perm_files() {
+    local data_dir="$PROJECT_DIR/data/cc_agent"
+    rm -f "$data_dir/.feishu_perm_port" "$data_dir/.feishu_perm_timeout" 2>/dev/null || true
+}
+
 do_start() {
     if _is_running; then
         echo "CC 机器人已在运行中 (PID: $(cat "$PID_FILE"))"
@@ -125,6 +131,7 @@ do_stop() {
     if ! _is_running; then
         echo "CC 机器人未在运行"
         rm -f "$PID_FILE"
+        _clean_perm_files
         return 0
     fi
     local pid
@@ -136,6 +143,7 @@ do_stop() {
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "已停止"
             rm -f "$PID_FILE"
+            _clean_perm_files
             return 0
         fi
         sleep 1
@@ -144,6 +152,7 @@ do_stop() {
     echo "进程未响应，强制终止..."
     kill -9 "$pid" 2>/dev/null || true
     rm -f "$PID_FILE"
+    _clean_perm_files
     echo "已强制停止"
 }
 
