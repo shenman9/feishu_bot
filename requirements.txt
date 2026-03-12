@@ -1,0 +1,14 @@
+# 核心框架（所有模式必需）
+lark-oapi>=1.4
+PyYAML>=6.0
+
+# Claude Code 插件（独立 CC Agent 仅需上述两项）
+# 无额外依赖
+
+# Claude Chat 插件
+requests>=2.28
+
+# Paper Daily 插件
+httpx>=0.24
+arxiv>=2.0
+schedule>=1.2

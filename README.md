@@ -43,11 +43,36 @@ hub_agent/
 ### 1. 安装依赖
 
 ```bash
-pip install lark-oapi pyyaml httpx schedule jinja2
-pip install -r requirements-dev.txt  # 测试依赖
+# 全量 Hub Agent
+pip install -r requirements.txt
+
+# 仅独立 CC Agent（最小依赖）
+pip install lark-oapi pyyaml
+
+pip install -r requirements-dev.txt  # 可选：测试依赖
 ```
 
 ### 2. 配置
+
+> 应用需在[飞书开放平台](https://open.feishu.cn)创建，并开启「机器人」能力和 WebSocket 长连接模式。详见下方「飞书应用配置」章节。
+
+#### 仅独立 CC Agent
+
+```bash
+cp config/cc/system.yaml.example config/cc/system.yaml
+cp config/cc/claude_code.yaml.example config/cc/claude_code.yaml
+```
+
+编辑 `config/cc/system.yaml`，填入飞书应用的凭证：
+
+```yaml
+app_id: "your_app_id"
+app_secret: "your_app_secret"
+```
+
+按需编辑 `config/cc/claude_code.yaml`，设置 `claude_path`、工作目录、权限模式等。
+
+#### 全量 Hub Agent
 
 ```bash
 cp config/system.yaml.example config/system.yaml
@@ -64,13 +89,93 @@ app_secret: "your_app_secret"
 
 各插件配置项详见对应 `config/*.yaml.example` 中的注释。
 
-> 应用需在[飞书开放平台](https://open.feishu.cn)创建，并开启「机器人」能力和 WebSocket 长连接模式。
+> CC Agent 与 Hub Agent 使用独立的配置和数据目录（`config/cc/`、`data/cc_agent/`），可以同时运行互不干扰，但需要分别绑定不同的飞书应用。
 
-### 3. 启动
+### 3. 独立 CC Agent 启动
+
+如果你**只需要 Claude Code 机器人**，无需启动完整的 Hub Agent，完成上述配置后直接启动：
+
+**前置条件**：已安装 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 并完成认证（`claude --version` 可正常执行）
+
+```bash
+./run_cc.sh start
+```
+
+常用管理命令：
+
+```bash
+./run_cc.sh status    # 查看运行状态
+./run_cc.sh log       # 查看最近日志
+./run_cc.sh restart   # 重启服务
+./run_cc.sh stop      # 停止服务
+```
+
+> **关于权限确认 Hook**：首次启动时，CC Agent 会自动将 `permission_hook.sh` 注册到 `~/.claude/settings.json` 的 `PreToolUse` hook 中，无需手动配置。如果你已有自定义 hook，不会被覆盖（仅追加）。该 Hook 使 Claude Code 在执行文件修改、命令执行等敏感操作前，通过飞书卡片向你请求确认。
+
+### 4. 启动 Hub Agent
+
+如果你需要完整的插件集成功能（多插件路由、菜单管理等），启动 Hub Agent：
 
 ```bash
 ./run.sh start
 ```
+
+#### 飞书应用配置
+
+1. 前往 [飞书开放平台](https://open.feishu.cn) 创建应用
+2. 在「应用能力」中添加「机器人」
+3. 在「权限管理」中开通以下权限：
+
+   | 权限名称 | 权限标识 | 用途 |
+   |---------|---------|------|
+   | 获取用户基本信息 | `contact:user.base:readonly` | 获取用户身份信息 |
+   | 获取用户 user ID | `contact:user.employee_id:readonly` | 获取用户 user ID |
+   | 获取用户组信息 | `contact:group:readonly` | 获取用户组信息 |
+   | 获取群组中所有消息 | `im:message.group_msg` | 获取群组中所有消息 |
+   | 接收群聊中@机器人消息 | `im:message.group_at_msg:readonly` | 读取群聊中 @机器人的消息内容 |
+   | 读取消息 | `im:message` | 获取与发送消息内容 |
+   | 读取单聊消息 | `im:message.p2p_msg:readonly` | 读取私聊消息内容 |
+   | 以应用身份发消息 | `im:message:send_as_bot` | 发送文本和卡片消息 |
+   | 更新应用发送的消息 | `im:message:update` | 流式更新卡片内容 |
+   | 获取与上传图片或文件资源 | `im:resource` | 下载用户上传的文件（文件阅读插件） |
+   | 发送应用内加急 | `im:message.urgent` | 任务完成后发送加急通知提醒用户 |
+   
+
+   > - 如果仅使用独立 CC Agent 且不需要文件阅读功能，可不开通 `im:resource`
+
+   <details>
+   <summary>一键导入权限 JSON（点击展开）</summary>
+
+   在飞书开放平台「权限管理」页面点击「批量开通」，粘贴以下 JSON 即可一键导入所有权限：
+
+   ```json
+   {
+     "scopes": {
+       "tenant": [
+         "contact:user.base:readonly",
+         "contact:user.employee_id:readonly",
+         "contact:group:readonly",
+         "im:message.group_msg",
+         "im:message.group_at_msg:readonly",
+         "im:message",
+         "im:message.p2p_msg:readonly",
+         "im:message:send_as_bot",
+         "im:message:update",
+         "im:message.urgent",
+         "im:resource"
+       ]
+     }
+   }
+   ```
+
+   </details>
+
+4. 在「事件与回调」中启用 **WebSocket 长连接模式**（非 HTTP 回调），并订阅以下事件：
+   - `im.message.receive_v1`（事件配置：接收消息）
+   - `card.action.trigger`（回调配置：卡片交互回调，权限确认/会话列表等按钮点击依赖此事件）
+5. 发布应用，将 `App ID` 和 `App Secret` 填入对应的 `system.yaml`
+
+完成后，在飞书中搜索你的机器人名称，发送任意消息即可开始使用。功能详情参见 [Claude Code 插件文档](plugins/claude_code/README.md)。
 
 ## 使用方式
 
