@@ -118,6 +118,7 @@ class PermissionManager:
     - load_config: 获取插件配置
     - send_card: 发送飞书卡片消息
     - send_card_get_id: 发送飞书卡片消息并返回 message_id
+    - urgent_message: 对已有消息发送应用内加急通知
     """
 
     def __init__(
@@ -127,12 +128,14 @@ class PermissionManager:
         get_state: Callable[[str, str], dict],  # (user_id, chat_id) -> state
         send_card: Callable[[str, str], None],
         send_card_get_id: Callable[[str, str], Optional[str]],
+        urgent_message: Optional[Callable[[str, list[str]], bool]] = None,
     ):
         self._data_dir = data_dir
         self._load_config = load_config
         self._get_state = get_state
         self._send_card = send_card
         self._send_card_get_id = send_card_get_id
+        self._urgent_message = urgent_message
 
         self._server: Optional[PermissionServer] = None
         self._started = False
@@ -271,6 +274,12 @@ class PermissionManager:
                     "[CC] 已发送用户问题卡片: user=%s, request=%s, 问题数=%d",
                     user_id, request_id[:8], len(questions),
                 )
+                # 发送加急通知，提醒用户及时回答
+                if self._urgent_message:
+                    try:
+                        self._urgent_message(msg_id, [user_id])
+                    except Exception as ue:
+                        logger.debug("[CC] 用户问题卡片加急通知失败: %s", ue)
             else:
                 # 卡片发送失败（如含不支持的元素类型），立即拒绝请求避免挂起
                 logger.error(
@@ -301,6 +310,12 @@ class PermissionManager:
                     "[CC] 已发送计划审批卡片: user=%s, request=%s, 计划长度=%d",
                     user_id, request_id[:8], len(plan_content),
                 )
+                # 发送加急通知，提醒用户及时审批
+                if self._urgent_message:
+                    try:
+                        self._urgent_message(msg_id, [user_id])
+                    except Exception as ue:
+                        logger.debug("[CC] 计划审批卡片加急通知失败: %s", ue)
             else:
                 logger.error(
                     "[CC] 计划审批卡片发送失败: user=%s, request=%s",

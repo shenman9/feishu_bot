@@ -121,6 +121,7 @@ class ClaudeCodePlugin(Plugin):
                 get_state=self._get_state,
                 send_card=lambda chat_id, content: self.bot.send_message(chat_id, "interactive", content),
                 send_card_get_id=lambda chat_id, content: self.bot.send_message_get_id(chat_id, "interactive", content),
+                urgent_message=lambda msg_id, user_ids: self.bot.urgent_message(msg_id, user_ids),
             )
         return self._perm_mgr
 
@@ -258,8 +259,18 @@ class ClaudeCodePlugin(Plugin):
         perm_mode = state.get("session_perm_mode", "interactive")
         model_alias = state.get("session_model", "")
         model_display = self._get_model_label(model_alias) if model_alias else "CLI 默认"
+        # 查询持久化记录，获取自定义名称和收藏状态
+        session_id = state["session_id"]
+        sessions = self._session_store.load_user_sessions(user_id)
+        session_record = next((s for s in sessions if s["session_id"] == session_id), None)
+        session_display = f"{session_id[:8]}..."
+        if session_record:
+            if session_record.get("title_customized"):
+                session_display = session_record["title"]
+            if session_record.get("starred"):
+                session_display += " ⭐"
         return (
-            f"会话: {state['session_id'][:8]}...\n"
+            f"会话: {session_display}\n"
             f"工作目录: {working_dir_display}\n"
             f"状态: {status}\n"
             f"权限模式: {perm_mode}\n"
@@ -907,12 +918,14 @@ class ClaudeCodePlugin(Plugin):
 
         # 5a. 特殊指令：收藏/取消收藏当前会话
         if text == "/star":
+            # 会话尚未持久化时，先创建记录以支持提前收藏
             if not state["session_started"]:
-                self.bot.reply(chat_id, "当前会话尚未开始，无法收藏。请先发送一条消息。")
-                return
+                self._session_store.upsert_session(
+                    user_id, state["session_id"], state["working_dir"], "新会话"
+                )
             new_starred = self._session_store.toggle_star(user_id, state["session_id"])
             if new_starred is None:
-                self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能收藏。")
+                self.bot.reply(chat_id, "收藏失败，请重试。")
                 return
             tip = "已收藏当前会话 ⭐" if new_starred else "已取消收藏当前会话"
             self.bot.reply(chat_id, tip)
@@ -928,12 +941,14 @@ class ClaudeCodePlugin(Plugin):
             if not new_title:
                 self.bot.reply(chat_id, "请输入新标题，格式：`/rename 新标题`")
                 return
+            # 会话尚未持久化时，先创建记录以支持提前重命名
             if not state["session_started"]:
-                self.bot.reply(chat_id, "当前会话尚未开始，无法重命名。请先发送一条消息。")
-                return
+                self._session_store.upsert_session(
+                    user_id, state["session_id"], state["working_dir"], "新会话"
+                )
             ok = self._session_store.rename_session(user_id, state["session_id"], new_title)
             if not ok:
-                self.bot.reply(chat_id, "当前会话尚未记录，完成第一次任务后才能重命名。")
+                self.bot.reply(chat_id, "重命名失败，请重试。")
                 return
             self.bot.reply(chat_id, f"会话已重命名为：{new_title}")
             return
@@ -1335,18 +1350,20 @@ class ClaudeCodePlugin(Plugin):
             # 终止旧进程并切换到目标会话
             self._kill_process(user_id, chat_id)
             state["session_id"] = target_sid
-            state["session_started"] = True   # 下次调用使用 --resume
             state["working_dir"] = resolved_dir
             state["running"] = False
             default_perm = self._load_plugin_config()["default_perm_mode"]
             state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
             state["session_model"] = self._load_plugin_config()["default_model"]
+            # 根据 JSONL 文件是否存在判断会话是否真正启动过
+            # 空会话（仅 rename/star 过）没有 JSONL 文件，不能用 --resume
+            jsonl_path = find_session_jsonl(target_sid, target_dir)
+            state["session_started"] = jsonl_path is not None
             logger.info(
-                "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s",
-                user_id, target_sid[:8], target_dir,
+                "[CC] 用户恢复历史会话: user=%s, session=%s, dir=%s, has_jsonl=%s",
+                user_id, target_sid[:8], target_dir, jsonl_path is not None,
             )
             # 发送历史对话预览卡片
-            jsonl_path = find_session_jsonl(target_sid, target_dir)
             if jsonl_path:
                 rounds = parse_session_rounds(jsonl_path, HISTORY_PREVIEW_ROUNDS)
                 if rounds:
