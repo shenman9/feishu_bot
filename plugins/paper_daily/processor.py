@@ -101,7 +101,7 @@ _TAG_PROMPT = """\
 
 # ---------- 缓存工具 ----------
 
-CACHE_RETENTION_DAYS = 7  # 缓存保留天数
+CACHE_RETENTION_DAYS = 180  # 缓存保留天数
 
 
 def _cache_path(date_str: str | None = None) -> Path:
@@ -113,8 +113,8 @@ def _cache_path(date_str: str | None = None) -> Path:
     return cache_dir / "papers.json"
 
 
-def _load_cache() -> dict:
-    path = _cache_path()
+def _load_cache(date_str: str | None = None) -> dict:
+    path = _cache_path(date_str)
     if not path.exists():
         return {}
     try:
@@ -124,9 +124,9 @@ def _load_cache() -> dict:
         return {}
 
 
-def _save_cache(cache: dict) -> None:
+def _save_cache(cache: dict, date_str: str | None = None) -> None:
     try:
-        _cache_path().write_text(
+        _cache_path(date_str).write_text(
             json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     except OSError as e:
@@ -254,6 +254,7 @@ def _assign_tags(
     config: AppConfig,
     cache: dict,
     progress_callback: Optional[Callable[[str], None]] = None,
+    date_str: str | None = None,
 ) -> None:
     """对推荐论文统一打标签（一次 LLM 调用），并更新标签词表和缓存。
 
@@ -301,7 +302,7 @@ def _assign_tags(
             raise ValueError(f"期望 JSON 对象，实际: {type(result).__name__}")
 
         mapping = result.get("mapping", {})
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        tag_date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         # 收集本次所有标签
         all_tags_this_run: set[str] = set()
@@ -316,16 +317,14 @@ def _assign_tags(
             cache.setdefault(paper.arxiv_id, {})["tags"] = paper_tags
             logger.info(f"  标签: {paper.title[:40]} → {paper_tags}")
 
-        _save_cache(cache)
-
-        # 更新标签词表（更新计数和最后使用日期）
+        _save_cache(cache, date_str)
         new_count = 0
         for tag_name in all_tags_this_run:
             if tag_name in existing_tags:
                 existing_tags[tag_name]["count"] = existing_tags[tag_name].get("count", 0) + 1
-                existing_tags[tag_name]["last_used"] = today_str
+                existing_tags[tag_name]["last_used"] = tag_date_str
             else:
-                existing_tags[tag_name] = {"count": 1, "last_used": today_str}
+                existing_tags[tag_name] = {"count": 1, "last_used": tag_date_str}
                 new_count += 1
 
         _save_tags(existing_tags)
@@ -345,6 +344,7 @@ def process_papers(
     papers: list[Paper],
     config: AppConfig,
     progress_callback: Optional[Callable[[str], None]] = None,
+    date_str: str | None = None,
 ) -> list[Paper]:
     """批量筛选论文 → 生成摘要 → 标签归类。支持断点续跑。
 
@@ -352,6 +352,7 @@ def process_papers(
         papers: 待处理的论文列表。
         config: 插件配置（含 LLM 设置和关注主题）。
         progress_callback: 进度汇报回调，每批完成后触发。
+        date_str: 缓存日期（YYYY-MM-DD），None 时取 UTC 当天。
 
     Returns:
         筛选出的相关论文列表，按相关性分数倒序排列。
@@ -359,7 +360,7 @@ def process_papers(
     # 清理过期缓存
     _cleanup_old_cache()
 
-    cache = _load_cache()
+    cache = _load_cache(date_str)
     total = len(papers)
 
     # ---- 阶段 1：分离已缓存和未缓存的论文 ----
@@ -444,7 +445,7 @@ def process_papers(
                     logger.info(f"  [{j+1}/{len(batch)}] 跳过 score={paper.relevance_score}"
                                 f" {paper.title[:50]}")
 
-            _save_cache(cache)
+            _save_cache(cache, date_str)
 
         except (GeminiError, ValueError) as e:
             logger.warning(f"批量筛选失败（第 {batch_idx+1} 批），跳过: {e}")
@@ -479,7 +480,7 @@ def process_papers(
                 base_url=config.llm_base_url,
             )
             cache.setdefault(paper.arxiv_id, {})["summary"] = paper.summary_zh
-            _save_cache(cache)
+            _save_cache(cache, date_str)
         except GeminiError as e:
             logger.warning(f"摘要生成失败 [{paper.arxiv_id}]: {e}")
             paper.summary_zh = "（摘要生成失败）"
@@ -501,6 +502,7 @@ def process_papers(
     _assign_tags(
         papers, config, cache,
         progress_callback=progress_callback,
+        date_str=date_str,
     )
 
     # 恢复有缓存标签的论文

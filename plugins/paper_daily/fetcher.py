@@ -49,6 +49,14 @@ def fetch_papers(config: AppConfig, target_date: datetime | None = None) -> list
     date_range = min_str if min_str == max_str else f"{min_str} ~ {max_str}"
 
     query = " OR ".join(f"cat:{c}" for c in config.categories)
+
+    # 指定目标日期时，在查询中加入 submittedDate 范围过滤，
+    # 让 ArXiv API 在服务端筛选，避免 max_results 不够覆盖历史日期
+    if target_date is not None:
+        d_min = date_min.strftime("%Y%m%d0000")
+        d_max = (date_max - timedelta(seconds=1)).strftime("%Y%m%d2359")
+        query = f"({query}) AND submittedDate:[{d_min} TO {d_max}]"
+
     logger.info(f"ArXiv 查询: query={query!r}, 目标日期={date_range}")
 
     search = arxiv.Search(

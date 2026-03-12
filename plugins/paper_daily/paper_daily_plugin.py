@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_KEYWORD = "论文日报"
 _PLUGIN_DIR = Path(__file__).parent
 _SUBSCRIBERS_PATH = _PLUGIN_DIR / "subscribers.json"
+_SETTINGS_PATH = _PLUGIN_DIR / "settings.json"
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -85,7 +86,7 @@ class PaperDailyPlugin(Plugin):
     def _build_app_config(self) -> AppConfig:
         cfg = self._load_plugin_config()
         return AppConfig(
-            research_interest=cfg["research_interest"],
+            research_interest=self._get_research_interest(),
             categories=cfg["categories"],
             max_papers=cfg["max_papers"],
             llm_base_url=cfg["llm_base_url"],
@@ -142,6 +143,34 @@ class PaperDailyPlugin(Plugin):
     def _is_subscribed(self, user_id: str) -> bool:
         return user_id in self._load_subscribers()
 
+    # ---- 设置持久化 ----
+
+    @staticmethod
+    def _load_settings() -> dict:
+        """加载用户设置（settings.json），不存在时返回空字典。"""
+        if not _SETTINGS_PATH.exists():
+            return {}
+        try:
+            return json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _save_settings(settings: dict) -> None:
+        try:
+            _SETTINGS_PATH.write_text(
+                json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as e:
+            logger.error(f"保存设置失败: {e}")
+
+    def _get_research_interest(self) -> str:
+        """获取当前研究兴趣：优先读 settings.json，回退到 YAML 配置。"""
+        settings = self._load_settings()
+        if "research_interest" in settings:
+            return settings["research_interest"]
+        return self._load_plugin_config()["research_interest"]
+
     # ---- 定时推送 ----
 
     def _start_scheduler(self) -> None:
@@ -175,7 +204,16 @@ class PaperDailyPlugin(Plugin):
             time.sleep(30)
 
     def _scheduled_push(self) -> None:
-        """定时推送：对所有订阅者执行完整流水线并推送结果。"""
+        """定时推送：对所有订阅者执行完整流水线并推送结果。
+
+        周末（周六/周日）ArXiv 不发布新论文，跳过推送避免重复。
+        """
+        # 周末跳过：ArXiv 周末无新论文，周一会统一推送
+        weekday = datetime.now(_BEIJING_TZ).weekday()  # 0=周一, 5=周六, 6=周日
+        if weekday in (5, 6):
+            logger.info(f"论文日报定时推送: 周末跳过（weekday={weekday}）")
+            return
+
         subscribers = self._load_subscribers()
         if not subscribers:
             logger.info("论文日报定时推送: 无订阅者，跳过")
@@ -289,7 +327,7 @@ class PaperDailyPlugin(Plugin):
         """欢迎/菜单卡片：显示配置信息和操作按钮。"""
         cfg = self._load_plugin_config()
         # 截取研究兴趣的前 80 字做展示
-        interest = cfg["research_interest"].strip().replace("\n", " ")
+        interest = self._get_research_interest().strip().replace("\n", " ")
         interest_short = interest[:80] + "..." if len(interest) > 80 else interest
         cats_str = ", ".join(cfg["categories"])
         schedule_time = cfg.get("schedule_time", "09:00")
@@ -328,6 +366,63 @@ class PaperDailyPlugin(Plugin):
                             "value": {"action": "fetch", "plugin": PLUGIN_KEYWORD},
                         },
                         sub_btn,
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "修改研究兴趣"},
+                            "type": "default",
+                            "value": {"action": "edit_interest", "plugin": PLUGIN_KEYWORD},
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def _build_edit_interest_card(self) -> dict:
+        """编辑研究兴趣的表单卡片：输入框预填当前值 + 保存按钮。"""
+        current = self._get_research_interest()
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "修改研究兴趣"},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "用自然语言描述你的研究兴趣，LLM 会据此判断论文相关性。\n"
+                        "可包含：关注的方向、具体技术、不感兴趣的方向等。"
+                    ),
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "form",
+                    "name": "edit_interest_form",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "research_interest",
+                            "input_type": "multiline_text",
+                            "width": "fill",
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "描述你的研究兴趣…",
+                            },
+                            "default_value": current,
+                            "rows": 6,
+                            "max_length": 1000,
+                        },
+                        {
+                            "tag": "button",
+                            "name": "submit_interest",
+                            "text": {"tag": "plain_text", "content": "保存"},
+                            "type": "primary",
+                            "form_action_type": "submit",
+                            "value": {
+                                "action": "save_interest",
+                                "plugin": PLUGIN_KEYWORD,
+                            },
+                        },
                     ],
                 },
             ],
@@ -453,6 +548,14 @@ class PaperDailyPlugin(Plugin):
     ) -> P2CardActionTriggerResponse:
         action = action_value.get("action", "")
 
+        # 表单提交时 action 可能为空，从 _form_value 判断
+        if not action and "_form_value" in action_value:
+            form_value = action_value["_form_value"]
+            if "research_interest" in form_value:
+                return self._handle_save_interest(
+                    chat_id, form_value.get("research_interest", "")
+                )
+
         if action == "fetch":
             self._start_fetch(user_id, chat_id)
         elif action == "subscribe":
@@ -461,5 +564,23 @@ class PaperDailyPlugin(Plugin):
         elif action == "unsubscribe":
             self._unsubscribe(user_id)
             return self.bot.make_card_response(toast="已取消订阅。")
+        elif action == "edit_interest":
+            self.bot.reply_card(chat_id, self._build_edit_interest_card())
+        elif action == "save_interest":
+            return self._handle_save_interest(
+                chat_id, action_value.get("_form_value", {}).get("research_interest", "")
+            )
 
         return P2CardActionTriggerResponse()
+
+    def _handle_save_interest(self, chat_id: str, new_interest: str) -> P2CardActionTriggerResponse:
+        """保存用户修改的研究兴趣。"""
+        new_interest = new_interest.strip()
+        if not new_interest:
+            return self.bot.make_card_response(toast="研究兴趣不能为空", toast_type="error")
+
+        settings = self._load_settings()
+        settings["research_interest"] = new_interest
+        self._save_settings(settings)
+        logger.info(f"研究兴趣已更新: {new_interest[:50]}...")
+        return self.bot.make_card_response(toast="研究兴趣已保存，下次获取日报时生效。")
