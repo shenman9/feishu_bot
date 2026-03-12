@@ -21,6 +21,9 @@ _SESSION_PAGE_SIZE = 10      # "显示更多" 每次增加的会话数
 # 历史预览单条消息最大展示字符数
 _HISTORY_TEXT_MAX = 300
 
+# 飞书卡片 markdown 中计划内容的最大字符数
+_PLAN_CONTENT_MAX = 4000
+
 
 def build_execution_card(
     log_text: str,
@@ -192,6 +195,119 @@ def build_permission_handled_card(decision: str) -> str:
         },
         "elements": [
             {"tag": "markdown", "content": f"已{decision}此操作。"},
+        ],
+    }
+    return json.dumps(card)
+
+
+def build_plan_approval_card(
+    request_id: str,
+    plan_content: str,
+    allowed_prompts: list[dict] | None = None,
+) -> str:
+    """构造 ExitPlanMode 计划审批飞书卡片
+
+    展示计划内容（markdown 格式），附带「批准」「拒绝」按钮，
+    以及「拒绝并反馈」表单输入框。
+
+    Args:
+        request_id: 权限请求 ID（用于回调匹配）
+        plan_content: .claude/plans/ 下的计划文件内容
+        allowed_prompts: ExitPlanMode 的 allowedPrompts 列表（暂保留）
+    """
+    if not plan_content:
+        display_content = "*（未找到计划文件内容）*"
+    elif len(plan_content) > _PLAN_CONTENT_MAX:
+        display_content = plan_content[:_PLAN_CONTENT_MAX] + "\n\n**[计划内容已截断，超出卡片显示限制]**"
+    else:
+        display_content = plan_content
+
+    elements: list[dict] = [
+        {"tag": "markdown", "content": display_content},
+        {"tag": "hr"},
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "批准计划"},
+                    "type": "primary",
+                    "value": {
+                        "action": "plan_approve",
+                        "plugin": PLUGIN_KEYWORD,
+                        "request_id": request_id,
+                    },
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "拒绝计划"},
+                    "type": "danger",
+                    "value": {
+                        "action": "plan_reject",
+                        "plugin": PLUGIN_KEYWORD,
+                        "request_id": request_id,
+                    },
+                },
+            ],
+        },
+        {
+            "tag": "form",
+            "name": "plan_reject_form",
+            "elements": [
+                {
+                    "tag": "input",
+                    "name": "plan_reject_reason",
+                    "placeholder": {
+                        "tag": "plain_text",
+                        "content": "输入修改意见后点击「拒绝并反馈」…",
+                    },
+                },
+                {
+                    "tag": "button",
+                    "name": "submit_plan_reject",
+                    "text": {"tag": "plain_text", "content": "拒绝并反馈"},
+                    "type": "default",
+                    "form_action_type": "submit",
+                    "value": {
+                        "action": "plan_reject_with_reason",
+                        "plugin": PLUGIN_KEYWORD,
+                        "request_id": request_id,
+                    },
+                },
+            ],
+        },
+    ]
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "Claude Code 执行计划审批"},
+            "template": "orange",
+        },
+        "elements": elements,
+    }
+    return json.dumps(card)
+
+
+def build_plan_handled_card(decision: str, plan_summary: str = "") -> str:
+    """构造计划审批已处理的卡片（灰色，无按钮）
+
+    Args:
+        decision: "批准" 或 "拒绝" 等决策描述
+        plan_summary: 计划内容摘要（可选）
+    """
+    content = f"已{decision}此执行计划。"
+    if plan_summary:
+        content += f"\n\n{plan_summary}"
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"Claude Code 执行计划 - 已{decision}"},
+            "template": "grey",
+        },
+        "elements": [
+            {"tag": "markdown", "content": content},
         ],
     }
     return json.dumps(card)

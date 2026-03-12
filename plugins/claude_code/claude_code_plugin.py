@@ -518,11 +518,13 @@ class ClaudeCodePlugin(Plugin):
                         tid = action["tool_use_id"]
                         if tid in active_tool_ids:
                             idx = active_tool_ids[tid]
-                            # AskUserQuestion 通过 hook "deny" 传回用户回答，
-                            # is_error=True 但实际上是成功收到回答，显示为 ✅
-                            is_ask_user = current_streak[idx].get("tool_name") == "AskUserQuestion"
+                            # AskUserQuestion/ExitPlanMode 通过 hook "deny" 传回用户回答/审批结果，
+                            # is_error=True 但实际上是成功的交互结果，显示为 ✅
+                            is_interactive_tool = current_streak[idx].get("tool_name") in (
+                                "AskUserQuestion", "ExitPlanMode",
+                            )
                             suffix = (
-                                f" → ❌ {action['summary']}" if action["is_error"] and not is_ask_user
+                                f" → ❌ {action['summary']}" if action["is_error"] and not is_interactive_tool
                                 else " → ✅"
                             )
                             current_streak[idx]["line"] += suffix
@@ -785,6 +787,56 @@ class ClaudeCodePlugin(Plugin):
             return self.bot.make_card_response(
                 card=json.loads(answered_card),
                 toast="已完成全部回答",
+            )
+        return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+    # ---- ExitPlanMode 响应处理 ----
+
+    def _handle_plan_response(
+        self, user_id: str, chat_id: str,
+        request_id: str, approved: bool, reason: str = "",
+    ) -> "P2CardActionTriggerResponse":
+        """处理用户对 ExitPlanMode 计划的审批决策
+
+        与 AskUserQuestion 相同机制：通过 resolve_request("deny", reason=...) 将
+        审批结果经 hook stderr 回传给 Claude Code，Claude 据此执行或修改方案。
+        """
+        state = self._get_state(user_id, chat_id)
+        pending = state.get("_pending_exit_plan")
+        if not pending or pending["request_id"] != request_id:
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        perm_mgr = self._ensure_perm_manager()
+        if not perm_mgr.server or not perm_mgr.server.has_pending_request(request_id):
+            state.pop("_pending_exit_plan", None)
+            return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        state.pop("_pending_exit_plan", None)
+
+        if approved:
+            resolve_reason = "用户已批准此执行计划。请立即按照计划开始执行，不要再次询问确认。"
+        elif reason:
+            resolve_reason = (
+                f"用户拒绝了此执行计划，理由：{reason}\n"
+                f"请根据用户的反馈修改计划后重新提交。"
+            )
+        else:
+            resolve_reason = "用户拒绝了此执行计划。请询问用户希望如何修改，或者提出新的方案。"
+
+        ok = perm_mgr.server.resolve_request(request_id, "deny", reason=resolve_reason)
+        if ok:
+            decision_text = "批准" if approved else "拒绝"
+            logger.info(
+                "[CC] 用户%s计划: user=%s, request=%s",
+                decision_text, user_id, request_id[:8],
+            )
+            plan_summary = ""
+            if approved and pending.get("plan_content"):
+                plan_summary = pending["plan_content"][:200] + "…"
+            handled_card = cards.build_plan_handled_card(decision_text, plan_summary)
+            return self.bot.make_card_response(
+                card=json.loads(handled_card),
+                toast=f"已{decision_text}执行计划",
             )
         return self.bot.make_card_response(toast="该请求已过期或已处理")
 
@@ -1057,6 +1109,20 @@ class ClaudeCodePlugin(Plugin):
                 card = cards.build_sessions_card(sessions, state["session_id"])
                 return self.bot.make_card_response(card=card, toast=f"已重命名 {target_sid[:8]}…")
 
+            # 计划拒绝表单：input name 为 plan_reject_reason
+            if "plan_reject_reason" in form_value:
+                reject_reason = (form_value.get("plan_reject_reason") or "").strip()
+                if not reject_reason:
+                    return self.bot.make_card_response(toast="请先输入修改意见")
+                state = self._get_state(user_id, chat_id)
+                pending = state.get("_pending_exit_plan")
+                if not pending:
+                    return self.bot.make_card_response(toast="该请求已过期或已处理")
+                return self._handle_plan_response(
+                    user_id, chat_id, pending["request_id"],
+                    approved=False, reason=reject_reason,
+                )
+
             # 自定义回答表单：input name 格式为 custom_answer_{qi}
             custom_answer = ""
             question_index = 0
@@ -1194,6 +1260,28 @@ class ClaudeCodePlugin(Plugin):
                     toast="已开启 bypass 模式，本会话后续请求自动放行",
                 )
             return self.bot.make_card_response(toast="该请求已过期或已处理")
+
+        if action == "plan_approve":
+            request_id = action_value.get("request_id", "")
+            return self._handle_plan_response(
+                user_id, chat_id, request_id, approved=True,
+            )
+
+        if action == "plan_reject":
+            request_id = action_value.get("request_id", "")
+            return self._handle_plan_response(
+                user_id, chat_id, request_id, approved=False,
+            )
+
+        if action == "plan_reject_with_reason":
+            request_id = action_value.get("request_id", "")
+            form_value = action_value.get("_form_value", {})
+            reject_reason = (form_value.get("plan_reject_reason") or "").strip()
+            if not reject_reason:
+                return self.bot.make_card_response(toast="请先输入修改意见")
+            return self._handle_plan_response(
+                user_id, chat_id, request_id, approved=False, reason=reject_reason,
+            )
 
         if action == "ask_user_answer":
             request_id = action_value.get("request_id", "")

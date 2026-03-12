@@ -19,6 +19,7 @@
 - **三态权限模式**：灵活的权限控制，适应不同工作场景
 - **工作目录管理**：支持切换工作目录，切换后自动重置会话
 - **用户问题转发**：Claude Code 调用 `AskUserQuestion` 时，问题会以飞书交互卡片形式呈现（逐题展示、预设选项按钮 + 自定义输入），用户回答后实时传回 Claude；即使处于 bypass 模式，该工具仍需用户实际作答
+- **计划审批**：Claude Code 进入 Plan Mode 后，调用 `ExitPlanMode` 时自动读取计划文件（`.claude/plans/*.md`），以飞书卡片完整展示计划内容，用户可点击「批准计划」「拒绝计划」或输入修改意见后「拒绝并反馈」；即使处于 bypass 模式，计划仍需用户审批
 - **完成通知**：任务执行结束后自动发送飞书应用内加急通知，避免用户错过结果
 - **模型选择**：支持在会话内切换 Claude 模型（Sonnet / Opus / Haiku 等），通过 `/model` 指令弹出选择卡片；模型设置为会话级别，重置会话后恢复默认
 
@@ -51,7 +52,7 @@
 |------|------|------|
 | 交互确认 | `interactive` | 所有操作均需飞书卡片确认 |
 | 自动放行编辑 | `accept_edits` | 工作目录内的文件写入/编辑自动放行，其余操作仍需确认 |
-| 全部放行 | `bypass` | 所有操作自动放行，适合高度信任场景（谨慎使用）。例外：`AskUserQuestion` 始终需要用户作答 |
+| 全部放行 | `bypass` | 所有操作自动放行，适合高度信任场景（谨慎使用）。例外：`AskUserQuestion` 始终需要用户作答，`ExitPlanMode` 始终需要用户审批计划 |
 | 手动选择 | `manual_select` | 新会话创建后弹出权限选择卡片，由用户手动选择模式 |
 
 默认模式由配置项 `claude_code.default_perm_mode` 控制，新会话启动时生效。`manual_select` 仅作为配置项值使用，表示每次新建会话时自动弹出选择卡片；运行时实际使用的始终是 `interactive`、`accept_edits`、`bypass` 三者之一。
@@ -101,9 +102,36 @@ permission_hook.sh → PermissionServer → 插件识别为 AskUserQuestion
 
 超时处理：每道题超时 300 秒（5 分钟），多道题按数量累加。bypass 模式下 `AskUserQuestion` 仍需用户实际作答。
 
+### ExitPlanMode 处理（计划审批）
+
+当 Claude Code 在 Plan Mode 中调用 `ExitPlanMode` 时，走独立的处理路径：
+
+```
+Claude Code 调用 ExitPlanMode
+    ↓
+permission_hook.sh → PermissionServer → 插件识别为 ExitPlanMode
+    ↓
+读取工作目录下最新的 .claude/plans/*.md 文件
+    ↓
+构建计划审批卡片（橙色标题）
+    ├─ 计划内容（markdown 格式，超 4000 字截断）
+    ├─「批准计划」按钮
+    ├─「拒绝计划」按钮
+    └─ 修改意见输入框 +「拒绝并反馈」按钮
+    ↓
+用户在飞书中审批
+    ├─ 批准 → 通过 Hook 传回"用户已批准"指令，Claude 开始执行
+    ├─ 拒绝 → 传回"用户拒绝"，Claude 询问如何修改
+    └─ 拒绝并反馈 → 传回拒绝理由，Claude 据此修改方案
+    ↓
+卡片变为灰色已处理状态
+```
+
+超时处理：计划审批超时 600 秒（10 分钟）。bypass 模式下 `ExitPlanMode` 仍需用户审批。`EnterPlanMode` 和 `TodoWrite` 作为非交互内部工具，在 Hook 脚本入口直接放行。
+
 **超时处理**：用户在 `permission_timeout`（默认 120s）内未点击按钮，服务器自动按"拒绝"处理。Hook 脚本区分两类失败：权限确认超时（curl exit 28）→ 拒绝操作；连接失败（服务器未运行）→ 降级放行。
 
-只读工具（`Read`、`Glob`、`Grep` 等）在 Hook 脚本入口直接放行，不经过权限服务器。
+只读工具（`Read`、`Glob`、`Grep`）和非交互内部工具（`EnterPlanMode`、`TodoWrite`）在 Hook 脚本入口直接放行，不经过权限服务器。
 
 ## 文件结构
 

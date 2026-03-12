@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PERM_PORT = 9876       # 权限确认 HTTP 服务器默认端口
 _DEFAULT_PERM_TIMEOUT = 120     # 用户确认超时（秒）
 _ASK_USER_TIMEOUT = 300         # AskUserQuestion 用户响应超时（秒）
+_EXIT_PLAN_TIMEOUT = 600        # ExitPlanMode 用户审批超时（秒）
 
 import threading
 
@@ -234,8 +235,9 @@ class PermissionManager:
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
         )
 
-        # bypass 模式：直接放行所有权限请求（AskUserQuestion 除外，它是用户输入而非权限确认）
-        if perm_mode == "bypass" and tool_name != "AskUserQuestion":
+        # bypass 模式：直接放行所有权限请求（AskUserQuestion 和 ExitPlanMode 除外，
+        # 前者需转发用户输入，后者需展示计划并等待用户审批）
+        if perm_mode == "bypass" and tool_name not in ("AskUserQuestion", "ExitPlanMode"):
             if self._server:
                 self._server.resolve_request(request_id, "allow")
             return
@@ -278,6 +280,36 @@ class PermissionManager:
                     self._server.resolve_request(
                         request_id, "deny",
                         reason="无法向用户发送问题卡片，请根据上下文自行做出最合理的判断。",
+                    )
+            return
+
+        # ExitPlanMode 特殊处理：读取计划文件，通过飞书卡片展示给用户审批
+        if tool_name == "ExitPlanMode":
+            plan_content = self._read_latest_plan_file(effective_working_dir)
+            allowed_prompts = tool_input.get("allowedPrompts", [])
+            card = cards.build_plan_approval_card(request_id, plan_content, allowed_prompts)
+            if self._server:
+                self._server.set_request_timeout(request_id, _EXIT_PLAN_TIMEOUT)
+            msg_id = self._send_card_get_id(chat_id, card)
+            if msg_id:
+                state = self._get_state(user_id, chat_id)
+                state["_pending_exit_plan"] = {
+                    "request_id": request_id,
+                    "plan_content": plan_content,
+                }
+                logger.info(
+                    "[CC] 已发送计划审批卡片: user=%s, request=%s, 计划长度=%d",
+                    user_id, request_id[:8], len(plan_content),
+                )
+            else:
+                logger.error(
+                    "[CC] 计划审批卡片发送失败: user=%s, request=%s",
+                    user_id, request_id[:8],
+                )
+                if self._server:
+                    self._server.resolve_request(
+                        request_id, "deny",
+                        reason="无法向用户发送计划审批卡片，请直接以文本形式展示计划内容。",
                     )
             return
 
@@ -402,6 +434,33 @@ class PermissionManager:
                     pass
 
         atexit.register(_cleanup)
+
+    def _read_latest_plan_file(self, working_dir: str) -> str:
+        """读取工作目录下最新的 .claude/plans/*.md 文件内容
+
+        Returns:
+            计划文件内容字符串；未找到或读取失败时返回空字符串
+        """
+        plans_dir = pathlib.Path(working_dir) / ".claude" / "plans"
+        if not plans_dir.is_dir():
+            logger.warning("[CC] 计划目录不存在: %s", plans_dir)
+            return ""
+        md_files = sorted(
+            plans_dir.glob("*.md"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if not md_files:
+            logger.warning("[CC] 计划目录中无 .md 文件: %s", plans_dir)
+            return ""
+        latest = md_files[0]
+        try:
+            content = latest.read_text(encoding="utf-8")
+            logger.info("[CC] 读取计划文件: %s (%d chars)", latest.name, len(content))
+            return content
+        except OSError as e:
+            logger.error("[CC] 读取计划文件失败: %s: %s", latest, e)
+            return ""
 
     def _setup_hook(self) -> None:
         """自动注册 PreToolUse Hook 到 Claude 用户设置

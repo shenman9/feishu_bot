@@ -30,6 +30,9 @@ _TOOL_ICONS: dict[str, str] = {
     "Task":             "🤖",
     "WebFetch":         "🌐",
     "AskUserQuestion":  "❓",
+    "EnterPlanMode":    "📋",
+    "ExitPlanMode":     "📋",
+    "TodoWrite":        "📝",
 }
 
 
@@ -43,6 +46,9 @@ def format_tool_call(tool_name: str, tool_input: dict, working_dir: str = "") ->
         if len(param) > _TOOL_PARAM_MAX:
             param = param[:_TOOL_PARAM_MAX - 3] + "..."
         return f"{icon} {tool_name} `{param}`" if param else f"{icon} {tool_name}"
+    # ExitPlanMode 特殊处理：避免展示无意义的 allowedPrompts JSON
+    if tool_name == "ExitPlanMode":
+        return f"{icon} ExitPlanMode `计划审批中...`"
     # 按优先级提取最有意义的参数作为摘要
     param: str = (
         tool_input.get("file_path")
