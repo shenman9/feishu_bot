@@ -62,6 +62,9 @@ class SessionStore:
             existing = next((s for s in sessions if s["session_id"] == session_id), None)
             if existing:
                 existing["last_activity"] = now
+                # 用户未手动重命名过的会话，自动更新标题为最新一条消息
+                if not existing.get("title_customized"):
+                    existing["title"] = title
             else:
                 sessions.insert(0, {
                     "session_id": session_id,
@@ -117,6 +120,7 @@ class SessionStore:
             if not target:
                 return False
             target["title"] = new_title
+            target["title_customized"] = True
             data[user_id] = sessions
             self._write_file(path, data)
             return True
