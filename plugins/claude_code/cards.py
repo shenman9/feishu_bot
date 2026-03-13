@@ -300,16 +300,24 @@ def build_plan_approval_card(
     return json.dumps(card)
 
 
-def build_plan_handled_card(decision: str, plan_summary: str = "") -> str:
-    """构造计划审批已处理的卡片（灰色，无按钮）
+def build_plan_handled_card(decision: str, plan_content: str = "") -> str:
+    """构造计划审批已处理的卡片（灰色，无按钮，保留计划内容）
 
     Args:
         decision: "批准" 或 "拒绝" 等决策描述
-        plan_summary: 计划内容摘要（可选）
+        plan_content: 计划文件完整内容（可选，会截断和表格限制处理）
     """
-    content = f"已{decision}此执行计划。"
-    if plan_summary:
-        content += f"\n\n{plan_summary}"
+    elements: list[dict] = []
+
+    if plan_content:
+        if len(plan_content) > _PLAN_CONTENT_MAX:
+            display = plan_content[:_PLAN_CONTENT_MAX] + "\n\n**[计划内容已截断，超出卡片显示限制]**"
+        else:
+            display = plan_content
+        display = limit_card_tables(display)
+        elements.append({"tag": "markdown", "content": display})
+    else:
+        elements.append({"tag": "markdown", "content": f"已{decision}此执行计划。"})
 
     card = {
         "config": {"wide_screen_mode": True},
@@ -317,9 +325,7 @@ def build_plan_handled_card(decision: str, plan_summary: str = "") -> str:
             "title": {"tag": "plain_text", "content": f"Claude Code 执行计划 - 已{decision}"},
             "template": "grey",
         },
-        "elements": [
-            {"tag": "markdown", "content": content},
-        ],
+        "elements": elements,
     }
     return json.dumps(card)
 

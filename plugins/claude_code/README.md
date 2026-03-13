@@ -124,7 +124,7 @@ permission_hook.sh → PermissionServer → 插件识别为 ExitPlanMode
     ├─ 拒绝 → 传回"用户拒绝"，Claude 询问如何修改
     └─ 拒绝并反馈 → 传回拒绝理由，Claude 据此修改方案
     ↓
-卡片变为灰色已处理状态
+卡片变为灰色已处理状态（保留计划内容展示）
 ```
 
 超时处理：计划审批超时 600 秒（10 分钟）。bypass 模式下 `ExitPlanMode` 仍需用户审批。`EnterPlanMode` 和 `TodoWrite` 作为非交互内部工具，在 Hook 脚本入口直接放行。

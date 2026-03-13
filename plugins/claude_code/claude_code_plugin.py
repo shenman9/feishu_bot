@@ -862,10 +862,8 @@ class ClaudeCodePlugin(Plugin):
                 "[CC] 用户%s计划: user=%s, request=%s",
                 decision_text, user_id, request_id[:8],
             )
-            plan_summary = ""
-            if approved and pending.get("plan_content"):
-                plan_summary = pending["plan_content"][:200] + "…"
-            handled_card = cards.build_plan_handled_card(decision_text, plan_summary)
+            plan_content = pending.get("plan_content", "")
+            handled_card = cards.build_plan_handled_card(decision_text, plan_content)
             return self.bot.make_card_response(
                 card=json.loads(handled_card),
                 toast=f"已{decision_text}执行计划",
