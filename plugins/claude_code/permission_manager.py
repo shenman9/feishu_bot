@@ -238,6 +238,13 @@ class PermissionManager:
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
         )
 
+        # 追踪 Write/Edit 对 .claude/plans/ 的写入，供 ExitPlanMode 精确定位计划文件
+        if tool_name in ("Write", "Edit"):
+            fp = tool_input.get("file_path", "")
+            if fp and "/.claude/plans/" in fp and fp.endswith(".md"):
+                state["_last_plan_file"] = fp
+                logger.debug("[CC] 追踪计划文件写入: %s", fp)
+
         # bypass 模式：直接放行所有权限请求（AskUserQuestion 和 ExitPlanMode 除外，
         # 前者需转发用户输入，后者需展示计划并等待用户审批）
         if perm_mode == "bypass" and tool_name not in ("AskUserQuestion", "ExitPlanMode"):
@@ -292,9 +299,31 @@ class PermissionManager:
                     )
             return
 
-        # ExitPlanMode 特殊处理：读取计划文件，通过飞书卡片展示给用户审批
+        # ExitPlanMode 特殊处理：获取计划内容，通过飞书卡片展示给用户审批
+        # 三级回退：追踪的文件路径 → tool_input["plan"] → 多目录 mtime 搜索
         if tool_name == "ExitPlanMode":
-            plan_content = self._read_latest_plan_file(effective_working_dir)
+            plan_content = ""
+            # 1) 从当前会话追踪到的计划文件路径精确读取
+            tracked_file = state.get("_last_plan_file", "")
+            if tracked_file:
+                try:
+                    content = pathlib.Path(tracked_file).read_text(encoding="utf-8")
+                    if content.strip():
+                        plan_content = content
+                        logger.info(
+                            "[CC] 从追踪的计划文件读取: %s (%d chars)",
+                            tracked_file, len(plan_content),
+                        )
+                except OSError as e:
+                    logger.warning("[CC] 追踪的计划文件读取失败: %s: %s", tracked_file, e)
+            # 2) 使用 tool_input 中 Claude Code 直接传递的计划内容
+            if not plan_content:
+                plan_content = tool_input.get("plan", "").strip()
+                if plan_content:
+                    logger.info("[CC] 使用 tool_input 中的计划内容 (%d chars)", len(plan_content))
+            # 3) 多目录 mtime 搜索兜底
+            if not plan_content:
+                plan_content = self._read_latest_plan_file(effective_working_dir)
             allowed_prompts = tool_input.get("allowedPrompts", [])
             card = cards.build_plan_approval_card(request_id, plan_content, allowed_prompts)
             if self._server:
@@ -451,31 +480,57 @@ class PermissionManager:
         atexit.register(_cleanup)
 
     def _read_latest_plan_file(self, working_dir: str) -> str:
-        """读取工作目录下最新的 .claude/plans/*.md 文件内容
+        """从多个候选目录中读取 mtime 最新的 .claude/plans/*.md 文件
+
+        搜索顺序：工作目录、CC 进程用户 HOME 目录。
+        合并所有候选文件后按 mtime 取最新，避免固定搜索单一目录导致读到旧文件。
 
         Returns:
             计划文件内容字符串；未找到或读取失败时返回空字符串
         """
-        plans_dir = pathlib.Path(working_dir) / ".claude" / "plans"
-        if not plans_dir.is_dir():
-            logger.warning("[CC] 计划目录不存在: %s", plans_dir)
+        # 构建候选 plans 目录列表（去重）
+        candidate_dirs: list[pathlib.Path] = []
+        seen: set[str] = set()
+        for base in self._plan_search_dirs(working_dir):
+            plans_dir = pathlib.Path(base) / ".claude" / "plans"
+            key = str(plans_dir)
+            if key not in seen:
+                seen.add(key)
+                candidate_dirs.append(plans_dir)
+
+        # 合并所有目录下的 .md 文件
+        all_md: list[pathlib.Path] = []
+        for plans_dir in candidate_dirs:
+            if plans_dir.is_dir():
+                all_md.extend(plans_dir.glob("*.md"))
+
+        if not all_md:
+            logger.warning("[CC] 所有候选计划目录均无 .md 文件: %s", candidate_dirs)
             return ""
-        md_files = sorted(
-            plans_dir.glob("*.md"),
-            key=lambda f: f.stat().st_mtime,
-            reverse=True,
-        )
-        if not md_files:
-            logger.warning("[CC] 计划目录中无 .md 文件: %s", plans_dir)
-            return ""
-        latest = md_files[0]
+
+        # 按 mtime 降序取最新
+        all_md.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        latest = all_md[0]
         try:
             content = latest.read_text(encoding="utf-8")
-            logger.info("[CC] 读取计划文件: %s (%d chars)", latest.name, len(content))
+            logger.info("[CC] 读取计划文件: %s (%d chars)", latest, len(content))
             return content
         except OSError as e:
             logger.error("[CC] 读取计划文件失败: %s: %s", latest, e)
             return ""
+
+    def _plan_search_dirs(self, working_dir: str) -> list[str]:
+        """返回计划文件搜索的基础目录列表
+
+        包含工作目录和 CC 进程用户的 HOME 目录（由 run_as_user 配置决定）。
+        """
+        dirs = [working_dir]
+        cfg = self._load_config()
+        run_as_user = cfg.get("run_as_user", "")
+        home_dir = self._get_target_home_dir(run_as_user)
+        if home_dir:
+            dirs.append(home_dir)
+        return dirs
 
     def _setup_hook(self) -> None:
         """自动注册 PreToolUse Hook 到 Claude 用户设置
