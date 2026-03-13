@@ -8,6 +8,7 @@ Claude Code 飞书卡片构建
 import datetime
 import json
 
+from core.feishu_bot import limit_card_tables, count_card_tables, _MAX_CARD_TABLES
 from plugins.claude_code.constants import (
     PLUGIN_KEYWORD,
     BEIJING_TZ,
@@ -78,15 +79,24 @@ def build_execution_card(
 
     elements: list[dict] = []
 
+    # 飞书对整张卡片的 markdown 表格总数有上限，需跨面板统筹分配配额
     if log_text and reply_text:
+        log_tc = count_card_tables(log_text)
+        reply_tc = count_card_tables(reply_text)
+        if log_tc + reply_tc > _MAX_CARD_TABLES:
+            # 优先保留回复中的表格，剩余配额给日志
+            reply_budget = min(reply_tc, _MAX_CARD_TABLES)
+            log_budget = _MAX_CARD_TABLES - reply_budget
+            log_text = limit_card_tables(log_text, log_budget)
+            reply_text = limit_card_tables(reply_text, reply_budget)
         log_title = "📋 执行过程（进行中）" if running else "📋 执行过程"
         elements.append(_panel(log_title, log_text, expanded=running))
         elements.append(_panel("💬 回复", reply_text, expanded=True))
     elif log_text:
         log_title = "📋 执行过程（进行中）" if running else "📋 执行过程"
-        elements.append(_panel(log_title, log_text, expanded=running))
+        elements.append(_panel(log_title, limit_card_tables(log_text), expanded=running))
     elif reply_text:
-        elements.append(_panel("💬 回复", reply_text, expanded=True))
+        elements.append(_panel("💬 回复", limit_card_tables(reply_text), expanded=True))
     else:
         elements.append({"tag": "markdown", "content": ""})
 
@@ -221,6 +231,7 @@ def build_plan_approval_card(
         display_content = plan_content[:_PLAN_CONTENT_MAX] + "\n\n**[计划内容已截断，超出卡片显示限制]**"
     else:
         display_content = plan_content
+    display_content = limit_card_tables(display_content)
 
     elements: list[dict] = [
         {"tag": "markdown", "content": display_content},

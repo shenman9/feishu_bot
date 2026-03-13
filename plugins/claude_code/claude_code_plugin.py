@@ -658,13 +658,13 @@ class ClaudeCodePlugin(Plugin):
 
             if message_id:
                 cancelled = state.get("cancelled", False)
-                self._patch_card(message_id, log_text, reply_text, running=False, cancelled=cancelled)
+                self._patch_card(message_id, log_text, reply_text, running=False, cancelled=cancelled, chat_id=chat_id)
 
         except FileNotFoundError:
             error_msg = "Claude Code CLI 未安装或路径错误，请检查配置。"
             logger.error("[CC] CLI 未找到: %s", self._load_plugin_config()["claude_path"])
             if message_id:
-                self._patch_card(message_id, log_text=error_msg, running=False)
+                self._patch_card(message_id, log_text=error_msg, running=False, chat_id=chat_id)
             else:
                 self.bot.reply(chat_id, error_msg)
 
@@ -676,7 +676,7 @@ class ClaudeCodePlugin(Plugin):
             )
             error_msg = f"执行失败: {e}"
             if message_id:
-                self._patch_card(message_id, log_text=error_msg, running=False)
+                self._patch_card(message_id, log_text=error_msg, running=False, chat_id=chat_id)
             else:
                 self.bot.reply(chat_id, error_msg)
 
@@ -712,8 +712,14 @@ class ClaudeCodePlugin(Plugin):
     # ---- 飞书卡片更新 ----
 
     def _patch_card(self, message_id: str, log_text: str, reply_text: str = "",
-                    running: bool = True, elapsed: int = 0, cancelled: bool = False) -> None:
-        """更新飞书卡片消息"""
+                    running: bool = True, elapsed: int = 0, cancelled: bool = False,
+                    chat_id: str = "") -> None:
+        """更新飞书卡片消息，表格超限时自动降级重试
+
+        Args:
+            chat_id: 可选，仅最终更新时传入。卡片彻底更新失败时
+                     以纯文本发送回复内容，确保用户至少能收到结果。
+        """
         content = cards.build_execution_card(log_text, reply_text, running=running, elapsed=elapsed, cancelled=cancelled)
         # 调试日志：将卡片 markdown 文本追加写入文件，用于排查路径缩短问题
         try:
@@ -725,9 +731,31 @@ class ClaudeCodePlugin(Plugin):
         except Exception:
             pass
         try:
-            self.bot.patch_message(message_id, content)
+            ok = self.bot.patch_message(message_id, content)
+            if not ok:
+                # 降级：将所有表格转为代码块后重试
+                from core.feishu_bot import limit_card_tables
+                safe_log = limit_card_tables(log_text, 0) if log_text else log_text
+                safe_reply = limit_card_tables(reply_text, 0) if reply_text else reply_text
+                fallback = cards.build_execution_card(
+                    safe_log, safe_reply, running=running, elapsed=elapsed, cancelled=cancelled,
+                )
+                ok = self.bot.patch_message(message_id, fallback)
+            if not ok and chat_id:
+                # 终极兜底：卡片彻底失败，以纯文本发送回复内容
+                fallback_text = reply_text or log_text
+                if fallback_text:
+                    logger.warning("卡片更新彻底失败，降级为纯文本发送")
+                    self.bot.reply(chat_id, fallback_text)
         except Exception as e:
             logger.warning("卡片更新失败: %s", e)
+            if chat_id:
+                try:
+                    fallback_text = reply_text or log_text
+                    if fallback_text:
+                        self.bot.reply(chat_id, fallback_text)
+                except Exception:
+                    pass
 
     # ---- AskUserQuestion 响应处理 ----
 

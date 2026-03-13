@@ -13,6 +13,7 @@ from typing import Optional
 import requests
 
 from config import load_plugin_config
+from core.feishu_bot import limit_card_tables
 from core.plugin import Plugin
 
 logger = logging.getLogger(__name__)
@@ -184,7 +185,7 @@ class ClaudeChatPlugin(Plugin):
 
         # 最终更新一次完整内容
         if message_id and len(full_text) > last_patch_len:
-            self._patch_text(message_id, full_text)
+            self._patch_text(message_id, full_text, chat_id=chat_id)
 
         return full_text
 # PLACEHOLDER_HANDLE
@@ -202,6 +203,7 @@ class ClaudeChatPlugin(Plugin):
     @staticmethod
     def _build_card(text: str) -> str:
         """构造包含文本的飞书卡片 JSON"""
+        text = limit_card_tables(text)
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -214,13 +216,31 @@ class ClaudeChatPlugin(Plugin):
         }
         return json.dumps(card)
 
-    def _patch_text(self, message_id: str, text: str) -> None:
-        """更新飞书卡片消息内容"""
+    def _patch_text(self, message_id: str, text: str, chat_id: str = "") -> None:
+        """更新飞书卡片消息内容，表格超限时自动降级重试
+
+        Args:
+            chat_id: 可选，仅最终更新时传入。卡片彻底更新失败时
+                     以纯文本发送回复内容，确保用户至少能收到结果。
+        """
         content = self._build_card(text)
         try:
-            self.bot.patch_message(message_id, content)
+            ok = self.bot.patch_message(message_id, content)
+            if not ok:
+                # 降级：将所有表格转为代码块后重试
+                safe_text = limit_card_tables(text, 0)
+                ok = self.bot.patch_message(message_id, self._build_card(safe_text))
+            if not ok and chat_id and text:
+                # 终极兜底：卡片彻底失败，以纯文本发送回复内容
+                logger.warning("卡片更新彻底失败，降级为纯文本发送")
+                self.bot.reply(chat_id, text)
         except Exception as e:
             logger.warning("消息更新失败: %s", e)
+            if chat_id and text:
+                try:
+                    self.bot.reply(chat_id, text)
+                except Exception:
+                    pass
 
     # ---- Plugin 接口实现 ----
 
@@ -277,7 +297,7 @@ class ClaudeChatPlugin(Plugin):
             # 更新占位消息为错误提示
             error_msg = f"Claude 暂时无法回复，请稍后再试。\n错误: {e}"
             if message_id:
-                self._patch_text(message_id, error_msg)
+                self._patch_text(message_id, error_msg, chat_id=chat_id)
             else:
                 self.bot.reply(chat_id, error_msg)
             return
