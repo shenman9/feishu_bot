@@ -621,13 +621,6 @@ class ClaudeCodePlugin(Plugin):
             # 进程正常结束后标记会话已启动，后续调用使用 --resume
             if proc.returncode == 0:
                 state["session_started"] = True
-                # 保存/更新历史会话记录
-                title = (prompt[:50] + "…") if len(prompt) > 50 else prompt
-                self._session_store.upsert_session(
-                    user_id, session_id,
-                    state["working_dir"],
-                    title,
-                )
 
             # 最终内容组装
             if not full_text:
@@ -917,6 +910,14 @@ class ClaudeCodePlugin(Plugin):
                 self._kill_process(user_id, chat_id)
                 state["running"] = False
                 state["cancelled"] = True
+                # CLI 进程启动后即创建会话记录，即使被取消也已存在上下文，
+                # 标记为已启动，下次调用使用 --resume 继续对话
+                if not state.get("session_started"):
+                    state["session_started"] = True
+                    logger.info(
+                        "[CC] 首次调用被取消，标记 session_started=True: session=%s",
+                        state["session_id"][:8],
+                    )
                 # 立即更新执行卡片，移除取消按钮
                 mid = state.get("current_message_id")
                 if mid:
@@ -1106,6 +1107,14 @@ class ClaudeCodePlugin(Plugin):
             )
             return
 
+        # 每轮对话开始时即更新会话记录（标题取当前 prompt），
+        # 避免进程中途退出导致信息停留在上一轮
+        session_id = state["session_id"]
+        title = (text[:50] + "…") if len(text) > 50 else text
+        self._session_store.upsert_session(
+            user_id, session_id, state["working_dir"], title,
+        )
+
         # 发送占位卡片
         placeholder = cards.build_execution_card(log_text="正在启动 Claude Code...", running=True)
         message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
@@ -1197,6 +1206,14 @@ class ClaudeCodePlugin(Plugin):
                 self._kill_process(user_id, chat_id, wait=False)
                 state["running"] = False
                 state["cancelled"] = True
+                # CLI 进程启动后即创建会话记录，即使被取消也已存在上下文，
+                # 标记为已启动，下次调用使用 --resume 继续对话
+                if not state.get("session_started"):
+                    state["session_started"] = True
+                    logger.info(
+                        "[CC] 首次调用被取消，标记 session_started=True: session=%s",
+                        state["session_id"][:8],
+                    )
                 # 立即返回更新后的卡片，移除取消按钮并更新标题
                 cancel_card = json.loads(cards.build_execution_card(log_text="**已取消执行**", cancelled=True))
                 return self.bot.make_card_response(card=cancel_card, toast="已取消执行")

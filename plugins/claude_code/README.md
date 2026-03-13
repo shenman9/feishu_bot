@@ -218,7 +218,7 @@ default_model: ""                   # 新会话默认模型，留空使用 CLI �
 |------|------|
 | `active` | 用户是否处于活跃会话 |
 | `session_id` | Claude Code 会话 UUID（用于 `--resume`）|
-| `session_started` | 会话是否已真正启动（首次提交后置 True）|
+| `session_started` | 会话是否已真正启动（首次调用 CLI 后置 True，包括被取消的情况）|
 | `running` | 当前是否有任务正在运行 |
 | `working_dir` | 当前工作目录路径 |
 | `last_chat_id` | 最近一次交互的飞书 chat_id（用于权限卡片推送）|
