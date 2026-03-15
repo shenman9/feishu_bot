@@ -41,3 +41,14 @@ permission_timeout: 120               # 用户确认超时秒数，超时自动�
 #   并向 Claude 的 settings.json 注册 PreToolUse Hook。
 # - 用户可在会话内发送 /permission 指令切换权限模式（interactive/accept_edits/bypass）。
 #   此设置仅限当前会话，开启新会话后自动恢复默认权限模式。
+
+# 工作区管理配置（可选，不配置则工作区功能不启用）
+# workspace:
+#   base_dir: "/data/wcwxyai/workspaces"     # 工作区根目录
+#   repos:                                    # 可用仓库列表
+#     simpler:                                # 仓库别名（用于 /init 命令）
+#       url: "git@github.com:ChaoWao/simpler.git"        # 原始仓库地址
+#       fork: "git@github.com:hw-native-sys-bot/simpler.git"  # Bot fork 地址
+#     pypto:
+#       url: "git@github.com:hw-native-sys/pypto.git"
+#       fork: "git@github.com:hw-native-sys-bot/pypto.git"
