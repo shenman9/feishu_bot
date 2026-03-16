@@ -288,8 +288,8 @@ class TestUserCommands:
 class TestConcurrency:
     """并发控制测试"""
 
-    def test_reject_when_running(self, plugin):
-        """运行中拒绝新任务"""
+    def test_enqueue_when_running(self, plugin):
+        """运行中新指令入队而非拒绝"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         state = plugin._get_state("u1", "c1")
         state["running"] = True
@@ -298,7 +298,99 @@ class TestConcurrency:
         plugin.handle_message("u1", "c1", "新的 prompt")
 
         msg = plugin.bot.reply.call_args[0][1]
-        assert "运行中" in msg
+        assert "队列" in msg
+        assert len(state["message_queue"]) == 1
+        assert state["message_queue"][0] == "新的 prompt"
+
+    def test_queue_full_reject(self, plugin):
+        """队列满时拒绝新指令"""
+        import collections
+        from plugins.claude_code.claude_code_plugin import _MAX_QUEUE_SIZE
+
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["running"] = True
+        # 填满队列
+        for i in range(_MAX_QUEUE_SIZE):
+            state["message_queue"].append(f"prompt-{i}")
+
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "溢出的 prompt")
+
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "队列已满" in msg
+        assert len(state["message_queue"]) == _MAX_QUEUE_SIZE
+
+    def test_queue_view_empty(self, plugin):
+        """查看空队列"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "队列为空" in msg
+
+    def test_queue_view_with_items(self, plugin):
+        """查看有内容的队列"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["message_queue"].append("第一条指令")
+        state["message_queue"].append("第二条指令")
+
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "共 2 条" in msg
+        assert "1." in msg
+        assert "第一条指令" in msg
+
+    def test_queue_remove(self, plugin):
+        """删除队列中指定条目"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["message_queue"].append("aaa")
+        state["message_queue"].append("bbb")
+        state["message_queue"].append("ccc")
+
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue remove 2")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "已移除" in msg
+        assert "bbb" in msg
+        assert len(state["message_queue"]) == 2
+        assert list(state["message_queue"]) == ["aaa", "ccc"]
+
+    def test_queue_remove_out_of_range(self, plugin):
+        """删除超出范围的编号"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["message_queue"].append("aaa")
+
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue remove 5")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "超出范围" in msg
+
+    def test_queue_clear(self, plugin):
+        """清空队列"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        state = plugin._get_state("u1", "c1")
+        state["message_queue"].append("aaa")
+        state["message_queue"].append("bbb")
+
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue clear")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "已清空" in msg
+        assert "2 条" in msg
+        assert len(state["message_queue"]) == 0
+
+    def test_queue_clear_empty(self, plugin):
+        """清空已经空的队列"""
+        plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
+        plugin.bot.reply.reset_mock()
+        plugin.handle_message("u1", "c1", "/queue clear")
+        msg = plugin.bot.reply.call_args[0][1]
+        assert "已经是空的" in msg
 
 
 # ---- stream-json 解析测试 ----

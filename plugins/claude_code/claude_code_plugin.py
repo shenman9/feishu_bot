@@ -8,6 +8,7 @@ Claude Code 桥接插件
 将 Claude Code 的权限请求转发给飞书用户确认。
 """
 
+import collections
 import datetime
 import json
 import logging
@@ -63,6 +64,7 @@ _IDLE_PATCH_INTERVAL = 2.0  # 无新数据时进度提示刷新间隔（秒）
 _DEFAULT_TIMEOUT = 600          # 默认超时 10 分钟
 _DEFAULT_MAX_OUTPUT = DEFAULT_MAX_OUTPUT
 _DEFAULT_MAX_TURNS = 50         # Claude Code 最大轮次
+_MAX_QUEUE_SIZE = 10            # 每会话最大排队指令数
 
 
 class ClaudeCodePlugin(Plugin):
@@ -80,7 +82,8 @@ class ClaudeCodePlugin(Plugin):
         {"usage": "/session",   "brief": "查看并恢复历史会话",             "detail": "列出最近历史会话，可点击选择恢复"},
         {"usage": "/star",      "brief": "收藏/取消收藏当前会话",          "detail": "收藏或取消收藏当前会话（收藏后不会被自动清理）"},
         {"usage": "/rename <标题>", "brief": "重命名当前会话",            "detail": "修改当前会话的标题，方便后续查找"},
-        {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务"},
+        {"usage": "/cancel",    "brief": "终止运行中的任务",             "detail": "终止当前正在运行的任务并清空队列"},
+        {"usage": "/queue",     "brief": "查看/管理消息队列",             "detail": "查看排队指令 | `/queue remove N` 移除第 N 条 | `/queue clear` 清空"},
         {"usage": "/status",    "brief": "查看当前状态",                 "detail": "查看当前会话状态（目录、session、权限模式等）"},
         {"usage": "/permission", "brief": "切换权限确认模式",              "detail": "弹出权限模式选择卡片，可选 interactive / accept_edits / bypass"},
         {"usage": "/cd <路径>",    "brief": "切换工作目录（会同时重置会话）", "detail": "切换工作目录并重置会话"},
@@ -213,6 +216,7 @@ class ClaudeCodePlugin(Plugin):
                 "session_perm_mode": init_perm,  # 会话级权限模式: interactive / bypass / accept_edits
                 "session_model": cfg["default_model"],  # 会话级模型: "" 表示 CLI 默认
                 "perm_timeout_count": 0,  # 当前任务中权限确认超时次数
+                "message_queue": collections.deque(),  # 排队中的用户指令
             }
         return self.user_states[key]
 
@@ -224,6 +228,9 @@ class ClaudeCodePlugin(Plugin):
         """清理用户在指定群聊中的状态，终止运行中的进程"""
         self._kill_process(user_id, chat_id)
         key = self._state_key(user_id, chat_id)
+        state = self.user_states.get(key)
+        if state:
+            state.get("message_queue", collections.deque()).clear()
         self.user_states.pop(key, None)
 
     def _reset_session(self, user_id: str, chat_id: str) -> str:
@@ -233,6 +240,7 @@ class ClaudeCodePlugin(Plugin):
         state["session_id"] = str(uuid.uuid4())
         state["session_started"] = False
         state["running"] = False
+        state.get("message_queue", collections.deque()).clear()
         default_perm = self._load_plugin_config()["default_perm_mode"]
         # manual_select 模式：暂用 interactive 作为安全默认，后续弹卡片由用户选择
         state["session_perm_mode"] = "interactive" if default_perm == "manual_select" else default_perm
@@ -270,10 +278,13 @@ class ClaudeCodePlugin(Plugin):
                 session_display = session_record["title"]
             if session_record.get("starred"):
                 session_display += " ⭐"
+        queue_size = len(state.get("message_queue", []))
+        queue_display = f"{queue_size} 条待执行" if queue_size else "空"
         return (
             f"会话: {session_display}\n"
             f"工作目录: {working_dir_display}\n"
             f"状态: {status}\n"
+            f"队列: {queue_display}\n"
             f"权限模式: {perm_mode}\n"
             f"模型: {model_display}"
         )
@@ -388,6 +399,59 @@ class ClaudeCodePlugin(Plugin):
                 logger.error("配置的 run_as_user '%s' 不存在", run_as_user)
 
         return env, preexec_fn
+
+    def _launch_task(
+        self, user_id: str, chat_id: str, text: str, state: dict,
+    ) -> None:
+        """启动一次 Claude Code 任务（权限检查 + 占位卡片 + 后台线程）
+
+        调用方需确保 state["running"] 已为 True。
+        """
+        # 确保权限确认服务器已启动（首次调用时初始化）
+        perm_mgr = self._ensure_perm_manager()
+        server_ok = perm_mgr.ensure_server()
+
+        # 非 bypass 模式下，权限服务器必须正常运行才能安全执行任务
+        perm_mode = state.get("session_perm_mode", "interactive")
+        if not server_ok and perm_mode != "bypass":
+            logger.error(
+                "[CC] 权限服务器启动失败，%s 模式下拒绝执行: user=%s",
+                perm_mode, user_id,
+            )
+            state["running"] = False
+            state.get("message_queue", collections.deque()).clear()
+            self.bot.reply(
+                chat_id,
+                "⚠️ 权限确认服务器启动失败，无法在当前权限模式下安全执行任务。\n"
+                "请联系管理员检查服务器端口配置，或切换到 bypass 模式（/permission）后重试。",
+            )
+            return
+
+        # 每轮对话开始时即更新会话记录（标题取当前 prompt），
+        # 避免进程中途退出导致信息停留在上一轮
+        session_id = state["session_id"]
+        title = (text[:50] + "…") if len(text) > 50 else text
+        self._session_store.upsert_session(
+            user_id, session_id, state["working_dir"], title,
+        )
+
+        # 发送占位卡片（若有排队指令，卡片上附带队列剩余信息）
+        queue = state.get("message_queue", collections.deque())
+        queue_hint = f"（队列剩余 {len(queue)} 条）" if queue else ""
+        placeholder = cards.build_execution_card(
+            log_text=f"正在启动 Claude Code...{queue_hint}", running=True,
+        )
+        message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
+        state["current_message_id"] = message_id
+
+        # 启动后台线程
+        t = threading.Thread(
+            target=self._run_claude_code,
+            args=(user_id, chat_id, text, message_id),
+            daemon=True,
+        )
+        t.start()
+        self._running_threads[self._state_key(user_id, chat_id)] = t
 
     def _run_claude_code(
         self, user_id: str, chat_id: str, prompt: str, message_id: Optional[str]
@@ -677,7 +741,6 @@ class ClaudeCodePlugin(Plugin):
         finally:
             if timer:
                 timer.cancel()
-            state["running"] = False
             key = self._state_key(user_id, chat_id)
             self._running_processes.pop(key, None)
             self._running_threads.pop(key, None)
@@ -690,7 +753,25 @@ class ClaudeCodePlugin(Plugin):
                     self.bot.urgent_message(message_id, [user_id])
                 except Exception as ue:
                     logger.debug("[CC] 加急通知发送失败: %s", ue)
-            logger.info("[CC] 任务清理完成: user=%s", user_id)
+
+            # 队列消费：若有排队指令且非取消，自动执行下一条
+            queue = state.get("message_queue", collections.deque())
+            if queue and not state.get("cancelled"):
+                next_text = queue.popleft()
+                logger.info(
+                    "[CC] 自动取出队列指令: user=%s, remaining=%d",
+                    user_id, len(queue),
+                )
+                state["cancelled"] = False
+                state["perm_timeout_count"] = 0
+                try:
+                    self._launch_task(user_id, chat_id, next_text, state)
+                except Exception:
+                    logger.exception("[CC] 启动队列任务失败: user=%s", user_id)
+                    state["running"] = False
+            else:
+                state["running"] = False
+                logger.info("[CC] 任务清理完成: user=%s", user_id)
 
     def _start_timeout_timer(self, user_id: str, chat_id: str, timeout: int) -> threading.Timer:
         """启动超时定时器，超时后终止进程"""
@@ -906,6 +987,10 @@ class ClaudeCodePlugin(Plugin):
         if text == "/cancel":
             if state["running"]:
                 logger.info("[CC] 用户取消任务: user=%s", user_id)
+                # 清空队列
+                queue = state.get("message_queue", collections.deque())
+                dropped = len(queue)
+                queue.clear()
                 self._kill_process(user_id, chat_id)
                 state["running"] = False
                 state["cancelled"] = True
@@ -921,9 +1006,63 @@ class ClaudeCodePlugin(Plugin):
                 mid = state.get("current_message_id")
                 if mid:
                     self._patch_card(mid, log_text="**已取消执行**", cancelled=True)
-                self.bot.reply(chat_id, "已取消当前任务。")
+                msg = "已取消当前任务。"
+                if dropped:
+                    msg += f"（队列中 {dropped} 条指令已清空）"
+                self.bot.reply(chat_id, msg)
             else:
                 self.bot.reply(chat_id, "当前没有运行中的任务。")
+            return
+
+        # 3a. 特殊指令：队列管理
+        if text == "/queue" or text.startswith("/queue "):
+            queue = state.get("message_queue", collections.deque())
+            sub = text[len("/queue"):].strip()
+
+            # /queue clear — 清空队列（不终止当前任务）
+            if sub == "clear":
+                if not queue:
+                    self.bot.reply(chat_id, "队列已经是空的。")
+                else:
+                    dropped = len(queue)
+                    queue.clear()
+                    self.bot.reply(chat_id, f"已清空队列（{dropped} 条指令已移除）。")
+                return
+
+            # /queue remove N — 删除第 N 条
+            if sub.startswith("remove"):
+                idx_str = sub[len("remove"):].strip()
+                if not idx_str.isdigit() or int(idx_str) < 1:
+                    self.bot.reply(chat_id, "用法: `/queue remove N`，N 为队列编号（从 1 开始）。")
+                    return
+                idx = int(idx_str) - 1  # 转为 0-based
+                if idx >= len(queue):
+                    self.bot.reply(chat_id, f"编号超出范围，当前队列共 {len(queue)} 条。")
+                    return
+                # deque 不支持 del，转 list 后重建
+                items = list(queue)
+                removed = items.pop(idx)
+                queue.clear()
+                queue.extend(items)
+                preview = (removed[:30] + "…") if len(removed) > 30 else removed
+                self.bot.reply(chat_id, f"已移除第 {idx + 1} 条: {preview}")
+                return
+
+            # /queue — 查看队列
+            if not sub:
+                if not queue:
+                    self.bot.reply(chat_id, "队列为空，没有排队中的指令。")
+                else:
+                    lines = [f"**排队中的指令（共 {len(queue)} 条）：**"]
+                    for i, item in enumerate(queue, 1):
+                        preview = (item[:30] + "…") if len(item) > 30 else item
+                        lines.append(f"{i}. {preview}")
+                    lines.append("\n`/queue remove N` 移除第 N 条 | `/queue clear` 清空全部")
+                    self.bot.reply(chat_id, "\n".join(lines))
+                return
+
+            # 未知子命令
+            self.bot.reply(chat_id, "用法: `/queue` 查看 | `/queue remove N` 移除 | `/queue clear` 清空")
             return
 
         # 4. 特殊指令：状态
@@ -1068,13 +1207,22 @@ class ClaudeCodePlugin(Plugin):
             self.bot.reply(chat_id, help_text)
             return
 
-        # 10. 并发控制：运行中拒绝新任务
+        # 10. 并发控制：运行中将新指令入队
         if state["running"]:
-            logger.info("[CC] 拒绝新任务（上一个仍在运行）: user=%s", user_id)
-            self.bot.reply(
-                chat_id,
-                "上一个任务仍在运行中，请等待完成或发送 `/cancel` 终止。",
-            )
+            queue = state.get("message_queue", collections.deque())
+            if len(queue) >= _MAX_QUEUE_SIZE:
+                self.bot.reply(
+                    chat_id,
+                    f"队列已满（最多 {_MAX_QUEUE_SIZE} 条），"
+                    "请等待当前任务完成或发送 `/cancel` 取消。",
+                )
+            else:
+                queue.append(text)
+                logger.info("[CC] 指令入队: user=%s, queue_size=%d", user_id, len(queue))
+                self.bot.reply(
+                    chat_id,
+                    f"当前任务执行中，指令已加入队列（第 {len(queue)} 条），完成后将自动执行。",
+                )
             return
 
         # 12. 正常执行：发送 prompt 到 Claude Code
@@ -1086,47 +1234,7 @@ class ClaudeCodePlugin(Plugin):
             "[CC] 开始执行 prompt: user=%s, session=%s, prompt长度=%d",
             user_id, state["session_id"][:8], len(text),
         )
-
-        # 确保权限确认服务器已启动（首次调用时初始化）
-        perm_mgr = self._ensure_perm_manager()
-        server_ok = perm_mgr.ensure_server()
-
-        # 非 bypass 模式下，权限服务器必须正常运行才能安全执行任务
-        perm_mode = state.get("session_perm_mode", "interactive")
-        if not server_ok and perm_mode != "bypass":
-            logger.error(
-                "[CC] 权限服务器启动失败，%s 模式下拒绝执行: user=%s",
-                perm_mode, user_id,
-            )
-            state["running"] = False
-            self.bot.reply(
-                chat_id,
-                "⚠️ 权限确认服务器启动失败，无法在当前权限模式下安全执行任务。\n"
-                "请联系管理员检查服务器端口配置，或切换到 bypass 模式（/permission）后重试。",
-            )
-            return
-
-        # 每轮对话开始时即更新会话记录（标题取当前 prompt），
-        # 避免进程中途退出导致信息停留在上一轮
-        session_id = state["session_id"]
-        title = (text[:50] + "…") if len(text) > 50 else text
-        self._session_store.upsert_session(
-            user_id, session_id, state["working_dir"], title,
-        )
-
-        # 发送占位卡片
-        placeholder = cards.build_execution_card(log_text="正在启动 Claude Code...", running=True)
-        message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
-        state["current_message_id"] = message_id
-
-        # 启动后台线程
-        t = threading.Thread(
-            target=self._run_claude_code,
-            args=(user_id, chat_id, text, message_id),
-            daemon=True,
-        )
-        t.start()
-        self._running_threads[self._state_key(user_id, chat_id)] = t
+        self._launch_task(user_id, chat_id, text, state)
 
     def handle_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict
@@ -1201,6 +1309,10 @@ class ClaudeCodePlugin(Plugin):
             state = self._get_state(user_id, chat_id)
             if state.get("running"):
                 logger.info("[CC] 卡片取消按钮点击: user=%s", user_id)
+                # 清空队列
+                queue = state.get("message_queue", collections.deque())
+                dropped = len(queue)
+                queue.clear()
                 # wait=False: 不等待进程退出，避免阻塞飞书卡片回调超时
                 self._kill_process(user_id, chat_id, wait=False)
                 state["running"] = False
@@ -1215,7 +1327,10 @@ class ClaudeCodePlugin(Plugin):
                     )
                 # 立即返回更新后的卡片，移除取消按钮并更新标题
                 cancel_card = json.loads(cards.build_execution_card(log_text="**已取消执行**", cancelled=True))
-                return self.bot.make_card_response(card=cancel_card, toast="已取消执行")
+                toast = "已取消执行"
+                if dropped:
+                    toast += f"（队列 {dropped} 条已清空）"
+                return self.bot.make_card_response(card=cancel_card, toast=toast)
             return self.bot.make_card_response(toast="当前没有运行中的任务")
 
         if action in ("perm_allow", "perm_deny"):
