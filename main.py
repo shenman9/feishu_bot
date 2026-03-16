@@ -12,7 +12,7 @@ from plugins.rps_game import RPSPlugin
 from plugins.file_reader import FileReaderPlugin
 from plugins.claude_chat import ClaudeChatPlugin
 from plugins.paper_daily import PaperDailyPlugin
-from plugins.claude_code import ClaudeCodePlugin
+from plugins.claude_code.workspace_plugin import WorkspaceClaudeCodePlugin as ClaudeCodePlugin
 
 
 def main():

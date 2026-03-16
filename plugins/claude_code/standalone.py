@@ -15,7 +15,7 @@ from pathlib import Path
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
 
 from core.feishu_bot import FeishuBot
-from plugins.claude_code.claude_code_plugin import ClaudeCodePlugin
+from plugins.claude_code.workspace_plugin import WorkspaceClaudeCodePlugin as ClaudeCodePlugin
 from plugins.claude_code.constants import PLUGIN_KEYWORD
 
 logger = logging.getLogger(__name__)
