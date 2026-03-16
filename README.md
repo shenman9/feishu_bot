@@ -27,6 +27,8 @@ hub_agent/
 │   ├── paper_daily/         # 论文日报（ArXiv 论文 AI 筛选与每日推送）
 │   └── claude_code/         # Claude Code 桥接（调用本地 CLI，支持飞书交互式权限确认）
 │       ├── claude_code_plugin.py   # 插件主体
+│       ├── workspace.py            # 工作区管理逻辑层
+│       ├── workspace_plugin.py     # 工作区插件子类（继承扩展）
 │       ├── permission_server.py    # 权限确认 HTTP 服务器（IPC 桥梁）
 │       ├── permission_hook.sh      # PreToolUse Hook 脚本（Claude Code 调用）
 │       ├── standalone.py           # 独立运行模式（跳过 HubBot，直连飞书）

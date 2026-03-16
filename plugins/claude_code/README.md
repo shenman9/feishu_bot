@@ -18,6 +18,7 @@
 - **权限确认**：危险操作（写文件、执行命令等）通过飞书卡片弹出确认，用户可逐一审批；若确认超时，任务完成卡片会追加警告提示（如 `⚠️ 本次任务中有 N 次权限确认超时（120s），操作已自动拒绝`），帮助用户定位失败原因
 - **三态权限模式**：灵活的权限控制，适应不同工作场景
 - **工作目录管理**：支持切换工作目录，切换后自动重置会话
+- **工作区管理**（可选）：多用户隔离工作区，支持从配置仓库 clone/fork、绑定/解绑工作区、直接执行 bash 命令。通过继承扩展实现（`WorkspaceClaudeCodePlugin`），未配置 `workspace` 时自动降级为基础功能
 - **用户问题转发**：Claude Code 调用 `AskUserQuestion` 时，问题会以飞书交互卡片形式呈现（逐题展示、预设选项按钮 + 自定义输入），同时发送应用内加急通知提醒用户及时作答，用户回答后实时传回 Claude；即使处于 bypass 模式，该工具仍需用户实际作答
 - **计划审批**：Claude Code 进入 Plan Mode 后，调用 `ExitPlanMode` 时自动读取计划文件（`.claude/plans/*.md`），以飞书卡片完整展示计划内容，同时发送应用内加急通知提醒用户及时审批，用户可点击「批准计划」「拒绝计划」或输入修改意见后「拒绝并反馈」；即使处于 bypass 模式，计划仍需用户审批
 - **完成通知**：任务执行结束后自动发送飞书应用内加急通知，避免用户错过结果
@@ -45,6 +46,20 @@
 | `/compact` | 压缩当前会话上下文（释放 token 空间），透传给 Claude Code 执行 |
 | `/model` | 弹出模型选择卡片，切换当前会话使用的 Claude 模型 |
 | `/help` | 显示帮助信息 |
+
+### 工作区指令（需配置 `workspace` 段）
+
+以下指令仅在 `claude_code.yaml` 中配置了 `workspace` 段后生效，未配置时不显示、不响应：
+
+| 指令 | 说明 |
+|------|------|
+| `/profile [name] [email]` | 查看或设置 Git 身份（`/profile` 查看，`/profile 张三 email` 设置）|
+| `/init <repo> [描述]` | 从配置仓库创建新工作区（clone + 配置 fork remote + 自动绑定）|
+| `/bind <名称\|编号>` | 绑定指定工作区到当前会话（会重置会话）|
+| `/unbind` | 解绑当前工作区，返回用户默认目录 |
+| `/folders` | 列出所有工作区文件夹及状态（名称、大小、绑定状态）|
+| `/rmfolder <名称\|编号>` | 删除指定工作区文件夹（若当前绑定则先解绑）|
+| `/run <命令>` | 在当前工作目录下直接执行 bash 命令（不走 Claude Code，超时 30 秒）|
 
 > 未被上述指令匹配的 `/` 开头文本（如 `/compact`）会直接作为 prompt 发送给 Claude Code。其中 `/compact` 对应 Claude Code 内置的上下文压缩命令，执行耗时较长（可能数分钟），完成后显示压缩前的 token 数。
 
@@ -150,6 +165,8 @@ claude_code/
 ├── permission_manager.py    # 权限服务器生命周期管理（Hook 注册、请求回调分发）
 ├── permission_server.py     # HTTP 权限确认服务（阻塞等待用户飞书确认）
 ├── permission_hook.sh       # Claude Code PreToolUse Hook 脚本
+├── workspace.py             # 工作区纯逻辑层（目录管理、Git clone/fork、profile 持久化）
+├── workspace_plugin.py      # 工作区插件子类（继承 ClaudeCodePlugin，扩展工作区指令）
 ├── standalone.py            # 独立机器人模式（跳过 HubBot 直连飞书）
 └── __main__.py              # python -m plugins.claude_code 入口
 ```
@@ -166,6 +183,8 @@ claude_code/
 | `permission_manager.py` | 权限确认服务器的启动、Hook 注册、权限请求回调分发（通过回调与主插件解耦）|
 | `permission_server.py` | 内嵌 HTTP 服务器，接收 Hook 请求并阻塞等待用户飞书确认 |
 | `permission_hook.sh` | 由 Claude Code 调用，将权限请求转发给 PermissionServer |
+| `workspace.py` | 工作区纯逻辑层：目录创建/删除、Git clone/fork 配置、profile 持久化、目录大小计算 |
+| `workspace_plugin.py` | 工作区插件子类：继承 `ClaudeCodePlugin`，扩展 `/profile`、`/init`、`/bind` 等工作区指令；未配置时完全降级 |
 | `standalone.py` | 绕过 HubBot，以独立机器人身份运行 CC 插件 |
 | `__main__.py` | 支持 `python -m plugins.claude_code` 直接启动 |
 
@@ -213,6 +232,27 @@ default_model: ""                   # 新会话默认模型，留空使用 CLI �
 | `permission_timeout` | `120` | 等待用户确认的超时时间（秒）|
 | `models` | 内置 Sonnet/Opus/Haiku | 可选模型列表，每项含 `alias`、`label`、`desc` |
 | `default_model` | `""` | 新会话默认模型，留空使用 CLI 默认，填写应为 `models` 中的某个 `alias` |
+
+### 工作区配置（可选）
+
+在 `claude_code.yaml` 中添加 `workspace` 段即可启用工作区功能，不配置则工作区指令不生效、不显示：
+
+```yaml
+workspace:
+  base_dir: "/data/workspaces"         # 工作区根目录（每个用户在此下自动创建独立子目录）
+  repos:                                # 可用仓库列表
+    simpler:                            # 仓库别名（用于 /init 命令）
+      url: "git@github.com:Org/simpler.git"        # 原始仓库地址
+      fork: "git@github.com:Bot/simpler.git"       # Bot fork 地址（可选）
+    pypto:
+      url: "git@github.com:Org/pypto.git"
+      fork: "git@github.com:Bot/pypto.git"
+```
+
+| 配置项 | 说明 |
+|--------|------|
+| `workspace.base_dir` | 工作区根目录，用户首次 `/init` 时自动在此下创建 `<user_id>/` 子目录 |
+| `workspace.repos` | 可用仓库字典，键为别名，`url` 为上游仓库，`fork` 为 Bot 的 fork 地址（`/init` 时自动配置为 push remote）|
 
 ## 会话状态
 
