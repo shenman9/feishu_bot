@@ -172,6 +172,7 @@ class ClaudeCodePlugin(Plugin):
                 cc = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
             else:
                 cc = load_plugin_config("claude_code")
+            self._raw_yaml = cc  # 保留完整 YAML，供子类扩展读取
             self._config = {
                 "claude_path": cc.get("claude_path", "/usr/bin/claude"),
                 "default_working_dir": cc.get("default_working_dir", ""),

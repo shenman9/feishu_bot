@@ -289,21 +289,12 @@ class WorkspaceManager:
     def _dir_size_display(path: str) -> str:
         """估算目录大小，返回人类可读格式"""
         try:
-            total = 0
-            for dirpath, _dirnames, filenames in os.walk(path):
-                for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    try:
-                        total += os.path.getsize(fp)
-                    except OSError:
-                        pass
-            if total < 1024:
-                return f"{total}B"
-            elif total < 1024 * 1024:
-                return f"{total // 1024}K"
-            elif total < 1024 * 1024 * 1024:
-                return f"{total // (1024 * 1024)}M"
-            else:
-                return f"{total // (1024 * 1024 * 1024)}G"
-        except OSError:
+            result = subprocess.run(
+                ["du", "-sh", path],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return result.stdout.split()[0]
+            return "?"
+        except Exception:
             return "?"

@@ -12,7 +12,6 @@ import shlex
 import subprocess
 from typing import Optional
 
-from config import load_plugin_config
 from plugins.claude_code.claude_code_plugin import ClaudeCodePlugin
 from plugins.claude_code.constants import display_path
 from plugins.claude_code.workspace import WorkspaceManager
@@ -69,14 +68,8 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
         """懒加载插件配置，追加 workspace 配置段"""
         cfg = super()._load_plugin_config()
         if "workspace" not in cfg:
-            # 从同源 yaml 重新读取完整配置以获取 workspace 段
-            if self._config_dir is not None:
-                import yaml
-                path = self._config_dir / "claude_code.yaml"
-                cc = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-            else:
-                cc = load_plugin_config("claude_code")
-            ws = cc.get("workspace", {})
+            raw = getattr(self, "_raw_yaml", {})
+            ws = raw.get("workspace", {})
             cfg["workspace"] = {
                 "base_dir": ws.get("base_dir", ""),
                 "repos": ws.get("repos", {}),
@@ -240,9 +233,7 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
 
         # 自动绑定到当前会话
         state = self._get_state(user_id, chat_id)
-        state["working_dir"] = result["folder_path"]
         self._reset_session(user_id, chat_id)
-        # 重置后需要重新设置 working_dir（_reset_session 不改 working_dir）
         state["working_dir"] = result["folder_path"]
 
         self.bot.reply(
@@ -278,7 +269,6 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
             return
 
         state = self._get_state(user_id, chat_id)
-        state["working_dir"] = folder_path
         self._reset_session(user_id, chat_id)
         state["working_dir"] = folder_path
 
@@ -293,7 +283,6 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
         """解绑工作区，返回用户默认目录"""
         state = self._get_state(user_id, chat_id)
         user_dir = ws_mgr.ensure_user_dir(user_id)
-        state["working_dir"] = user_dir
         self._reset_session(user_id, chat_id)
         state["working_dir"] = user_dir
 
@@ -350,7 +339,6 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
         current_folder = ws_mgr.get_bound_folder_name(user_id, state["working_dir"])
         if current_folder == folder_name:
             user_dir = ws_mgr.ensure_user_dir(user_id)
-            state["working_dir"] = user_dir
             self._reset_session(user_id, chat_id)
             state["working_dir"] = user_dir
 
