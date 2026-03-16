@@ -91,7 +91,8 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
 
     # ---- 覆写 handle_message：拦截工作区命令 ----
 
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         """处理用户消息，优先匹配工作区命令"""
         state = self._get_state(user_id, chat_id)
         ws_mgr = self._ensure_workspace_mgr()
@@ -139,7 +140,7 @@ class WorkspaceClaudeCodePlugin(ClaudeCodePlugin):
                 return
 
         # 没命中 → 走父类全部逻辑
-        super().handle_message(user_id, chat_id, text)
+        super().handle_message(user_id, chat_id, text, message_id=message_id)
 
     # ---- 工作区命令实现 ----
 

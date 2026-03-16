@@ -512,7 +512,8 @@ class PaperDailyPlugin(Plugin):
 
     # ---- Plugin 接口 ----
 
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         state = self._get_state(user_id)
 
         if text == self.keyword:

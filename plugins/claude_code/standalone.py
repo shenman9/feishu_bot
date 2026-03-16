@@ -40,7 +40,8 @@ class ClaudeCodeBot(FeishuBot):
 
     # ---- 消息路由 ----
 
-    def on_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def on_message(self, user_id: str, chat_id: str, text: str,
+                   message_id: str = "") -> None:
         """将消息转发给 CC 插件；首条消息自动激活，无需发送关键词"""
         state = self._plugin._get_state(user_id, chat_id)
 
@@ -50,9 +51,9 @@ class ClaudeCodeBot(FeishuBot):
             self._plugin.handle_message(user_id, chat_id, PLUGIN_KEYWORD)
             # 若用户第一条消息本身就是 prompt，激活后立即处理，不浪费一轮
             if text.strip().upper() != PLUGIN_KEYWORD:
-                self._plugin.handle_message(user_id, chat_id, text)
+                self._plugin.handle_message(user_id, chat_id, text, message_id=message_id)
         else:
-            self._plugin.handle_message(user_id, chat_id, text)
+            self._plugin.handle_message(user_id, chat_id, text, message_id=message_id)
 
     def on_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict

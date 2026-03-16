@@ -33,7 +33,8 @@ class MyPlugin(Plugin):
         """一句话描述，出现在功能菜单中"""
         return "这是一个示例功能"
 
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         """
         处理文本消息。
         - 当用户发送 keyword 时，text == keyword（首次激活）

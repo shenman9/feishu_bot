@@ -248,7 +248,7 @@ class FeishuBot(ABC):
             if not text:
                 if chat_type == "group" and mentions:
                     # 群聊中纯 @机器人无附加文本，视为无指令，触发默认菜单
-                    self.on_message(sender_id, chat_id, "")
+                    self.on_message(sender_id, chat_id, "", message_id=message_id)
                 else:
                     logger.info("忽略空文本消息: user=%s, msg_type=%s, message_id=%s",
                                sender_id, msg_type, message_id)
@@ -260,7 +260,7 @@ class FeishuBot(ABC):
             if text == self._WAKE_MODE_KEYWORD and chat_type == "group":
                 self._send_wake_mode_card(chat_id)
                 return
-            self.on_message(sender_id, chat_id, text)
+            self.on_message(sender_id, chat_id, text, message_id=message_id)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         """解析卡片按钮点击事件，交给子类处理"""
@@ -388,6 +388,41 @@ class FeishuBot(ABC):
         """发送交互卡片消息"""
         self.send_message(chat_id, "interactive", json.dumps(card))
 
+    def reply_to_message(
+        self, parent_id: str, msg_type: str, content: str,
+    ) -> Optional[str]:
+        """引用回复指定消息，返回新消息的 message_id，失败时返回 None"""
+        request = ReplyMessageRequest.builder() \
+            .message_id(parent_id) \
+            .request_body(ReplyMessageRequestBody.builder()
+                .msg_type(msg_type)
+                .content(content)
+                .build()) \
+            .build()
+        response = self.client.im.v1.message.reply(request)
+        if not response.success():
+            logger.error("引用回复失败: code=%s, msg=%s", response.code, response.msg)
+            return None
+        try:
+            return response.data.message_id
+        except AttributeError:
+            return None
+
+    def delete_message(self, message_id: str) -> bool:
+        """删除指定消息
+
+        Returns:
+            是否成功
+        """
+        request = DeleteMessageRequest.builder() \
+            .message_id(message_id) \
+            .build()
+        response = self.client.im.v1.message.delete(request)
+        if not response.success():
+            logger.error("删除消息失败: code=%s, msg=%s", response.code, response.msg)
+            return False
+        return True
+
     @staticmethod
     def make_card_response(
         card: Optional[dict] = None,
@@ -497,7 +532,8 @@ class FeishuBot(ABC):
     # ---- 业务逻辑层 (子类实现) ----
 
     @abstractmethod
-    def on_message(self, sender_id: str, chat_id: str, text: str) -> None:
+    def on_message(self, sender_id: str, chat_id: str, text: str,
+                   message_id: str = "") -> None:
         """处理收到的文本消息"""
         ...
 

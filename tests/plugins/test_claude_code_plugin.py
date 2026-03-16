@@ -300,7 +300,7 @@ class TestConcurrency:
         msg = plugin.bot.reply.call_args[0][1]
         assert "队列" in msg
         assert len(state["message_queue"]) == 1
-        assert state["message_queue"][0] == "新的 prompt"
+        assert state["message_queue"][0] == ("新的 prompt", "")
 
     def test_queue_full_reject(self, plugin):
         """队列满时拒绝新指令"""
@@ -312,7 +312,7 @@ class TestConcurrency:
         state["running"] = True
         # 填满队列
         for i in range(_MAX_QUEUE_SIZE):
-            state["message_queue"].append(f"prompt-{i}")
+            state["message_queue"].append((f"prompt-{i}", ""))
 
         plugin.bot.reply.reset_mock()
         plugin.handle_message("u1", "c1", "溢出的 prompt")
@@ -333,8 +333,8 @@ class TestConcurrency:
         """查看有内容的队列"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         state = plugin._get_state("u1", "c1")
-        state["message_queue"].append("第一条指令")
-        state["message_queue"].append("第二条指令")
+        state["message_queue"].append(("第一条指令", ""))
+        state["message_queue"].append(("第二条指令", ""))
 
         plugin.bot.reply.reset_mock()
         plugin.handle_message("u1", "c1", "/queue")
@@ -347,9 +347,9 @@ class TestConcurrency:
         """删除队列中指定条目"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         state = plugin._get_state("u1", "c1")
-        state["message_queue"].append("aaa")
-        state["message_queue"].append("bbb")
-        state["message_queue"].append("ccc")
+        state["message_queue"].append(("aaa", ""))
+        state["message_queue"].append(("bbb", ""))
+        state["message_queue"].append(("ccc", ""))
 
         plugin.bot.reply.reset_mock()
         plugin.handle_message("u1", "c1", "/queue remove 2")
@@ -357,13 +357,13 @@ class TestConcurrency:
         assert "已移除" in msg
         assert "bbb" in msg
         assert len(state["message_queue"]) == 2
-        assert list(state["message_queue"]) == ["aaa", "ccc"]
+        assert list(state["message_queue"]) == [("aaa", ""), ("ccc", "")]
 
     def test_queue_remove_out_of_range(self, plugin):
         """删除超出范围的编号"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         state = plugin._get_state("u1", "c1")
-        state["message_queue"].append("aaa")
+        state["message_queue"].append(("aaa", ""))
 
         plugin.bot.reply.reset_mock()
         plugin.handle_message("u1", "c1", "/queue remove 5")
@@ -374,8 +374,8 @@ class TestConcurrency:
         """清空队列"""
         plugin.handle_message("u1", "c1", PLUGIN_KEYWORD)
         state = plugin._get_state("u1", "c1")
-        state["message_queue"].append("aaa")
-        state["message_queue"].append("bbb")
+        state["message_queue"].append(("aaa", ""))
+        state["message_queue"].append(("bbb", ""))
 
         plugin.bot.reply.reset_mock()
         plugin.handle_message("u1", "c1", "/queue clear")

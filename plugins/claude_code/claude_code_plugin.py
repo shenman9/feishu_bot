@@ -402,10 +402,13 @@ class ClaudeCodePlugin(Plugin):
 
     def _launch_task(
         self, user_id: str, chat_id: str, text: str, state: dict,
+        user_message_id: str = "",
     ) -> None:
         """启动一次 Claude Code 任务（权限检查 + 占位卡片 + 后台线程）
 
         调用方需确保 state["running"] 已为 True。
+        Args:
+            user_message_id: 用户原始消息 ID，非空时执行卡片以引用回复方式发送。
         """
         # 确保权限确认服务器已启动（首次调用时初始化）
         perm_mgr = self._ensure_perm_manager()
@@ -436,18 +439,24 @@ class ClaudeCodePlugin(Plugin):
         )
 
         # 发送占位卡片（若有排队指令，卡片上附带队列剩余信息）
+        # 有用户消息 ID 时以引用回复方式发送，便于在群聊中追溯指令来源
         queue = state.get("message_queue", collections.deque())
         queue_hint = f"（队列剩余 {len(queue)} 条）" if queue else ""
         placeholder = cards.build_execution_card(
             log_text=f"正在启动 Claude Code...{queue_hint}", running=True,
         )
-        message_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
-        state["current_message_id"] = message_id
+        if user_message_id:
+            card_msg_id = self.bot.reply_to_message(
+                user_message_id, "interactive", placeholder,
+            )
+        else:
+            card_msg_id = self.bot.send_message_get_id(chat_id, "interactive", placeholder)
+        state["current_message_id"] = card_msg_id
 
         # 启动后台线程
         t = threading.Thread(
             target=self._run_claude_code,
-            args=(user_id, chat_id, text, message_id),
+            args=(user_id, chat_id, text, card_msg_id),
             daemon=True,
         )
         t.start()
@@ -757,7 +766,7 @@ class ClaudeCodePlugin(Plugin):
             # 队列消费：若有排队指令且非取消，自动执行下一条
             queue = state.get("message_queue", collections.deque())
             if queue and not state.get("cancelled"):
-                next_text = queue.popleft()
+                next_text, next_user_msg_id = queue.popleft()
                 logger.info(
                     "[CC] 自动取出队列指令: user=%s, remaining=%d",
                     user_id, len(queue),
@@ -765,7 +774,10 @@ class ClaudeCodePlugin(Plugin):
                 state["cancelled"] = False
                 state["perm_timeout_count"] = 0
                 try:
-                    self._launch_task(user_id, chat_id, next_text, state)
+                    self._launch_task(
+                        user_id, chat_id, next_text, state,
+                        user_message_id=next_user_msg_id,
+                    )
                 except Exception:
                     logger.exception("[CC] 启动队列任务失败: user=%s", user_id)
                     state["running"] = False
@@ -954,7 +966,8 @@ class ClaudeCodePlugin(Plugin):
 
     # ---- Plugin 接口实现 ----
 
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         """处理用户消息"""
         state = self._get_state(user_id, chat_id)
 
@@ -1041,10 +1054,10 @@ class ClaudeCodePlugin(Plugin):
                     return
                 # deque 不支持 del，转 list 后重建
                 items = list(queue)
-                removed = items.pop(idx)
+                removed_text, _ = items.pop(idx)
                 queue.clear()
                 queue.extend(items)
-                preview = (removed[:30] + "…") if len(removed) > 30 else removed
+                preview = (removed_text[:30] + "…") if len(removed_text) > 30 else removed_text
                 self.bot.reply(chat_id, f"已移除第 {idx + 1} 条: {preview}")
                 return
 
@@ -1054,8 +1067,8 @@ class ClaudeCodePlugin(Plugin):
                     self.bot.reply(chat_id, "队列为空，没有排队中的指令。")
                 else:
                     lines = [f"**排队中的指令（共 {len(queue)} 条）：**"]
-                    for i, item in enumerate(queue, 1):
-                        preview = (item[:30] + "…") if len(item) > 30 else item
+                    for i, (item_text, _) in enumerate(queue, 1):
+                        preview = (item_text[:30] + "…") if len(item_text) > 30 else item_text
                         lines.append(f"{i}. {preview}")
                     lines.append("\n`/queue remove N` 移除第 N 条 | `/queue clear` 清空全部")
                     self.bot.reply(chat_id, "\n".join(lines))
@@ -1217,7 +1230,7 @@ class ClaudeCodePlugin(Plugin):
                     "请等待当前任务完成或发送 `/cancel` 取消。",
                 )
             else:
-                queue.append(text)
+                queue.append((text, message_id))
                 logger.info("[CC] 指令入队: user=%s, queue_size=%d", user_id, len(queue))
                 self.bot.reply(
                     chat_id,
@@ -1234,7 +1247,7 @@ class ClaudeCodePlugin(Plugin):
             "[CC] 开始执行 prompt: user=%s, session=%s, prompt长度=%d",
             user_id, state["session_id"][:8], len(text),
         )
-        self._launch_task(user_id, chat_id, text, state)
+        self._launch_task(user_id, chat_id, text, state, user_message_id=message_id)
 
     def handle_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict

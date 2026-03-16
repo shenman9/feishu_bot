@@ -47,7 +47,8 @@ class Plugin(ABC):
     # ---- 消息处理（子类实现） ----
 
     @abstractmethod
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         """处理路由过来的文本消息"""
         ...
 

@@ -73,7 +73,8 @@ class HubBot(FeishuBot):
 
     # ---- 消息路由 ----
 
-    def on_message(self, sender_id: str, chat_id: str, text: str) -> None:
+    def on_message(self, sender_id: str, chat_id: str, text: str,
+                   message_id: str = "") -> None:
         # 1. 菜单请求
         if text.lower() in MENU_KEYWORDS:
             self._send_menu(chat_id)
@@ -100,7 +101,7 @@ class HubBot(FeishuBot):
                     logger.error("插件 '%s' deactivate_user 异常: %s", prev_kw, e, exc_info=True)
             self.active_plugin[(sender_id, chat_id)] = text
             try:
-                self.plugins[text].handle_message(sender_id, chat_id, text)
+                self.plugins[text].handle_message(sender_id, chat_id, text, message_id=message_id)
             except Exception as e:
                 logger.error("插件 '%s' 处理消息异常: %s", text, e, exc_info=True)
                 self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")
@@ -111,7 +112,7 @@ class HubBot(FeishuBot):
         if active_kw and active_kw in self.plugins:
             plugin = self.plugins[active_kw]
             try:
-                plugin.handle_message(sender_id, chat_id, text)
+                plugin.handle_message(sender_id, chat_id, text, message_id=message_id)
             except Exception as e:
                 logger.error("插件 '%s' 处理消息异常: %s", active_kw, e, exc_info=True)
                 self.reply(chat_id, "该功能暂时遇到问题，请稍后再试。")

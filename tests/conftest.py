@@ -76,7 +76,8 @@ class StubPlugin(Plugin):
     def description(self) -> str:
         return self._description
 
-    def handle_message(self, user_id: str, chat_id: str, text: str) -> None:
+    def handle_message(self, user_id: str, chat_id: str, text: str,
+                       message_id: str = "") -> None:
         self.received_messages.append((user_id, chat_id, text))
 
     def handle_file_message(
