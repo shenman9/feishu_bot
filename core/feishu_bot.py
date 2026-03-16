@@ -311,7 +311,11 @@ class FeishuBot(ABC):
                 .content(content)
                 .build()) \
             .build()
-        response = self.client.im.v1.message.create(request)
+        try:
+            response = self.client.im.v1.message.create(request)
+        except Exception as e:
+            logger.error("发送消息失败(SDK异常): %s", e)
+            return
         if not response.success():
             logger.error("发送失败: code=%s, msg=%s", response.code, response.msg)
 
@@ -326,7 +330,11 @@ class FeishuBot(ABC):
                 .content(content)
                 .build()) \
             .build()
-        response = self.client.im.v1.message.create(request)
+        try:
+            response = self.client.im.v1.message.create(request)
+        except Exception as e:
+            logger.error("发送消息失败(SDK异常): %s", e)
+            return None
         if not response.success():
             logger.error("发送失败: code=%s, msg=%s", response.code, response.msg)
             return None
@@ -347,7 +355,11 @@ class FeishuBot(ABC):
                 .content(content)
                 .build()) \
             .build()
-        response = self.client.im.v1.message.patch(request)
+        try:
+            response = self.client.im.v1.message.patch(request)
+        except Exception as e:
+            logger.error("消息更新失败(SDK异常): %s", e)
+            return False
         if not response.success():
             logger.error(
                 "消息更新失败: code=%s, msg=%s, ext=%s",
@@ -374,7 +386,11 @@ class FeishuBot(ABC):
                 .user_id_list(user_ids)
                 .build()) \
             .build()
-        response = self.client.im.v1.message.urgent_app(request)
+        try:
+            response = self.client.im.v1.message.urgent_app(request)
+        except Exception as e:
+            logger.error("加急通知失败(SDK异常): %s", e)
+            return False
         if not response.success():
             logger.error("加急通知失败: code=%s, msg=%s", response.code, response.msg)
             return False
@@ -399,7 +415,11 @@ class FeishuBot(ABC):
                 .content(content)
                 .build()) \
             .build()
-        response = self.client.im.v1.message.reply(request)
+        try:
+            response = self.client.im.v1.message.reply(request)
+        except Exception as e:
+            logger.error("引用回复失败(SDK异常): %s", e)
+            return None
         if not response.success():
             logger.error("引用回复失败: code=%s, msg=%s", response.code, response.msg)
             return None
@@ -417,7 +437,11 @@ class FeishuBot(ABC):
         request = DeleteMessageRequest.builder() \
             .message_id(message_id) \
             .build()
-        response = self.client.im.v1.message.delete(request)
+        try:
+            response = self.client.im.v1.message.delete(request)
+        except Exception as e:
+            logger.error("删除消息失败(SDK异常): %s", e)
+            return False
         if not response.success():
             logger.error("删除消息失败: code=%s, msg=%s", response.code, response.msg)
             return False
@@ -459,7 +483,10 @@ class FeishuBot(ABC):
             .file_key(file_key) \
             .type("file") \
             .build()
-        response = self.client.im.v1.message_resource.get(request)
+        try:
+            response = self.client.im.v1.message_resource.get(request)
+        except Exception as e:
+            raise RuntimeError(f"文件下载失败(SDK异常): {e}") from e
         if not response.success():
             raise RuntimeError(f"文件下载失败: code={response.code}, msg={response.msg}")
         return response.file.read()

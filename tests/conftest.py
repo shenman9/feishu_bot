@@ -29,6 +29,11 @@ _im_v1_mock.__all__ = [
     "GetMessageResourceRequest",
     "PatchMessageRequest",
     "PatchMessageRequestBody",
+    "UrgentAppMessageRequest",
+    "UrgentReceivers",
+    "ReplyMessageRequest",
+    "ReplyMessageRequestBody",
+    "DeleteMessageRequest",
 ]
 
 _modules = {

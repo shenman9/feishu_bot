@@ -1247,7 +1247,11 @@ class ClaudeCodePlugin(Plugin):
             "[CC] 开始执行 prompt: user=%s, session=%s, prompt长度=%d",
             user_id, state["session_id"][:8], len(text),
         )
-        self._launch_task(user_id, chat_id, text, state, user_message_id=message_id)
+        try:
+            self._launch_task(user_id, chat_id, text, state, user_message_id=message_id)
+        except Exception:
+            logger.exception("[CC] 启动任务失败: user=%s", user_id)
+            state["running"] = False
 
     def handle_card_action(
         self, user_id: str, chat_id: str, message_id: str, action_value: dict
