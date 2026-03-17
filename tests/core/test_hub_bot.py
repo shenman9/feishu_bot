@@ -19,8 +19,12 @@ def _make_mock_event(
     msg_type: str = "text",
     chat_type: str = "p2p",
     mentions: list | None = None,
+    content_override: dict | None = None,
 ):
-    """构造 mock 的 P2ImMessageReceiveV1 事件对象"""
+    """构造 mock 的 P2ImMessageReceiveV1 事件对象
+
+    content_override: 若指定则替代默认的 {"text": text} 作为 message.content
+    """
     event = MagicMock()
     event.event.sender.sender_id.user_id = sender_id
     event.event.message.chat_id = chat_id
@@ -28,7 +32,10 @@ def _make_mock_event(
     event.event.message.message_type = msg_type
     event.event.message.chat_type = chat_type
     event.event.message.mentions = mentions
-    event.event.message.content = json.dumps({"text": text})
+    if content_override is not None:
+        event.event.message.content = json.dumps(content_override)
+    else:
+        event.event.message.content = json.dumps({"text": text})
     return event
 
 
@@ -574,3 +581,316 @@ class TestWakeMode:
         )
         bot._on_raw_message(event)
         assert plugin.received_messages == [("user1", "oc_group1", "test")]
+
+
+# ---- 合并转发消息测试辅助 ----
+
+def _make_message_item(
+    msg_type: str, content, message_id: str = "om_sub",
+    sender_id: str = "ou_sender_1", create_time: str = "1700000000000",
+    sender_type: str = "user",
+    upper_message_id: str | None = None,
+):
+    """构造 mock 的 Message 对象（GetMessage 返回的条目）
+
+    content: dict 会被 json.dumps，str 直接赋值（用于 merge_forward 的固定字符串）
+    sender_type: "user" 或 "app"
+    upper_message_id: 父消息 ID，用于构建消息树
+    """
+    item = MagicMock()
+    item.msg_type = msg_type
+    item.message_id = message_id
+    item.create_time = create_time
+    item.sender.id = sender_id
+    item.sender.sender_type = sender_type
+    item.upper_message_id = upper_message_id
+    if isinstance(content, dict):
+        item.body.content = json.dumps(content)
+    else:
+        item.body.content = content
+    return item
+
+
+def _make_get_response(items: list, *, success: bool = True):
+    """构造 mock 的 GetMessage API 响应"""
+    resp = MagicMock()
+    resp.success.return_value = success
+    if success:
+        resp.data.items = items
+    else:
+        resp.code = 99999
+        resp.msg = "mock error"
+    return resp
+
+
+def _setup_merge_bot(bot):
+    """为合并转发测试设置 mock client，跳过用户名 API 调用"""
+    bot.client = MagicMock()
+    # 用户名解析直接返回 sender_id 本身，避免调用 contact API
+    bot._batch_resolve_sender_names = lambda ids: {oid: oid for oid in ids}
+
+
+# 固定时间戳及其格式化结果（UTC+8）
+_TS_A = "1700000000000"   # -> 11-15 06:13:20
+_TS_B = "1700000060000"   # -> 11-15 06:14:20
+_TS_A_STR = "11-15 06:13:20"
+_TS_B_STR = "11-15 06:14:20"
+
+
+class TestMergeForwardRouting:
+    """合并转发消息处理测试"""
+
+    def test_merge_forward_extracts_text(self, bot_with_plugin):
+        """正常合并转发：包裹标签、缩进格式、多条子消息"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_001"),
+            _make_message_item("text", {"text": "你好"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="merge_msg_001"),
+            _make_message_item("text", {"text": "世界"}, message_id="om_2",
+                               sender_id="Bob", create_time=_TS_B,
+                               upper_message_id="merge_msg_001"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_001",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        # 标签包裹
+        assert text.startswith("<forwarded_messages>")
+        assert text.endswith("</forwarded_messages>")
+        # 对话内容：发送者头 + 缩进内容
+        assert f"[{_TS_A_STR}] Alice:" in text
+        assert "    你好" in text
+        assert f"[{_TS_B_STR}] Bob:" in text
+        assert "    世界" in text
+
+    def test_merge_forward_api_failure(self, bot_with_plugin):
+        """GetMessage API 失败时回复提示"""
+        bot, plugin = bot_with_plugin
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response(
+            [], success=False,
+        )
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_002",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        bot.reply.assert_called_once()
+        assert "未包含可识别的文本" in bot.reply.call_args[0][1]
+
+    def test_merge_forward_only_self_item(self, bot_with_plugin):
+        """仅返回自身条目、无子消息时回复提示"""
+        bot, plugin = bot_with_plugin
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_003"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_003",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        bot.reply.assert_called_once()
+        assert "未包含可识别的文本" in bot.reply.call_args[0][1]
+
+    def test_merge_forward_image_placeholder(self, bot_with_plugin):
+        """图片子消息显示占位提示而非静默丢弃"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_004"),
+            _make_message_item("text", {"text": "看这张图"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="merge_msg_004"),
+            _make_message_item("image", {"image_key": "img_xxx"}, message_id="om_2",
+                               sender_id="Alice", create_time=_TS_B,
+                               upper_message_id="merge_msg_004"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_004",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        assert "看这张图" in text
+        assert "[图片]" in text
+
+    def test_merge_forward_in_group_strips_mentions(self, bot_with_plugin):
+        """群聊合并转发时正确剥离 @提及"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "oc_group1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_005"),
+            _make_message_item("text", {"text": "@_user_1 帮我看看"},
+                               message_id="om_1", sender_id="Alice",
+                               create_time=_TS_A,
+                               upper_message_id="merge_msg_005"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "oc_group1", "",
+            message_id="merge_msg_005",
+            msg_type="merge_forward",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        assert "帮我看看" in text
+        assert "@_user_1" not in text
+
+    def test_merge_forward_nested_indentation(self, bot_with_plugin):
+        """嵌套合并转发：API 返回扁平列表，通过 upper_message_id 构建树"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        # 单次 API 返回所有消息（扁平列表），通过 upper_message_id 区分层级
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_006"),
+            _make_message_item("text", {"text": "外层消息"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="merge_msg_006"),
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="om_nested",
+                               upper_message_id="merge_msg_006"),
+            # 以下子消息的 upper_message_id 指向嵌套的 merge_forward
+            _make_message_item("text", {"text": "内层消息"}, message_id="om_i1",
+                               sender_id="Bob", create_time=_TS_B,
+                               upper_message_id="om_nested"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_006",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        # 外层消息无缩进前缀
+        assert "[forwarded messages]" in text
+        assert "Alice:" in text
+        assert "    外层消息" in text
+        # 内层消息有 4 空格缩进（时间戳前）
+        assert f"    [{_TS_B_STR}] Bob:" in text
+        assert "        内层消息" in text  # depth=1 content → 8 空格
+        # 只调用一次 API（不再递归调用）
+        assert bot.client.im.v1.message.get.call_count == 1
+
+    def test_merge_forward_depth_limit(self, bot_with_plugin):
+        """递归深度超限时输出截断提示"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        # 构造 11 层嵌套的 merge_forward（超过 _MERGE_FORWARD_MAX_DEPTH=10）
+        items = [
+            _make_message_item("merge_forward", "M", message_id="root"),
+        ]
+        for i in range(11):
+            parent = "root" if i == 0 else f"mf_{i - 1}"
+            items.append(_make_message_item(
+                "merge_forward", "M", message_id=f"mf_{i}",
+                upper_message_id=parent,
+            ))
+        bot.client.im.v1.message.get.return_value = _make_get_response(items)
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="root",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        assert "已截断" in text
+
+    def test_merge_forward_with_post_submessage(self, bot_with_plugin):
+        """子消息中包含富文本(post)类型，正确提取文本"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_008"),
+            _make_message_item("text", {"text": "普通消息"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="merge_msg_008"),
+            _make_message_item("post", {
+                "content": [[{"tag": "text", "text": "富文本内容"}]]
+            }, message_id="om_2", sender_id="Bob", create_time=_TS_B,
+                               upper_message_id="merge_msg_008"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_008",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        assert "Alice:" in text
+        assert "普通消息" in text
+        assert "Bob:" in text
+        assert "富文本内容" in text
+
+    def test_merge_forward_unknown_type_placeholder(self, bot_with_plugin):
+        """未知消息类型显示占位提示"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="merge_msg_009"),
+            _make_message_item("text", {"text": "正常消息"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="merge_msg_009"),
+            _make_message_item("hongbao", "{}", message_id="om_2",
+                               sender_id="Bob", create_time=_TS_B,
+                               upper_message_id="merge_msg_009"),
+        ])
+
+        event = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="merge_msg_009",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event)
+        text = plugin.received_messages[0][2]
+        assert "正常消息" in text
+        assert "[hongbao 消息]" in text

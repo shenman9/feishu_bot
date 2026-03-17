@@ -32,6 +32,10 @@ _DEDUP_TTL = 300  # 5 分钟
 # 飞书卡片限制：单张卡片中 markdown 表格数量上限（实测约 5~10，取保守值）
 _MAX_CARD_TABLES = 5
 
+# 合并转发消息：子消息处理上限 & 递归深度上限
+_MERGE_FORWARD_MAX = 50
+_MERGE_FORWARD_MAX_DEPTH = 10
+
 
 def _scan_tables(text: str) -> list[tuple[int, int]]:
     """扫描 markdown 文本中 **代码块外** 的表格，返回 (start, end) 行号列表
@@ -180,6 +184,27 @@ class FeishuBot(ABC):
                             parts.append(t)
             return " ".join(parts)
 
+        if msg_type == "interactive":
+            # 飞书卡片：GetMessage API 返回降级内容，提取 title 和 text 元素
+            title = content_dict.get("title", "")
+            texts: list[str] = []
+            for para in content_dict.get("elements", []):
+                if not isinstance(para, list):
+                    continue
+                for elem in para:
+                    if isinstance(elem, dict) and elem.get("tag") == "text":
+                        t = elem.get("text", "").strip()
+                        if t:
+                            texts.append(t)
+            body = " ".join(texts)
+            if title and body:
+                return f"[卡片: {title}] {body}"
+            if title:
+                return f"[卡片: {title}]"
+            if body:
+                return f"[卡片] {body}"
+            return ""
+
         # sticker/image/video/audio 等无文本消息
         return ""
 
@@ -191,6 +216,170 @@ class FeishuBot(ABC):
             if key:
                 text = text.replace(key, "")
         return text.strip()
+
+    def _resolve_sender_name(self, open_id: str) -> str:
+        """通过 open_id 查询用户姓名，失败时返回 open_id 前 8 位作为兜底"""
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest as GetContactUserReq
+            request = (GetContactUserReq.builder()
+                       .user_id(open_id)
+                       .user_id_type("open_id")
+                       .build())
+            response = self.client.contact.v3.user.get(request)
+            if response.success() and response.data and response.data.user:
+                name = response.data.user.name or response.data.user.nickname
+                if name:
+                    return name
+        except Exception as e:
+            logger.debug("解析用户名失败: open_id=%s, error=%s", open_id, e)
+        return open_id[:8]
+
+    def _batch_resolve_sender_names(self, open_ids: set[str]) -> dict[str, str]:
+        """批量解析 open_id → 用户姓名，返回映射表"""
+        name_map: dict[str, str] = {}
+        for oid in open_ids:
+            name_map[oid] = self._resolve_sender_name(oid)
+        return name_map
+
+    @staticmethod
+    def _format_ts(ts_ms: str | None) -> str:
+        """将毫秒时间戳转为可读时间字符串"""
+        if not ts_ms:
+            return "未知时间"
+        try:
+            from datetime import datetime, timezone, timedelta
+            dt = datetime.fromtimestamp(
+                int(ts_ms) / 1000,
+                tz=timezone(timedelta(hours=8)),
+            )
+            return dt.strftime("%m-%d %H:%M:%S")
+        except (ValueError, OSError):
+            return "未知时间"
+
+    def _fetch_merge_forward_text(self, merge_message_id: str) -> str:
+        """通过 GetMessage API 获取合并转发中的子消息，还原对话格式返回
+
+        飞书 API 将所有层级的子消息作为扁平列表一次性返回，
+        通过 upper_message_id 字段区分父子关系。
+        本方法只调用一次 API，用 upper_message_id 构建消息树后递归格式化。
+        顶层调用会在外部包裹 <forwarded_messages> 标签。
+
+        输出格式示例:
+            [03-17 09:15:55] 张三:
+                你好，这是第一条消息
+            [03-17 09:16:37] 李四: [forwarded messages]
+                [03-17 08:00:00] 王五:
+                    嵌套的消息
+        """
+        try:
+            request = GetMessageRequest.builder().message_id(merge_message_id).build()
+            response = self.client.im.v1.message.get(request)
+            if not response.success():
+                logger.warning(
+                    "获取合并转发消息失败: message_id=%s, code=%s, msg=%s",
+                    merge_message_id, response.code, response.msg,
+                )
+                return ""
+            items = response.data.items or []
+        except Exception as e:
+            logger.warning("获取合并转发消息异常: message_id=%s, error=%s",
+                          merge_message_id, e)
+            return ""
+
+        # 用 upper_message_id 构建父子关系树
+        children_map: dict[str, list] = {}
+        for item in items[:_MERGE_FORWARD_MAX]:
+            sub_id = getattr(item, "message_id", None)
+            if sub_id == merge_message_id:
+                continue  # 跳过合并转发消息本身
+            parent_id = getattr(item, "upper_message_id", None) or merge_message_id
+            children_map.setdefault(parent_id, []).append(item)
+
+        # 批量解析用户姓名（只对 sender_type=user 调 Contact API）
+        user_ids: set[str] = set()
+        for item in items[:_MERGE_FORWARD_MAX]:
+            sender = getattr(item, "sender", None)
+            if sender and getattr(sender, "sender_type", "") == "user":
+                sid = getattr(sender, "id", None)
+                if sid:
+                    user_ids.add(sid)
+        name_map = self._batch_resolve_sender_names(user_ids)
+
+        return self._format_merge_tree(
+            merge_message_id, children_map, name_map, depth=0,
+        )
+
+    def _format_merge_tree(
+        self,
+        parent_id: str,
+        children_map: dict[str, list],
+        name_map: dict[str, str],
+        depth: int,
+    ) -> str:
+        """递归格式化消息树的某一层子消息"""
+        indent = "    " * depth
+        if depth >= _MERGE_FORWARD_MAX_DEPTH:
+            return f"{indent}[嵌套转发层数过深，已截断]"
+
+        children = children_map.get(parent_id, [])
+        parts: list[str] = []
+        for item in children:
+            try:
+                sub_id = getattr(item, "message_id", None)
+                sub_type = item.msg_type
+
+                # 提取发送者和时间
+                sender = getattr(item, "sender", None)
+                sender_id = getattr(sender, "id", "") if sender else ""
+                sender_type = getattr(sender, "sender_type", "") if sender else ""
+                sender_name = name_map.get(sender_id, sender_id[:8])
+                if sender_type == "app":
+                    sender_name = f"{sender_name}[机器人]"
+                ts_str = self._format_ts(getattr(item, "create_time", None))
+                header = f"{indent}[{ts_str}] {sender_name}:"
+                content_indent = indent + "    "
+
+                if sub_type == "merge_forward":
+                    # 嵌套合并转发：标记后递归格式化子节点
+                    parts.append(f"{header} [forwarded messages]")
+                    nested = self._format_merge_tree(
+                        sub_id, children_map, name_map, depth + 1,
+                    )
+                    if nested:
+                        parts.append(nested)
+                else:
+                    # 提取文本内容（text/post/interactive 等）
+                    try:
+                        sub_content = json.loads(item.body.content)
+                        text = self._extract_text(sub_type, sub_content)
+                    except (json.JSONDecodeError, AttributeError):
+                        text = ""
+
+                    if text:
+                        # 多行消息：每行缩进到发送者下方
+                        indented_lines = "\n".join(
+                            f"{content_indent}{line}"
+                            for line in text.splitlines()
+                        )
+                        parts.append(f"{header}\n{indented_lines}")
+                    elif sub_type in ("image", "audio", "video", "sticker",
+                                      "file", "media"):
+                        # 不支持下载的媒体类型：占位提示
+                        type_labels = {
+                            "image": "图片", "audio": "语音",
+                            "video": "视频", "sticker": "表情",
+                            "file": "文件", "media": "媒体",
+                        }
+                        label = type_labels.get(sub_type, sub_type)
+                        parts.append(f"{header} [{label}]")
+                    else:
+                        # 其他未知类型：占位提示
+                        parts.append(f"{header} [{sub_type} 消息]")
+            except Exception as e:
+                logger.warning("解析子消息异常: message_id=%s, error=%s",
+                              getattr(item, "message_id", "?"), e)
+                continue
+        return "\n".join(parts)
 
     def _on_raw_message(self, data: P2ImMessageReceiveV1) -> None:
         """解析原始消息，根据消息类型分发到对应处理方法
@@ -223,10 +412,32 @@ class FeishuBot(ABC):
                 logger.debug("忽略群聊非@消息: chat=%s, user=%s", chat_id, sender_id)
                 return
 
+        # 合并转发消息的 content 不是 JSON（是固定字符串 "Merged and Forwarded Message"），
+        # 需要在 JSON 解析之前单独处理
+        if msg_type == "merge_forward":
+            logger.info("收到合并转发: user=%s, chat_type=%s, message_id=%s",
+                        sender_id, chat_type, message_id)
+            text = self._fetch_merge_forward_text(message_id)
+            if chat_type == "group" and mentions:
+                text = self._strip_mentions(text, mentions)
+            if not text:
+                logger.warning("合并转发消息提取文本为空: message_id=%s", message_id)
+                self.reply(chat_id, "合并转发的消息中未包含可识别的文本内容。")
+                return
+            # 用标签包裹，给模型明确的语义边界
+            text = f"<forwarded_messages>\n{text}\n</forwarded_messages>"
+            logger.info("合并转发提取完成: user=%s, message_id=%s, text=%s",
+                        sender_id, message_id, text[:200])
+            self.on_message(sender_id, chat_id, text, message_id=message_id)
+            return
+
         try:
             content_dict = json.loads(message.content)
         except (json.JSONDecodeError, AttributeError) as e:
-            logger.warning("消息内容解析失败: message_id=%s, error=%s", message_id, type(e).__name__)
+            logger.warning(
+                "消息内容解析失败: message_id=%s, msg_type=%s, error=%s, raw_content=%r",
+                message_id, msg_type, type(e).__name__, message.content,
+            )
             return
 
         logger.info(

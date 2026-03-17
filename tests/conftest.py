@@ -34,6 +34,7 @@ _im_v1_mock.__all__ = [
     "ReplyMessageRequest",
     "ReplyMessageRequestBody",
     "DeleteMessageRequest",
+    "GetMessageRequest",
 ]
 
 _modules = {
