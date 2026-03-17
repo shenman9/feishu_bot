@@ -39,10 +39,14 @@ def _make_mock_event(
     return event
 
 
-def _make_mention(key: str):
-    """构造 mock 的 MentionEvent 对象"""
+def _make_mention(key: str, open_id: str = "ou_bot_open_id"):
+    """构造 mock 的 MentionEvent 对象
+
+    open_id: 被 @ 用户的 open_id，默认为机器人的 open_id
+    """
     m = MagicMock()
     m.key = key
+    m.id.open_id = open_id
     return m
 
 
@@ -270,6 +274,43 @@ class TestStripMentions:
         assert result == "Claude"
 
 
+class TestIsBotMentioned:
+    """机器人 @提及 精确判断测试"""
+
+    def test_empty_mentions_returns_false(self, mock_bot):
+        """空 mentions 列表返回 False"""
+        assert mock_bot._is_bot_mentioned([]) is False
+
+    def test_bot_mentioned_returns_true(self, mock_bot):
+        """mentions 中包含机器人 open_id 时返回 True"""
+        mention = _make_mention("@_user_1", open_id="ou_bot_open_id")
+        assert mock_bot._is_bot_mentioned([mention]) is True
+
+    def test_other_user_mentioned_returns_false(self, mock_bot):
+        """mentions 中只有其他用户时返回 False"""
+        mention = _make_mention("@_user_1", open_id="ou_other_user")
+        assert mock_bot._is_bot_mentioned([mention]) is False
+
+    def test_bot_among_multiple_mentions(self, mock_bot):
+        """多个 mention 中包含机器人时返回 True"""
+        mentions = [
+            _make_mention("@_user_1", open_id="ou_other_user"),
+            _make_mention("@_user_2", open_id="ou_bot_open_id"),
+        ]
+        assert mock_bot._is_bot_mentioned(mentions) is True
+
+    def test_fallback_when_open_id_unknown(self, mock_bot):
+        """无法获取机器人 open_id 时回退为宽松策略（有 mention 即 True）"""
+        mock_bot._bot_open_id = ""  # 表示已尝试但获取失败
+        mention = _make_mention("@_user_1", open_id="ou_anyone")
+        assert mock_bot._is_bot_mentioned([mention]) is True
+
+    def test_fallback_empty_mentions_still_false(self, mock_bot):
+        """即使回退策略，空 mentions 仍返回 False"""
+        mock_bot._bot_open_id = ""
+        assert mock_bot._is_bot_mentioned([]) is False
+
+
 class TestGroupChatRouting:
     """群聊 @机器人 消息路由测试（通过 _on_raw_message 端到端验证）"""
 
@@ -370,6 +411,47 @@ class TestGroupChatRouting:
         )
         bot._on_raw_message(event)
         # 剥离两个 mention 后得到 "test"，匹配插件关键词
+        assert plugin.received_messages == [("user1", "oc_group1", "test")]
+
+    def test_group_at_other_user_ignored(self, bot_with_plugin):
+        """群聊中 @其他用户（非机器人）不触发机器人响应"""
+        bot, plugin = bot_with_plugin
+        event = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 你好",
+            message_id="grp_msg_009",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1", open_id="ou_other_user")],
+        )
+        bot._on_raw_message(event)
+        assert len(plugin.received_messages) == 0
+        bot.reply_card.assert_not_called()
+
+    def test_group_at_other_user_with_keyword_ignored(self, bot_with_plugin):
+        """群聊中 @其他用户+插件关键词 不激活插件"""
+        bot, plugin = bot_with_plugin
+        event = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 test",
+            message_id="grp_msg_010",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1", open_id="ou_other_user")],
+        )
+        bot._on_raw_message(event)
+        assert ("user1", "oc_group1") not in bot.active_plugin
+        assert len(plugin.received_messages) == 0
+
+    def test_group_at_bot_and_other_user(self, bot_with_plugin):
+        """群聊中同时 @机器人和其他用户，机器人正常响应"""
+        bot, plugin = bot_with_plugin
+        event = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 @_user_2 test",
+            message_id="grp_msg_011",
+            chat_type="group",
+            mentions=[
+                _make_mention("@_user_1", open_id="ou_bot_open_id"),
+                _make_mention("@_user_2", open_id="ou_other_user"),
+            ],
+        )
+        bot._on_raw_message(event)
         assert plugin.received_messages == [("user1", "oc_group1", "test")]
 
     def test_dm_message_unchanged(self, bot_with_plugin):
@@ -581,6 +663,32 @@ class TestWakeMode:
         )
         bot._on_raw_message(event)
         assert plugin.received_messages == [("user1", "oc_group1", "test")]
+
+    def test_wake_mode_at_other_user_passes_through(self, bot_with_plugin):
+        """唤醒模式下 @其他用户的消息正常通过，且不剥离 @占位符"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group1")
+        # 先激活插件
+        event1 = _make_mock_event(
+            "user1", "oc_group1", "test",
+            message_id="wake_msg_008a",
+            chat_type="group",
+            mentions=None,
+        )
+        bot._on_raw_message(event1)
+        plugin.received_messages.clear()
+
+        # @其他用户的消息：在唤醒模式下通过，且不剥离占位符
+        event2 = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 你说的对",
+            message_id="wake_msg_008b",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1", open_id="ou_other_user")],
+        )
+        bot._on_raw_message(event2)
+        assert plugin.received_messages == [
+            ("user1", "oc_group1", "@_user_1 你说的对")
+        ]
 
 
 # ---- 合并转发消息测试辅助 ----

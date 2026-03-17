@@ -104,6 +104,8 @@ def mock_bot():
     bot.send_message = MagicMock()
     bot.send_message_get_id = MagicMock(return_value="mock_msg_id")
     bot.patch_message = MagicMock()
+    # 预设机器人 open_id，避免测试中调用飞书 API
+    bot._bot_open_id = "ou_bot_open_id"
     return bot
 
 

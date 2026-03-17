@@ -114,6 +114,8 @@ class FeishuBot(ABC):
         self._dedup_lock = threading.Lock()
         # 唤醒模式：这些群聊中所有消息都直接处理，无需 @机器人
         self._wake_mode_groups: set[str] = set()
+        # 机器人自身的 open_id，用于精确判断群消息是否 @了机器人
+        self._bot_open_id: Optional[str] = None
 
         self.client = lark.Client.builder() \
             .app_id(app_id) \
@@ -216,6 +218,48 @@ class FeishuBot(ABC):
             if key:
                 text = text.replace(key, "")
         return text.strip()
+
+    def _fetch_bot_open_id(self) -> Optional[str]:
+        """调用飞书 API 获取机器人自身的 open_id，用于判断群消息是否 @了机器人"""
+        try:
+            req = lark.BaseRequest.builder() \
+                .http_method(lark.HttpMethod.GET) \
+                .uri("/open-apis/bot/v3/info/") \
+                .token_types({lark.AccessTokenType.TENANT}) \
+                .build()
+            resp = self.client.request(req)
+            if not resp.success():
+                logger.warning("获取机器人信息失败: code=%s, msg=%s", resp.code, resp.msg)
+                return None
+            data = json.loads(resp.raw.content)
+            open_id = data.get("bot", {}).get("open_id")
+            if open_id:
+                logger.info("获取机器人 open_id: %s", open_id)
+            return open_id
+        except Exception as e:
+            logger.warning("获取机器人信息异常: %s", e)
+            return None
+
+    def _is_bot_mentioned(self, mentions: list) -> bool:
+        """判断 mentions 列表中是否包含机器人自身
+
+        首次调用时会通过 API 获取并缓存机器人的 open_id。
+        若无法获取 open_id，回退到「有 mention 即视为 @机器人」的宽松策略，
+        避免因 API 异常导致群聊功能完全失效。
+        """
+        if not mentions:
+            return False
+        # 懒加载机器人 open_id（空字符串表示已尝试但获取失败）
+        if self._bot_open_id is None:
+            self._bot_open_id = self._fetch_bot_open_id() or ""
+        # 无法获取 open_id 时回退：有任何 mention 就视为 @机器人（兼容旧行为）
+        if not self._bot_open_id:
+            return True
+        for mention in mentions:
+            mid = getattr(mention, "id", None)
+            if mid and getattr(mid, "open_id", None) == self._bot_open_id:
+                return True
+        return False
 
     def _resolve_sender_name(self, open_id: str) -> str:
         """通过 open_id 查询用户姓名，失败时返回 open_id 前 8 位作为兜底"""
@@ -406,10 +450,13 @@ class FeishuBot(ABC):
             logger.info("跳过重复消息: message_id=%s", message_id)
             return
 
-        # 群聊非 @消息：不在唤醒模式的群则忽略
-        if chat_type == "group" and not mentions:
+        # 精确判断是否 @了机器人（而非 @其他用户）
+        bot_mentioned = self._is_bot_mentioned(mentions)
+
+        # 群聊非 @机器人消息：不在唤醒模式的群则忽略
+        if chat_type == "group" and not bot_mentioned:
             if chat_id not in self._wake_mode_groups:
-                logger.debug("忽略群聊非@消息: chat=%s, user=%s", chat_id, sender_id)
+                logger.debug("忽略群聊非@机器人消息: chat=%s, user=%s", chat_id, sender_id)
                 return
 
         # 合并转发消息的 content 不是 JSON（是固定字符串 "Merged and Forwarded Message"），
@@ -418,7 +465,7 @@ class FeishuBot(ABC):
             logger.info("收到合并转发: user=%s, chat_type=%s, message_id=%s",
                         sender_id, chat_type, message_id)
             text = self._fetch_merge_forward_text(message_id)
-            if chat_type == "group" and mentions:
+            if chat_type == "group" and bot_mentioned:
                 text = self._strip_mentions(text, mentions)
             if not text:
                 logger.warning("合并转发消息提取文本为空: message_id=%s", message_id)
@@ -454,10 +501,10 @@ class FeishuBot(ABC):
         else:
             text = self._extract_text(msg_type, content_dict)
             # 群聊消息剥离 @提及 占位符
-            if chat_type == "group" and mentions:
+            if chat_type == "group" and bot_mentioned:
                 text = self._strip_mentions(text, mentions)
             if not text:
-                if chat_type == "group" and mentions:
+                if chat_type == "group" and bot_mentioned:
                     # 群聊中纯 @机器人无附加文本，视为无指令，触发默认菜单
                     self.on_message(sender_id, chat_id, "", message_id=message_id)
                 else:
