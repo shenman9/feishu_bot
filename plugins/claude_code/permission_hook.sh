@@ -41,9 +41,9 @@ SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin)
 _log "=== 权限请求: tool=${TOOL_NAME}, session=${SESSION_ID} ==="
 
 # 安全工具白名单：只读工具和非交互内部工具无需飞书卡片确认
-# 注意：ExitPlanMode 不在此列，因为需要走权限服务器实现飞书卡片审批
+# 注意：ExitPlanMode / EnterPlanMode 不在此列，需要走权限服务器处理
 case "$TOOL_NAME" in
-    Read|Glob|Grep|EnterPlanMode|TodoWrite)
+    Read|Glob|Grep|TodoWrite)
         _log "只读/内部工具 (${TOOL_NAME})，自动放行"
         exit 0
         ;;

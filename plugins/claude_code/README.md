@@ -20,7 +20,7 @@
 - **工作目录管理**：支持切换工作目录，切换后自动重置会话
 - **工作区管理**（可选）：多用户隔离工作区，支持从配置仓库 clone/fork、绑定/解绑工作区、直接执行 bash 命令。通过继承扩展实现（`WorkspaceClaudeCodePlugin`），未配置 `workspace` 时自动降级为基础功能
 - **用户问题转发**：Claude Code 调用 `AskUserQuestion` 时，问题会以飞书交互卡片形式呈现（逐题展示、预设选项按钮 + 自定义输入），同时发送应用内加急通知提醒用户及时作答，用户回答后实时传回 Claude；即使处于 bypass 模式，该工具仍需用户实际作答
-- **计划审批**：Claude Code 进入 Plan Mode 后，调用 `ExitPlanMode` 时自动读取计划文件（`.claude/plans/*.md`），以飞书卡片完整展示计划内容，同时发送应用内加急通知提醒用户及时审批，用户可点击「批准计划」「拒绝计划」或输入修改意见后「拒绝并反馈」；即使处于 bypass 模式，计划仍需用户审批
+- **计划审批**：Claude Code 进入 Plan Mode 后，`EnterPlanMode` 经权限服务器标记状态并自动放行，期间追踪实际写入的计划文件路径；调用 `ExitPlanMode` 时优先从追踪到的文件读取计划内容，以飞书卡片完整展示，同时发送应用内加急通知提醒用户及时审批，用户可点击「批准计划」「拒绝计划」或输入修改意见后「拒绝并反馈」；即使处于 bypass 模式，计划仍需用户审批
 - **完成通知**：任务执行结束后自动发送飞书应用内加急通知，避免用户错过结果
 - **消息队列**：任务执行期间用户发送的新指令自动入队（最多 10 条），上一轮完成后按序自动执行，无需手动重发；支持查看队列内容、移除指定条目、清空队列
 - **引用回复**：执行卡片以引用回复方式关联用户的原始指令消息，便于在多人群聊或连续对话中快速追溯每张执行卡片对应的指令来源；队列中的排队指令同样保留消息关联，自动消费时也以引用回复方式发送
@@ -131,7 +131,7 @@ Claude Code 调用 ExitPlanMode
     ↓
 permission_hook.sh → PermissionServer → 插件识别为 ExitPlanMode
     ↓
-读取工作目录下最新的 .claude/plans/*.md 文件
+读取计划内容（三级回退：追踪文件 → tool_input → mtime 搜索）
     ↓
 构建计划审批卡片（橙色标题）
     ├─ 计划内容（markdown 格式，超 4000 字截断）
@@ -147,11 +147,11 @@ permission_hook.sh → PermissionServer → 插件识别为 ExitPlanMode
 卡片变为灰色已处理状态（保留计划内容展示）
 ```
 
-超时处理：计划审批超时 600 秒（10 分钟）。bypass 模式下 `ExitPlanMode` 仍需用户审批。`EnterPlanMode` 和 `TodoWrite` 作为非交互内部工具，在 Hook 脚本入口直接放行。
+超时处理：计划审批超时 600 秒（10 分钟）。bypass 模式下 `ExitPlanMode` 仍需用户审批。`EnterPlanMode` 经权限服务器标记计划模式状态后自动放行，`TodoWrite` 在 Hook 脚本入口直接放行。
 
 **超时处理**：用户在 `permission_timeout`（默认 120s）内未点击按钮，服务器自动按"拒绝"处理。Hook 脚本区分两类失败：权限确认超时（curl exit 28）→ 拒绝操作；连接失败（服务器未运行）→ 降级放行。
 
-只读工具（`Read`、`Glob`、`Grep`）和非交互内部工具（`EnterPlanMode`、`TodoWrite`）在 Hook 脚本入口直接放行，不经过权限服务器。
+只读工具（`Read`、`Glob`、`Grep`）和非交互内部工具（`TodoWrite`）在 Hook 脚本入口直接放行，不经过权限服务器。`EnterPlanMode` 经权限服务器处理（标记计划模式状态、清除旧追踪路径）后自动放行。
 
 ## 文件结构
 

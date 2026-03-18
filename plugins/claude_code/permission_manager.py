@@ -238,10 +238,19 @@ class PermissionManager:
             user_id, tool_name, perm_mode, request_id[:8], input_summary.replace("\n", "↵"),
         )
 
-        # 追踪 Write/Edit 对 .claude/plans/ 的写入，供 ExitPlanMode 精确定位计划文件
-        if tool_name in ("Write", "Edit"):
+        # EnterPlanMode 特殊处理：标记进入计划模式，清除旧追踪路径，自动放行
+        if tool_name == "EnterPlanMode":
+            state["_in_plan_mode"] = True
+            state.pop("_last_plan_file", None)
+            logger.info("[CC] 进入计划模式，已标记 _in_plan_mode")
+            if self._server:
+                self._server.resolve_request(request_id, "allow")
+            return
+
+        # 计划模式下追踪 .md 文件写入，供 ExitPlanMode 兜底定位计划文件
+        if tool_name in ("Write", "Edit") and state.get("_in_plan_mode"):
             fp = tool_input.get("file_path", "")
-            if fp and "/.claude/plans/" in fp and fp.endswith(".md"):
+            if fp and fp.endswith(".md"):
                 state["_last_plan_file"] = fp
                 logger.debug("[CC] 追踪计划文件写入: %s", fp)
 
@@ -301,9 +310,12 @@ class PermissionManager:
 
         # ExitPlanMode 特殊处理：获取计划内容，通过飞书卡片展示给用户审批
         # 三级回退：追踪的文件路径 → tool_input["plan"] → 多目录 mtime 搜索
+        # 追踪文件最优先：EnterPlanMode 已清除旧路径，Write 追踪到的是本轮实际写入的文件；
+        # tool_input["plan"] 是 Claude Code 从其指定文件读取的，当用户写入非指定路径时内容可能过时。
         if tool_name == "ExitPlanMode":
+            state.pop("_in_plan_mode", None)  # 退出计划模式
             plan_content = ""
-            # 1) 从当前会话追踪到的计划文件路径精确读取
+            # 1) 从当前计划模式追踪到的文件路径读取（最可靠）
             tracked_file = state.get("_last_plan_file", "")
             if tracked_file:
                 try:
@@ -316,7 +328,7 @@ class PermissionManager:
                         )
                 except OSError as e:
                     logger.warning("[CC] 追踪的计划文件读取失败: %s: %s", tracked_file, e)
-            # 2) 使用 tool_input 中 Claude Code 直接传递的计划内容
+            # 2) 使用 Claude Code 在 tool_input 中传递的计划内容（兜底）
             if not plan_content:
                 plan_content = tool_input.get("plan", "").strip()
                 if plan_content:
