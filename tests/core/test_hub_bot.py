@@ -3,6 +3,7 @@ HubBot 消息路由单元测试
 """
 
 import json
+import time
 
 import pytest
 from unittest.mock import MagicMock
@@ -749,7 +750,7 @@ class TestMergeForwardRouting:
     """合并转发消息处理测试"""
 
     def test_merge_forward_extracts_text(self, bot_with_plugin):
-        """正常合并转发：包裹标签、缩进格式、多条子消息"""
+        """正常合并转发：超时后独立处理，包裹标签、缩进格式、多条子消息"""
         bot, plugin = bot_with_plugin
         bot.on_message("user1", "chat1", "test")
         plugin.received_messages.clear()
@@ -772,6 +773,9 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        # 转发消息暂存在缓冲区，超时后才处理
+        assert len(plugin.received_messages) == 0
+        bot._on_forward_timeout("user1", "chat1")
         assert len(plugin.received_messages) == 1
         text = plugin.received_messages[0][2]
         # 标签包裹
@@ -844,14 +848,22 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        bot._on_forward_timeout("user1", "chat1")
         text = plugin.received_messages[0][2]
         assert "看这张图" in text
         assert "[图片]" in text
 
     def test_merge_forward_in_group_strips_mentions(self, bot_with_plugin):
-        """群聊合并转发时正确剥离 @提及"""
+        """群聊合并转发+留言合并时，正确剥离留言中的 @提及"""
         bot, plugin = bot_with_plugin
-        bot.on_message("user1", "oc_group1", "test")
+        # 先激活插件
+        event_activate = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 test",
+            message_id="grp_activate_005",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event_activate)
         plugin.received_messages.clear()
 
         _setup_merge_bot(bot)
@@ -864,17 +876,30 @@ class TestMergeForwardRouting:
                                upper_message_id="merge_msg_005"),
         ])
 
+        # 第一条：转发（无 @mention）
         event = _make_mock_event(
             "user1", "oc_group1", "",
             message_id="merge_msg_005",
             msg_type="merge_forward",
             chat_type="group",
-            mentions=[_make_mention("@_user_1")],
+            mentions=[],
         )
         bot._on_raw_message(event)
+
+        # 第二条：留言（@机器人）
+        event_comment = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 帮我看看",
+            message_id="comment_005",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event_comment)
+        assert len(plugin.received_messages) == 1
         text = plugin.received_messages[0][2]
+        # 转发内容被包含
+        assert "<forwarded_messages>" in text
+        # 留言中的 @mention 被剥离
         assert "帮我看看" in text
-        assert "@_user_1" not in text
 
     def test_merge_forward_nested_indentation(self, bot_with_plugin):
         """嵌套合并转发：API 返回扁平列表，通过 upper_message_id 构建树"""
@@ -905,6 +930,7 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        bot._on_forward_timeout("user1", "chat1")
         text = plugin.received_messages[0][2]
         # 外层消息无缩进前缀
         assert "[forwarded messages]" in text
@@ -941,6 +967,7 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        bot._on_forward_timeout("user1", "chat1")
         text = plugin.received_messages[0][2]
         assert "已截断" in text
 
@@ -969,6 +996,7 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        bot._on_forward_timeout("user1", "chat1")
         text = plugin.received_messages[0][2]
         assert "Alice:" in text
         assert "普通消息" in text
@@ -999,6 +1027,340 @@ class TestMergeForwardRouting:
             msg_type="merge_forward",
         )
         bot._on_raw_message(event)
+        bot._on_forward_timeout("user1", "chat1")
         text = plugin.received_messages[0][2]
         assert "正常消息" in text
         assert "[hongbao 消息]" in text
+
+
+class TestForwardAggregation:
+    """转发消息 + 留言消息聚合测试"""
+
+    def test_p2p_forward_then_comment_merged(self, bot_with_plugin):
+        """私聊：转发消息 + 后续留言合并为一条指令"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_001"),
+            _make_message_item("text", {"text": "对话内容"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_001"),
+        ])
+
+        # 第一条：合并转发
+        event_fwd = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="fwd_001",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event_fwd)
+        # 尚未处理，暂存在缓冲区
+        assert len(plugin.received_messages) == 0
+
+        # 第二条：留言
+        event_comment = _make_mock_event(
+            "user1", "chat1", "帮我总结一下",
+            message_id="comment_001",
+        )
+        bot._on_raw_message(event_comment)
+        # 合并后作为一条消息处理
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        assert "<forwarded_messages>" in text
+        assert "对话内容" in text
+        assert "帮我总结一下" in text
+        # 留言在转发内容之后
+        fwd_end = text.index("</forwarded_messages>")
+        comment_pos = text.index("帮我总结一下")
+        assert comment_pos > fwd_end
+
+    def test_p2p_forward_timeout_processes_alone(self, bot_with_plugin):
+        """私聊：转发消息超时后单独处理"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_002"),
+            _make_message_item("text", {"text": "超时内容"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_002"),
+        ])
+
+        event_fwd = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="fwd_002",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event_fwd)
+        assert len(plugin.received_messages) == 0
+
+        # 手动触发超时回调
+        bot._on_forward_timeout("user1", "chat1")
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        assert "<forwarded_messages>" in text
+        assert "超时内容" in text
+
+    def test_group_forward_then_at_comment_merged(self, bot_with_plugin):
+        """群聊(@唤醒)：转发消息(无@) + 留言(@机器人) 合并处理"""
+        bot, plugin = bot_with_plugin
+        # 先在群聊中激活插件
+        event_activate = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 test",
+            message_id="grp_activate",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event_activate)
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_grp_001"),
+            _make_message_item("text", {"text": "群聊对话"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_grp_001"),
+        ])
+
+        # 第一条：合并转发（无 @mention）
+        event_fwd = _make_mock_event(
+            "user1", "oc_group1", "",
+            message_id="fwd_grp_001",
+            msg_type="merge_forward",
+            chat_type="group",
+            mentions=[],
+        )
+        bot._on_raw_message(event_fwd)
+        assert len(plugin.received_messages) == 0
+
+        # 第二条：留言（@机器人）
+        event_comment = _make_mock_event(
+            "user1", "oc_group1", "@_user_1 帮我分析",
+            message_id="comment_grp_001",
+            chat_type="group",
+            mentions=[_make_mention("@_user_1")],
+        )
+        bot._on_raw_message(event_comment)
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        assert "<forwarded_messages>" in text
+        assert "群聊对话" in text
+        assert "帮我分析" in text
+
+    def test_group_forward_timeout_discarded(self, bot_with_plugin):
+        """群聊(非唤醒模式)：转发消息超时后静默丢弃"""
+        bot, plugin = bot_with_plugin
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_grp_002"),
+            _make_message_item("text", {"text": "会被丢弃"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_grp_002"),
+        ])
+
+        event_fwd = _make_mock_event(
+            "user1", "oc_group1", "",
+            message_id="fwd_grp_002",
+            msg_type="merge_forward",
+            chat_type="group",
+            mentions=[],
+        )
+        bot._on_raw_message(event_fwd)
+
+        # 超时触发 — 群聊非唤醒模式，应丢弃
+        bot._on_forward_timeout("user1", "oc_group1")
+        assert len(plugin.received_messages) == 0
+
+    def test_group_wake_mode_forward_timeout_processes(self, bot_with_plugin):
+        """群聊(唤醒模式)：转发消息超时后单独处理"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group1")
+        bot.on_message("user1", "oc_group1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_grp_003"),
+            _make_message_item("text", {"text": "唤醒模式内容"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_grp_003"),
+        ])
+
+        event_fwd = _make_mock_event(
+            "user1", "oc_group1", "",
+            message_id="fwd_grp_003",
+            msg_type="merge_forward",
+            chat_type="group",
+            mentions=[],
+        )
+        bot._on_raw_message(event_fwd)
+        assert len(plugin.received_messages) == 0
+
+        bot._on_forward_timeout("user1", "oc_group1")
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        assert "唤醒模式内容" in text
+
+    def test_different_user_no_merge(self, bot_with_plugin):
+        """群聊：不同用户的消息不会误合并"""
+        bot, plugin = bot_with_plugin
+        bot._wake_mode_groups.add("oc_group1")
+        bot.on_message("user1", "oc_group1", "test")
+        bot.on_message("user2", "oc_group1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_cross_001"),
+            _make_message_item("text", {"text": "A的转发"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_cross_001"),
+        ])
+
+        # user1 转发
+        event_fwd = _make_mock_event(
+            "user1", "oc_group1", "",
+            message_id="fwd_cross_001",
+            msg_type="merge_forward",
+            chat_type="group",
+            mentions=[],
+        )
+        bot._on_raw_message(event_fwd)
+
+        # user2 发消息 — 不应与 user1 的转发合并
+        event_other = _make_mock_event(
+            "user2", "oc_group1", "我是另一个人",
+            message_id="other_msg_001",
+            chat_type="group",
+        )
+        bot._on_raw_message(event_other)
+        # user2 的消息不应包含转发内容
+        user2_msgs = [m for m in plugin.received_messages if m[0] == "user2"]
+        assert len(user2_msgs) == 1
+        assert "<forwarded_messages>" not in user2_msgs[0][2]
+
+        # user1 的转发仍在缓冲区，超时后才处理
+        bot._on_forward_timeout("user1", "oc_group1")
+        user1_msgs = [m for m in plugin.received_messages if m[0] == "user1"]
+        assert len(user1_msgs) == 1
+        assert "A的转发" in user1_msgs[0][2]
+
+    def test_forward_api_failure_no_buffer(self, bot_with_plugin):
+        """转发内容提取失败时不暂存"""
+        bot, plugin = bot_with_plugin
+
+        _setup_merge_bot(bot)
+        bot.client.im.v1.message.get.return_value = _make_get_response(
+            [], success=False,
+        )
+
+        event_fwd = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="fwd_fail_001",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event_fwd)
+        # 提取失败，回复提示
+        bot.reply.assert_called_once()
+        assert "未包含可识别的文本" in bot.reply.call_args[0][1]
+        # 缓冲区应为空
+        assert ("user1", "chat1") not in bot._pending_forwards
+
+    def test_new_forward_cancels_old_buffer(self, bot_with_plugin):
+        """同一用户连续两次转发，新的覆盖旧的"""
+        bot, plugin = bot_with_plugin
+        bot.on_message("user1", "chat1", "test")
+        plugin.received_messages.clear()
+
+        _setup_merge_bot(bot)
+
+        # 第一次转发
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_old"),
+            _make_message_item("text", {"text": "旧转发"}, message_id="om_1",
+                               sender_id="Alice", create_time=_TS_A,
+                               upper_message_id="fwd_old"),
+        ])
+        event1 = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="fwd_old",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event1)
+
+        # 第二次转发（覆盖）
+        bot.client.im.v1.message.get.return_value = _make_get_response([
+            _make_message_item("merge_forward", "Merged and Forwarded Message",
+                               message_id="fwd_new"),
+            _make_message_item("text", {"text": "新转发"}, message_id="om_2",
+                               sender_id="Bob", create_time=_TS_B,
+                               upper_message_id="fwd_new"),
+        ])
+        event2 = _make_mock_event(
+            "user1", "chat1", "",
+            message_id="fwd_new",
+            msg_type="merge_forward",
+        )
+        bot._on_raw_message(event2)
+
+        # 发送留言
+        event_comment = _make_mock_event(
+            "user1", "chat1", "看最新的",
+            message_id="comment_new",
+        )
+        bot._on_raw_message(event_comment)
+        assert len(plugin.received_messages) == 1
+        text = plugin.received_messages[0][2]
+        # 应合并新转发的内容，不含旧转发
+        assert "新转发" in text
+        assert "旧转发" not in text
+        assert "看最新的" in text
+
+    def test_forward_timeout_real_timer(self, bot_with_plugin):
+        """通过真实定时器验证超时后转发消息被处理（集成测试）"""
+        import core.feishu_bot as bot_module
+        original_timeout = bot_module._FORWARD_AGGREGATE_TIMEOUT
+        # 缩短超时到 0.1 秒以加速测试
+        bot_module._FORWARD_AGGREGATE_TIMEOUT = 0.1
+        try:
+            bot, plugin = bot_with_plugin
+            bot.on_message("user1", "chat1", "test")
+            plugin.received_messages.clear()
+
+            _setup_merge_bot(bot)
+            bot.client.im.v1.message.get.return_value = _make_get_response([
+                _make_message_item("merge_forward", "Merged and Forwarded Message",
+                                   message_id="fwd_timer"),
+                _make_message_item("text", {"text": "定时器内容"}, message_id="om_1",
+                                   sender_id="Alice", create_time=_TS_A,
+                                   upper_message_id="fwd_timer"),
+            ])
+
+            event_fwd = _make_mock_event(
+                "user1", "chat1", "",
+                message_id="fwd_timer",
+                msg_type="merge_forward",
+            )
+            bot._on_raw_message(event_fwd)
+            assert len(plugin.received_messages) == 0
+
+            # 等待定时器触发
+            time.sleep(0.3)
+            assert len(plugin.received_messages) == 1
+            text = plugin.received_messages[0][2]
+            assert "定时器内容" in text
+        finally:
+            bot_module._FORWARD_AGGREGATE_TIMEOUT = original_timeout

@@ -9,6 +9,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Optional
 
 import lark_oapi as lark
@@ -35,6 +36,18 @@ _MAX_CARD_TABLES = 5
 # 合并转发消息：子消息处理上限 & 递归深度上限
 _MERGE_FORWARD_MAX = 50
 _MERGE_FORWARD_MAX_DEPTH = 10
+
+# 转发消息聚合：等待留言的超时时间（秒）
+_FORWARD_AGGREGATE_TIMEOUT = 2.0
+
+
+@dataclass
+class _PendingForward:
+    """暂存的合并转发消息，等待后续留言消息合并"""
+    forwarded_text: str
+    message_id: str
+    chat_type: str
+    timer: threading.Timer = field(repr=False)
 
 
 def _scan_tables(text: str) -> list[tuple[int, int]]:
@@ -116,6 +129,9 @@ class FeishuBot(ABC):
         self._wake_mode_groups: set[str] = set()
         # 机器人自身的 open_id，用于精确判断群消息是否 @了机器人
         self._bot_open_id: Optional[str] = None
+        # 转发消息聚合缓冲区：暂存 merge_forward，等待后续留言合并
+        self._pending_forwards: dict[tuple[str, str], _PendingForward] = {}
+        self._pending_forwards_lock = threading.Lock()
 
         self.client = lark.Client.builder() \
             .app_id(app_id) \
@@ -218,6 +234,79 @@ class FeishuBot(ABC):
             if key:
                 text = text.replace(key, "")
         return text.strip()
+
+    # ---- 转发消息聚合 ----
+
+    def _pop_pending_forward(self, sender_id: str, chat_id: str) -> Optional[_PendingForward]:
+        """取出并清除指定用户/会话的待合并转发消息，同时取消其超时定时器
+
+        Returns:
+            待合并的转发消息，若不存在则返回 None
+        """
+        key = (sender_id, chat_id)
+        with self._pending_forwards_lock:
+            pending = self._pending_forwards.pop(key, None)
+            if pending and pending.timer:
+                pending.timer.cancel()
+        return pending
+
+    def _buffer_forward(
+        self, sender_id: str, chat_id: str, forwarded_text: str,
+        message_id: str, chat_type: str,
+    ) -> None:
+        """暂存合并转发消息，启动超时定时器等待后续留言
+
+        若同一 (sender_id, chat_id) 已有暂存转发，先取消旧定时器再覆盖。
+        """
+        key = (sender_id, chat_id)
+        timer = threading.Timer(
+            _FORWARD_AGGREGATE_TIMEOUT,
+            self._on_forward_timeout,
+            args=[sender_id, chat_id],
+        )
+        with self._pending_forwards_lock:
+            old = self._pending_forwards.get(key)
+            if old and old.timer:
+                old.timer.cancel()
+            self._pending_forwards[key] = _PendingForward(
+                forwarded_text=forwarded_text,
+                message_id=message_id,
+                chat_type=chat_type,
+                timer=timer,
+            )
+        timer.start()
+        logger.info("转发消息已暂存，等待留言合并: user=%s, chat=%s", sender_id, chat_id)
+
+    def _on_forward_timeout(self, sender_id: str, chat_id: str) -> None:
+        """超时未收到留言，单独处理暂存的转发消息
+
+        私聊和唤醒模式群聊中，转发消息可独立处理。
+        需要 @唤醒的群聊中，因无 @mention 上下文，静默丢弃（与原有行为一致）。
+        """
+        try:
+            pending = self._pop_pending_forward(sender_id, chat_id)
+            if not pending:
+                return
+            # 群聊（非唤醒模式）中无 @mention，丢弃
+            if (pending.chat_type == "group"
+                    and chat_id not in self._wake_mode_groups):
+                logger.debug(
+                    "转发消息聚合超时，群聊无@唤醒，丢弃: user=%s, chat=%s",
+                    sender_id, chat_id,
+                )
+                return
+            # 私聊或唤醒模式群聊：单独处理转发内容
+            text = (f"<forwarded_messages>\n{pending.forwarded_text}"
+                    f"\n</forwarded_messages>")
+            logger.info(
+                "转发消息聚合超时，单独处理: user=%s, chat=%s",
+                sender_id, chat_id,
+            )
+            self.on_message(
+                sender_id, chat_id, text, message_id=pending.message_id,
+            )
+        except Exception as e:
+            logger.error("转发消息超时处理异常: %s", e, exc_info=True)
 
     def _fetch_bot_open_id(self) -> Optional[str]:
         """调用飞书 API 获取机器人自身的 open_id，用于判断群消息是否 @了机器人"""
@@ -436,7 +525,14 @@ class FeishuBot(ABC):
             logger.error("处理消息事件异常: %s", e, exc_info=True)
 
     def _handle_raw_message(self, data: P2ImMessageReceiveV1) -> None:
-        """_on_raw_message 的实际逻辑，拆分以便顶层异常捕获"""
+        """_on_raw_message 的实际逻辑，拆分以便顶层异常捕获
+
+        合并转发消息聚合策略:
+        飞书将用户的"转发+留言"拆为两条独立事件（先 merge_forward，后 text）。
+        为将它们作为一条指令处理，merge_forward 到达时先暂存到缓冲区，
+        等待短时间窗口内同一用户同一会话的后续消息。若后续消息到达则合并处理，
+        超时则单独处理（私聊/唤醒模式群）或丢弃（需@唤醒的群聊）。
+        """
         message = data.event.message
         sender_id = data.event.sender.sender_id.user_id
         chat_id = message.chat_id
@@ -453,30 +549,33 @@ class FeishuBot(ABC):
         # 精确判断是否 @了机器人（而非 @其他用户）
         bot_mentioned = self._is_bot_mentioned(mentions)
 
-        # 群聊非 @机器人消息：不在唤醒模式的群则忽略
+        # ---- 合并转发消息：暂存到缓冲区，等待后续留言 ----
+        # 合并转发的 content 不是 JSON（是固定字符串 "Merged and Forwarded Message"），
+        # 需要在 JSON 解析之前单独处理。
+        # 注意：merge_forward 在群聊中不携带 @mention，所以要绕过群聊过滤先暂存。
+        if msg_type == "merge_forward":
+            logger.info("收到合并转发: user=%s, chat_type=%s, message_id=%s",
+                        sender_id, chat_type, message_id)
+            text = self._fetch_merge_forward_text(message_id)
+            if not text:
+                logger.warning("合并转发消息提取文本为空: message_id=%s", message_id)
+                # 仅在非群聊或有权响应时回复提示
+                if chat_type != "group" or chat_id in self._wake_mode_groups:
+                    self.reply(chat_id, "合并转发的消息中未包含可识别的文本内容。")
+                return
+            logger.info("合并转发提取完成，暂存等待留言: user=%s, message_id=%s, text=%s",
+                        sender_id, message_id, text[:200])
+            self._buffer_forward(sender_id, chat_id, text, message_id, chat_type)
+            return
+
+        # ---- 群聊非 @机器人消息过滤（merge_forward 已在上方绕过） ----
         if chat_type == "group" and not bot_mentioned:
             if chat_id not in self._wake_mode_groups:
                 logger.debug("忽略群聊非@机器人消息: chat=%s, user=%s", chat_id, sender_id)
                 return
 
-        # 合并转发消息的 content 不是 JSON（是固定字符串 "Merged and Forwarded Message"），
-        # 需要在 JSON 解析之前单独处理
-        if msg_type == "merge_forward":
-            logger.info("收到合并转发: user=%s, chat_type=%s, message_id=%s",
-                        sender_id, chat_type, message_id)
-            text = self._fetch_merge_forward_text(message_id)
-            if chat_type == "group" and bot_mentioned:
-                text = self._strip_mentions(text, mentions)
-            if not text:
-                logger.warning("合并转发消息提取文本为空: message_id=%s", message_id)
-                self.reply(chat_id, "合并转发的消息中未包含可识别的文本内容。")
-                return
-            # 用标签包裹，给模型明确的语义边界
-            text = f"<forwarded_messages>\n{text}\n</forwarded_messages>"
-            logger.info("合并转发提取完成: user=%s, message_id=%s, text=%s",
-                        sender_id, message_id, text[:200])
-            self.on_message(sender_id, chat_id, text, message_id=message_id)
-            return
+        # ---- 检查是否有待合并的转发消息 ----
+        pending = self._pop_pending_forward(sender_id, chat_id)
 
         try:
             content_dict = json.loads(message.content)
@@ -518,6 +617,14 @@ class FeishuBot(ABC):
             if text == self._WAKE_MODE_KEYWORD and chat_type == "group":
                 self._send_wake_mode_card(chat_id)
                 return
+            # 合并待处理的转发消息（转发内容在前，留言在后）
+            if pending:
+                text = (f"<forwarded_messages>\n{pending.forwarded_text}"
+                        f"\n</forwarded_messages>\n\n{text}")
+                logger.info(
+                    "转发消息与留言已合并: user=%s, chat=%s, forward_msg=%s",
+                    sender_id, chat_id, pending.message_id,
+                )
             self.on_message(sender_id, chat_id, text, message_id=message_id)
 
     def _on_raw_card_action(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
