@@ -1,0 +1,11 @@
+# 番茄钟插件配置
+# 复制为 pomodoro.yaml 后修改
+
+# 默认工作时长（分钟）
+default_work_minutes: 25
+
+# 默认休息时长（分钟）
+default_rest_minutes: 5
+
+# 默认多周期数
+default_cycles: 4

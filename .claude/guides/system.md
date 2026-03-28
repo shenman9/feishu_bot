@@ -35,7 +35,7 @@
 
 * **语言**: Python 3.10+
 * **并发模式**: 主线程处理飞书 WebSocket 事件（同步调用插件）；阻塞型 I/O（子进程调用、流式 HTTP 请求等）通过 `threading.Thread` 在后台线程中执行，避免阻塞主线程。
-* **核心依赖**: `lark-oapi`（飞书 SDK）、`pyyaml`（配置解析）、`httpx`（HTTP 客户端）、`schedule`（定时任务）、`jinja2`（模板引擎）
+* **核心依赖**: `lark-oapi`（飞书 SDK）、`pyyaml`（配置解析）、`httpx`（HTTP 客户端）、`schedule`（定时任务）、`apscheduler`（高级定时调度）、`jinja2`（模板引擎）
 * **依赖管理**: `pip`（运行依赖直接安装；测试依赖通过 `requirements-dev.txt`）。
 * **测试框架**: `pytest`。
 
@@ -49,6 +49,7 @@
 | `config/claude_chat.yaml` | Claude 对话插件配置 |
 | `config/claude_code.yaml` | Claude Code 桥接插件配置 |
 | `config/paper_daily.yaml` | 论文日报插件配置 |
+| `config/pomodoro.yaml` | 番茄钟插件配置（可选） |
 
 * **config/\*.yaml**: 你可以读取和修改这些文件以进行本地调试。
 * **Git 约束**:

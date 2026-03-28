@@ -13,6 +13,7 @@ from plugins.file_reader import FileReaderPlugin
 from plugins.claude_chat import ClaudeChatPlugin
 from plugins.paper_daily import PaperDailyPlugin
 from plugins.claude_code.workspace_plugin import WorkspaceClaudeCodePlugin as ClaudeCodePlugin
+from plugins.pomodoro import PomodoroPlugin
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
         ClaudeChatPlugin(),
         PaperDailyPlugin(),
         ClaudeCodePlugin(),
+        PomodoroPlugin(),
     ])
 
     # 注册 SIGTERM 处理器：将 SIGTERM 转为正常退出，确保 atexit 清理逻辑被触发
