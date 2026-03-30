@@ -20,6 +20,8 @@
 - 阶段结束时发送飞书加急通知
 - 完成后可"再来一轮"（累加周期，延续统计）
 - 记忆上次设置参数，返回设置页时自动回显
+- 专注统计：按用户维度跨群聊统计今日/累计专注时间、完成周期数
+- 统计数据持久化到磁盘，重启不丢失
 - 按 (user_id, chat_id) 隔离，不同群聊独立运行
 - 切换到其他插件后计时器继续运行，到期照常通知
 
@@ -67,8 +69,9 @@
 ```
 plugins/pomodoro/
 ├── __init__.py            # 导出 PomodoroPlugin
-├── models.py              # 数据模型：Phase、PomodoroState、LastSettings、UserTimers
+├── models.py              # 数据模型：Phase、PomodoroState、DailyStats、LastSettings、UserTimers
 ├── cards.py               # 飞书卡片构建函数（纯函数，无状态）
+├── stats.py               # 专注统计持久化模块（按用户存储到 stats/ 目录）
 └── pomodoro_plugin.py     # 主插件类：调度器管理、状态机、卡片动作处理
 config/pomodoro.yaml.example  # 配置示例
 ```

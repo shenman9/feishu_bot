@@ -121,6 +121,14 @@ class LastSettings:
 
 
 @dataclass
+class DailyStats:
+    """单日专注统计"""
+    focus_seconds: float = 0.0
+    sessions: int = 0
+    work_phases: int = 0
+
+
+@dataclass
 class UserTimers:
     """单个 (user_id, chat_id) 的所有定时器"""
     pomodoro: Optional[PomodoroState] = None

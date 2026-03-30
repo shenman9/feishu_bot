@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .models import Phase, fmt_duration
 
 if TYPE_CHECKING:
-    from .models import LastSettings, PomodoroState, ReminderState
+    from .models import DailyStats, LastSettings, PomodoroState, ReminderState
 
 PLUGIN_KEYWORD = "番茄钟"
 
@@ -140,6 +140,7 @@ def build_pomodoro_setup_card(settings: "LastSettings | None" = None) -> dict:
         },
         "elements": [
             {"tag": "form", "name": "pomo_setup_form", "elements": form_elements},
+            {"tag": "action", "actions": [_btn("我的统计", "show_stats")]},
         ],
     }
 
@@ -507,5 +508,59 @@ def build_reminder_notification_card(reminder: ReminderState) -> dict:
         },
         "elements": [
             {"tag": "markdown", "content": reminder.message},
+        ],
+    }
+
+
+# ────────────────────────── 专注统计 ──────────────────────────
+
+def build_stats_card(today: "DailyStats",
+                     total_seconds: float, total_days: int,
+                     total_phases: int) -> dict:
+    """专注统计卡片"""
+    today_focus = fmt_duration(today.focus_seconds) if today.focus_seconds > 0 else "0"
+    total_focus = fmt_duration(total_seconds) if total_seconds > 0 else "0"
+
+    body = (
+        f"**今日专注**: {today_focus}\n"
+        f"**今日完成**: {today.work_phases} 个周期 · {today.sessions} 次番茄钟\n"
+        f"---\n"
+        f"**累计专注**: {total_focus}\n"
+        f"**累计天数**: {total_days} 天\n"
+        f"**累计周期**: {total_phases} 个"
+    )
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "番茄钟 · 我的统计"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": body},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [
+                _btn("返回", "show_setup"),
+                _btn("清空数据", "clear_stats", "danger"),
+            ]},
+        ],
+    }
+
+
+def build_confirm_clear_stats_card() -> dict:
+    """确认清空统计数据的卡片"""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "确认清空统计数据"},
+            "template": "orange",
+        },
+        "elements": [
+            {"tag": "markdown", "content": "清空后所有历史专注记录将永久删除，无法恢复。\n确认要清空吗？"},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [
+                _btn("确认清空", "confirm_clear_stats", "danger"),
+                _btn("取消", "show_stats"),
+            ]},
         ],
     }

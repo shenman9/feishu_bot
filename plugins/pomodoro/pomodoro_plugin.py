@@ -24,6 +24,7 @@ from core.plugin import Plugin
 from . import cards
 from .cards import _fmt_time
 from .models import Phase, PomodoroState, LastSettings, ReminderState, UserTimers
+from .stats import FocusStatsStore
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class PomodoroPlugin(Plugin):
         self._active_users: set[str] = set()              # 正在交互中的用户
         self._scheduler: Optional[BackgroundScheduler] = None
         self._lock = threading.RLock()
+        self._stats = FocusStatsStore()
 
     # ──────────────── 元信息 ────────────────
 
@@ -263,6 +265,8 @@ class PomodoroPlugin(Plugin):
                     elapsed = time.time() - state.phase_start_time
                     state.total_focus_seconds += elapsed
                     state.completed_work_phases += 1
+                    # 持久化到用户统计
+                    self._stats.add_focus(user_id, elapsed, work_phases=1)
 
                 # 停止当前阶段的刷新
                 self._stop_refresh_job(state)
@@ -304,6 +308,7 @@ class PomodoroPlugin(Plugin):
                     prev_cycle = state.current_cycle
                     state.status = "completed"
                     card = cards.build_pomodoro_completed_card(state)
+                    self._stats.increment_sessions(user_id)
                     send_new = True
 
             # 网络 I/O 在锁外执行
@@ -404,16 +409,18 @@ class PomodoroPlugin(Plugin):
                 return None
 
             self._cancel_pomodoro_job(state)
-            # 统计当前工作阶段的已用时间
+            # 统计当前工作阶段的已用时间并持久化
             if state.phase == Phase.WORK:
                 if state.status == "running":
                     elapsed = time.time() - state.phase_start_time
                     state.total_focus_seconds += elapsed
+                    self._stats.add_focus(user_id, elapsed)
                 elif state.status == "paused":
-                    # 暂停时已工作的时间 = 总时长 - 剩余时间
-                    state.total_focus_seconds += (
-                        state.phase_duration_seconds - state.remaining_seconds)
+                    worked = state.phase_duration_seconds - state.remaining_seconds
+                    state.total_focus_seconds += worked
+                    self._stats.add_focus(user_id, worked)
             state.status = "completed"
+            self._stats.increment_sessions(user_id)
             return cards.build_pomodoro_completed_card(state)
 
     def _start_next_phase(self, user_id: str, chat_id: str,
@@ -465,6 +472,7 @@ class PomodoroPlugin(Plugin):
             else:
                 # 最后一轮 → 跳过休息直接完成
                 state.status = "completed"
+                self._stats.increment_sessions(user_id)
                 return cards.build_pomodoro_completed_card(state)
 
     # ──────────────── 定时提醒 ────────────────
@@ -647,6 +655,21 @@ class PomodoroPlugin(Plugin):
         elif action == "show_setup":
             return self.bot.make_card_response(
                 card=cards.build_pomodoro_setup_card(timers.last_settings))
+        elif action == "show_stats":
+            today = self._stats.load_today(user_id)
+            total_secs, total_days, total_phases = self._stats.load_total(user_id)
+            return self.bot.make_card_response(
+                card=cards.build_stats_card(
+                    today, total_secs, total_days, total_phases))
+        elif action == "clear_stats":
+            return self.bot.make_card_response(
+                card=cards.build_confirm_clear_stats_card())
+        elif action == "confirm_clear_stats":
+            self._stats.clear(user_id)
+            from .models import DailyStats
+            return self.bot.make_card_response(
+                card=cards.build_stats_card(DailyStats(), 0, 0, 0),
+                toast="统计数据已清空")
 
         # 提醒操作 — 原地切换页面
         elif action == "reminder_create":
