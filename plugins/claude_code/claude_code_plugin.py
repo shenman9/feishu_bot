@@ -9,6 +9,7 @@ Claude Code 桥接插件
 """
 
 import collections
+import re
 import datetime
 import json
 import logging
@@ -682,6 +683,10 @@ class ClaudeCodePlugin(Plugin):
             stderr_output = (stderr_raw.decode("utf-8", errors="replace")
                              if isinstance(stderr_raw, bytes) else stderr_raw) if stderr_raw else ""
             elapsed = time.time() - start_time
+
+            # 用实际墙钟耗时替换 CLI 报告的 duration_ms
+            # （CLI 的 duration_ms 可能不含工具执行和权限等待时间，导致长任务显示耗时偏短）
+            cost_info = re.sub(r"耗时: [\d.]+s", f"耗时: {elapsed:.1f}s", cost_info)
 
             logger.info(
                 "[CC] 子进程结束: user=%s, pid=%d, returncode=%s, "
