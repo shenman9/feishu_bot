@@ -78,7 +78,7 @@ fi
 # 转发请求到权限确认服务器（阻塞等待响应）
 _log "发送请求到权限服务器 http://127.0.0.1:${PORT}/permission-request ..."
 CURL_EXIT=0
-RESPONSE=$(echo "$INPUT" | curl -sS --max-time "$CURL_MAX_TIME" \
+RESPONSE=$(echo "$INPUT" | curl -sS --noproxy 127.0.0.1 --max-time "$CURL_MAX_TIME" \
     -X POST \
     -H "Content-Type: application/json" \
     -d @- \
